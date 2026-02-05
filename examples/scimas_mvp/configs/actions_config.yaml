@@ -1,0 +1,8 @@
+name: EasyActions
+components:
+  communication:
+    plugins:
+      EasyCommunicationPlugin: {}
+  otheractions:
+    plugins:
+      ResearchActionsPlugin: {}

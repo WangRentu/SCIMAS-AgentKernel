@@ -1,0 +1,20 @@
+name: EasyEnvironment
+components:
+  relation:
+    plugin:
+      EasyRelationPlugin:
+        relations: 'agents_relation'
+  space:
+    plugin:
+      EasySpacePlugin:
+        agents: 'map_agents'
+  science:
+    plugin:
+      CausalWorldPlugin:
+        num_vars: 4
+        target: "Y"
+        seed: 42
+        budget: 10
+        lambda_cost: 0.3
+        hint_accuracy: 0.7
+        template_mode: "random"

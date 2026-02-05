@@ -1,0 +1,29 @@
+# ===================================================================
+# Main Simulator Configuration File (Entry Point)
+
+
+# --- Global Simulation Configuration ---
+# Parameters for controlling overall simulator behavior.
+simulation:
+  max_ticks: 10          # Maximum time steps for simulation run
+
+# --- Module Path Configuration ---
+# Defines configuration file paths for all core modules.
+configs:
+  environment: "environment_config.yaml"
+  actions: "actions_config.yaml"
+  agent_templates: "agents_config.yaml"
+  system: "system_config.yaml"
+  database: "db_config.yaml"
+  models: "models_config.yaml"
+
+# --- Data Path Configuration ---
+# Defines all static data files used to initialize environment and agents.
+
+data:
+  # Agent-related data
+  agent_profiles: "data/agents/profiles.jsonl"
+  # Environment-related data
+  agents_relation: "data/relation/relation.jsonl"
+  map_agents: "data/map/agents.jsonl"
+
