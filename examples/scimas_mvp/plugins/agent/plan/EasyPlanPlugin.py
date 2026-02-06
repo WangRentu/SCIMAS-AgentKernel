@@ -8,6 +8,7 @@ from agentkernel_standalone.toolkit.logger import get_logger
 
 logger = get_logger(__name__)
 
+# 基于概率的plan plugin，根据概率化的policy选择action
 class EasyPlanPlugin(PlanPlugin):
     """
     A minimal research planner that samples actions from the policy vector.
@@ -30,6 +31,8 @@ class EasyPlanPlugin(PlanPlugin):
         hypothesis = await self.state_plug.get_state("hypothesis") or []
         exp_count = await self.state_plug.get_state("exp_count") or 0
         budget = await self.state_plug.get_state("budget") or 10
+        observations = await self.state_plug.get_state("observations") or []
+        notes = await self.state_plug.get_state("notes") or []
 
         action = self._sample_action(policy)
 
@@ -38,7 +41,14 @@ class EasyPlanPlugin(PlanPlugin):
         if exp_count >= budget and action == "experiment":
             action = "write"
 
-        self.plan.append({"action": action})
+        plan_item: Dict[str, Any] = {"action": action}
+
+        if action == "experiment":
+            intervention = await self._propose_intervention(hypothesis, observations, notes)
+            if intervention:
+                plan_item["intervention"] = intervention
+
+        self.plan.append(plan_item)
         logger.info(f"Agent {self.agent_id} planned action: {action}")
 
     def _sample_action(self, policy: Dict[str, float]) -> str:
@@ -54,3 +64,45 @@ class EasyPlanPlugin(PlanPlugin):
             if pick <= current:
                 return action
         return next(iter(policy.keys()))
+
+    async def _propose_intervention(self, hypothesis, observations, notes) -> Dict[str, float]:
+        """
+        Simple heuristic:
+        - Prefer variables not yet in hypothesis.
+        - Use literature hints to pick a likely parent if available.
+        - Otherwise pick the most unexplored variable.
+        """
+        spec = await self._component.agent.controller.run_environment("science", "get_world_spec")
+        target = spec.get("target")
+        vars_all = [v for v in spec.get("variables", []) if v != target]
+
+        # Count how many times each var was intervened
+        int_counts = {v: 0 for v in vars_all}
+        for obs in observations:
+            intervention = (obs or {}).get("intervention") or {}
+            for v, delta in intervention.items():
+                if delta:
+                    int_counts[v] = int_counts.get(v, 0) + 1
+
+        # Literature priors
+        lit_score = {v: 0.0 for v in vars_all}
+        for note in notes:
+            for hint in (note or {}).get("hints", []) or []:
+                for v in vars_all:
+                    if hint.startswith(f"{v} likely causes {target}."):
+                        lit_score[v] += 1.0
+                    elif hint.startswith(f"No evidence that {v} causes {target}."):
+                        lit_score[v] -= 1.0
+
+        candidates = vars_all
+        # Prefer not-yet-in-hypothesis
+        prefer = [v for v in candidates if v not in hypothesis] or candidates
+
+        # Score = literature bonus - explored count
+        scored = sorted(prefer, key=lambda v: (lit_score.get(v, 0.0), -int_counts.get(v, 0)), reverse=True)
+        if not scored:
+            return {}
+
+        chosen = scored[0]
+        delta = 1.0 if self._rng.random() < 0.5 else -1.0
+        return {chosen: delta}

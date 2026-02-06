@@ -9,6 +9,7 @@ __pycache__/
 .pytest_cache/
 *.log
 logs/
+**/logs*/
 volumes/
 node_modules/
 dist/

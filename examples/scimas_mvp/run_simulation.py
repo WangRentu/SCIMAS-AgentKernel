@@ -65,6 +65,8 @@ async def main():
             logger.info(f"\n--- Ran {num_ticks_to_run} ticks. Average time per tick: {average_time_per_tick:.4f} seconds ---")
 
         logger.info("\n--- Simulation Finished ---")
+        if isinstance(controller, CustomController):
+            await controller.finalize_episode()
     except Exception as e:
         logger.error(f"Simulation failed: {e}")
         logger.exception("An unhandled exception occurred during simulation.")
