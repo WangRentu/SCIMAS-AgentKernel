@@ -29,6 +29,14 @@ class EasyCommunicationPlugin(CommunicationPlugin):
     async def _log_action(self, *args, **kwargs):
         return None
 
+    @ServiceCall
+    async def save_to_db(self):
+        return ActionResult.success(method_name="save_to_db", message="No state to save.")
+
+    @ServiceCall
+    async def load_from_db(self):
+        return ActionResult.success(method_name="load_from_db", message="No state to load.")
+
     @AgentCall
     async def send_message(self, from_id: str, to_id: str, content: str):
         logger.info(f"{from_id} send message to {to_id}")

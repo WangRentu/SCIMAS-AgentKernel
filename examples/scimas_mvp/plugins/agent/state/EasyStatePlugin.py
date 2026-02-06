@@ -39,6 +39,7 @@ class EasyStatePlugin(StatePlugin):
         self._state_data.setdefault("action_space", list(self._default_action_space))
         self._state_data.setdefault("budget", budget)
         self._state_data.setdefault("exp_count", 0)
+        self._state_data.setdefault("observations", [])
         self._state_data.setdefault("hypothesis", [])
         self._state_data.setdefault("notes", [])
         self._state_data.setdefault("last_action", None)
