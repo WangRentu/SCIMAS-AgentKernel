@@ -52,5 +52,14 @@ class EasyCommunicationPlugin(CommunicationPlugin):
         try:
             await self.controller.run_system("messager", "send_message", message=message)
             logger.info(f"{from_id} send message to {to_id}")
+            return ActionResult.success(
+                method_name="send_message",
+                message="Message sent.",
+                data={"from_id": from_id, "to_id": to_id},
+            )
         except Exception as e:
             logger.error(f"{from_id} Error sending message: {e}")
+            return ActionResult.error(
+                method_name="send_message",
+                message=str(e),
+            )

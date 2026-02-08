@@ -23,15 +23,25 @@ class EasyStatePlugin(StatePlugin):
             "read",
             "hypothesize",
             "experiment",
+            "replicate",
             "write",
             "review",
+            "share_evidence",
+            "share_observation",
+            "claim_task",
+            "complete_task",
         ]
         self._default_policy = policy or {
-            "read": 0.25,
-            "hypothesize": 0.2,
-            "experiment": 0.25,
-            "write": 0.2,
-            "review": 0.1,
+            "read": 0.18,
+            "hypothesize": 0.14,
+            "experiment": 0.22,
+            "replicate": 0.02,
+            "write": 0.14,
+            "review": 0.08,
+            "share_evidence": 0.06,
+            "share_observation": 0.06,
+            "claim_task": 0.06,
+            "complete_task": 0.04,
         }
         self._state_data.setdefault("policy", copy.deepcopy(self._default_policy))
         self._state_data.setdefault("alpha", alpha)
@@ -40,11 +50,17 @@ class EasyStatePlugin(StatePlugin):
         self._state_data.setdefault("budget", budget)
         self._state_data.setdefault("exp_count", 0)
         self._state_data.setdefault("observations", [])
+        self._state_data.setdefault("replications", [])
+        self._state_data.setdefault("shared_observations", [])
         self._state_data.setdefault("hypothesis", [])
         self._state_data.setdefault("notes", [])
+        self._state_data.setdefault("shared_notes", [])
+        self._state_data.setdefault("inbox_evidence", [])
         self._state_data.setdefault("last_action", None)
         self._state_data.setdefault("last_reward", 0.0)
         self._state_data.setdefault("last_fitness", None)
+        self._state_data.setdefault("last_paper_id", None)
+        self._state_data.setdefault("current_task_id", None)
         
     async def init(self):
         self.agent_id = self._component.agent.agent_id

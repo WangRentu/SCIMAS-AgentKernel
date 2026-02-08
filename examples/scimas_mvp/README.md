@@ -25,5 +25,23 @@ To simplify the process, we have provided basic implementations for five core pl
     python -m examples.scimas_mvp.run_simulation
     ```
 
+4. Inspect research logs
+    - Evidence cards per tick/agent: `examples/scimas_mvp/logs/app/research/evidence_cards.jsonl`
+    - Paper submissions and evaluations: `examples/scimas_mvp/logs/app/research/papers.jsonl`
+    - Full action trace: `examples/scimas_mvp/logs/app/action/trace.jsonl`
+    - Taskboard events (create/claim/complete): `examples/scimas_mvp/logs/app/environment/taskboard.jsonl`
+    - Team metrics across episodes: `examples/scimas_mvp/logs/app/simulation/team_metrics.jsonl`
+    - Policy evolution records: `examples/scimas_mvp/logs/app/simulation/evolution.jsonl`
+    - Trend dashboard (auto-generated after run): `examples/scimas_mvp/logs/app/simulation/trend_dashboard.html`
+
+5. Analyze cross-episode evolution
+    ```bash
+    python -m examples.scimas_mvp.analysis.analyze_metrics
+    ```
+    - Summary JSON: `examples/scimas_mvp/logs/app/simulation/analysis_summary.json`
+    - Summary text: `examples/scimas_mvp/logs/app/simulation/analysis_summary.txt`
+    - Episode time series CSV: `examples/scimas_mvp/logs/app/simulation/analysis_timeseries.csv`
+    - Trend chart: `examples/scimas_mvp/logs/app/simulation/analysis_trend.html`
+
         
             
