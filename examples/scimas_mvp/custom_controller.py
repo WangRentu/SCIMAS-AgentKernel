@@ -21,6 +21,8 @@ class CustomController(ControllerImpl):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._evolve_rng = random.Random(42)
+        self._last_team_record: Dict[str, Any] | None = None
+        self._log_mode = (os.getenv("SCIMAS_LOG_MODE", "compact") or "compact").strip().lower()
         
     async def update_agents_status(self) -> None:
         """Trigger each pod to refresh agent status within the environment.
@@ -47,17 +49,86 @@ class CustomController(ControllerImpl):
             mutated[action] = max(1e-6, float(prob) + noise)
         return self._normalize_policy(mutated)
 
+    def _minmax(self, rows: List[Dict[str, Any]], key: str) -> Dict[str, float]:
+        values = [float(r.get(key, 0.0) or 0.0) for r in rows]
+        if not values:
+            return {}
+        lo = min(values)
+        hi = max(values)
+        if abs(hi - lo) < 1e-9:
+            return {str(r.get("agent_id")): 0.0 for r in rows}
+        return {str(r.get("agent_id")): (float(r.get(key, 0.0) or 0.0) - lo) / (hi - lo) for r in rows}
+
+    def _selection_score(self, rec: Dict[str, Any], team_ctx: Dict[str, Any], norms: Dict[str, Dict[str, float]]) -> float:
+        aid = str(rec.get("agent_id"))
+        individual = norms["individual"].get(aid, 0.0)
+        contrib = norms["contrib"].get(aid, 0.0)
+        collab = norms["collab"].get(aid, 0.0)
+        target_collab = float(os.getenv("SCIMAS_TARGET_COLLAB_RATIO", "0.15"))
+        team_collab = float(team_ctx.get("collaboration_ratio", 0.0) or 0.0)
+        team_fitness = float(team_ctx.get("team_fitness", 0.0) or 0.0)
+
+        w_ind = float(os.getenv("SCIMAS_EVOLVE_W_INDIV", "0.70"))
+        w_contrib = float(os.getenv("SCIMAS_EVOLVE_W_CONTRIB", "0.20"))
+        w_collab = float(os.getenv("SCIMAS_EVOLVE_W_COLLAB", "0.10"))
+        if team_collab < target_collab:
+            # Under-collaboration: shift selection toward collaboration and contribution signals.
+            gap = min(1.0, max(0.0, (target_collab - team_collab) / max(target_collab, 1e-6)))
+            shift = 0.20 * gap
+            w_ind = max(0.40, w_ind - shift)
+            w_collab = min(0.30, w_collab + 0.5 * shift)
+            w_contrib = min(0.35, w_contrib + 0.5 * shift)
+        rep_pass_rate = team_ctx.get("replication_pass_rate")
+        if rep_pass_rate is None:
+            rep_pass_rate = 1.0 if bool(team_ctx.get("replication_all_pass", False)) else 0.0
+        rep_pass_rate = float(rep_pass_rate or 0.0)
+        target_rep_pass_rate = float(os.getenv("SCIMAS_TARGET_REPLICATION_PASS_RATE", "0.30"))
+        if rep_pass_rate < target_rep_pass_rate:
+            w_contrib += 0.05
+            w_ind = max(0.35, w_ind - 0.05)
+
+        # Team fitness modulates strength of social signals instead of adding a useless constant.
+        team_gain = 1.0 + max(-0.5, min(0.5, team_fitness))
+        score = (w_ind * individual) + (w_contrib * contrib * team_gain) + (w_collab * collab * team_gain)
+        return float(score)
+
     async def evolve_population(self, top_ratio: float = 0.2, noise_scale: float = 0.03) -> Dict[str, Any]:
         agents = self.get_agent_ids()
         if len(agents) < 2:
             return {"ok": False, "reason": "not_enough_agents"}
 
         records: List[Dict[str, Any]] = []
+        team_ctx = dict(self._last_team_record or {})
         for aid in agents:
             fitness = await self.run_agent_method(aid, "state", "get_state", "last_fitness")
             policy = await self.run_agent_method(aid, "state", "get_state", "policy")
-            records.append({"agent_id": aid, "fitness": fitness, "policy": policy or {}})
-        ranked = sorted(records, key=self._fit_value, reverse=True)
+            contribution_credit = await self.run_agent_method(aid, "state", "get_state", "contribution_credit_total")
+            shares_e = await self.run_agent_method(aid, "state", "get_state", "share_sent_evidence_count")
+            shares_o = await self.run_agent_method(aid, "state", "get_state", "share_sent_observation_count")
+            collab_count = float(shares_e or 0) + float(shares_o or 0)
+            individual_fit = self._fit_value({"fitness": fitness})
+            if individual_fit == float("-inf"):
+                individual_fit = 0.0
+            rec = {
+                "agent_id": aid,
+                "fitness": fitness,
+                "policy": policy or {},
+                "individual_fitness": float(individual_fit),
+                "contribution_credit_total": float(contribution_credit or 0.0),
+                "collab_count": float(collab_count),
+            }
+            records.append(rec)
+
+        norms = {
+            "individual": self._minmax(records, "individual_fitness"),
+            "contrib": self._minmax(records, "contribution_credit_total"),
+            "collab": self._minmax(records, "collab_count"),
+        }
+        for rec in records:
+            score = self._selection_score(rec, team_ctx=team_ctx, norms=norms)
+            rec["selection_score"] = score
+            await self.run_agent_method(rec["agent_id"], "state", "set_state", "last_selection_score", score)
+        ranked = sorted(records, key=lambda r: float(r.get("selection_score", 0.0)), reverse=True)
         k = max(1, int(len(ranked) * top_ratio))
         donors = ranked[:k]
         receivers = list(reversed(ranked[-k:]))
@@ -73,6 +144,8 @@ class CustomController(ControllerImpl):
                     "receiver": rec["agent_id"],
                     "donor": donor["agent_id"],
                     "noise_scale": noise_scale,
+                    "receiver_selection_score": rec.get("selection_score"),
+                    "donor_selection_score": donor.get("selection_score"),
                 }
             )
         result = {
@@ -80,6 +153,25 @@ class CustomController(ControllerImpl):
             "ok": True,
             "top_k": k,
             "noise_scale": noise_scale,
+            "selection_mode": "mixed_individual_contribution_collab",
+            "team_context": {
+                "team_fitness": team_ctx.get("team_fitness"),
+                "collaboration_ratio": team_ctx.get("collaboration_ratio"),
+                "replication_all_pass": team_ctx.get("replication_all_pass"),
+                "replication_pass_rate": team_ctx.get("replication_pass_rate"),
+                "replication_verified_rate": team_ctx.get("replication_verified_rate"),
+                "publishable_rate": team_ctx.get("publishable_rate"),
+            },
+            "top_donors": [
+                {
+                    "agent_id": d.get("agent_id"),
+                    "selection_score": d.get("selection_score"),
+                    "individual_fitness": d.get("individual_fitness"),
+                    "contribution_credit_total": d.get("contribution_credit_total"),
+                    "collab_count": d.get("collab_count"),
+                }
+                for d in donors[: min(5, len(donors))]
+            ],
             "changes": changes,
         }
         base = os.getenv("MAS_PROJECT_ABS_PATH", ".")
@@ -104,10 +196,23 @@ class CustomController(ControllerImpl):
             await self.run_agent_method(aid, "state", "set_state", "shared_notes", [])
             await self.run_agent_method(aid, "state", "set_state", "inbox_evidence", [])
             await self.run_agent_method(aid, "state", "set_state", "last_action", None)
+            await self.run_agent_method(aid, "state", "set_state", "last_effective_action", None)
             await self.run_agent_method(aid, "state", "set_state", "last_reward", 0.0)
+            await self.run_agent_method(aid, "state", "set_state", "last_learning_reward", 0.0)
+            await self.run_agent_method(aid, "state", "set_state", "last_reward_components", {})
             await self.run_agent_method(aid, "state", "set_state", "last_fitness", None)
             await self.run_agent_method(aid, "state", "set_state", "last_paper_id", None)
             await self.run_agent_method(aid, "state", "set_state", "current_task_id", None)
+            await self.run_agent_method(aid, "state", "set_state", "episode_reward_ledger", {})
+            await self.run_agent_method(aid, "state", "set_state", "episode_action_counts", {})
+            await self.run_agent_method(aid, "state", "set_state", "credit_buffer", 0.0)
+            await self.run_agent_method(aid, "state", "set_state", "contribution_credit_total", 0.0)
+            await self.run_agent_method(aid, "state", "set_state", "share_sent_evidence_count", 0)
+            await self.run_agent_method(aid, "state", "set_state", "share_sent_observation_count", 0)
+            await self.run_agent_method(aid, "state", "set_state", "paper_write_count", 0)
+            await self.run_agent_method(aid, "state", "set_state", "review_count", 0)
+            await self.run_agent_method(aid, "state", "set_state", "replication_count", 0)
+            await self.run_agent_method(aid, "state", "set_state", "last_selection_score", None)
 
     async def finalize_episode(self, episode_index: int = 0) -> Dict[str, Any]:
         """Aggregate agent fitness and write a leaderboard for the episode."""
@@ -127,6 +232,10 @@ class CustomController(ControllerImpl):
             exp_count = await self.run_agent_method(aid, "state", "get_state", "exp_count")
             hypothesis = await self.run_agent_method(aid, "state", "get_state", "hypothesis")
             paper_id = await self.run_agent_method(aid, "state", "get_state", "last_paper_id")
+            contribution_credit_total = await self.run_agent_method(aid, "state", "get_state", "contribution_credit_total")
+            share_sent_evidence_count = await self.run_agent_method(aid, "state", "get_state", "share_sent_evidence_count")
+            share_sent_observation_count = await self.run_agent_method(aid, "state", "get_state", "share_sent_observation_count")
+            episode_action_counts = await self.run_agent_method(aid, "state", "get_state", "episode_action_counts")
             record = {
                 "agent_id": aid,
                 "fitness": fitness,
@@ -134,6 +243,10 @@ class CustomController(ControllerImpl):
                 "hypothesis": hypothesis,
                 "policy": policy,
                 "paper_id": paper_id,
+                "contribution_credit_total": float(contribution_credit_total or 0.0),
+                "share_sent_evidence_count": int(share_sent_evidence_count or 0),
+                "share_sent_observation_count": int(share_sent_observation_count or 0),
+                "episode_action_counts": episode_action_counts or {},
             }
             records.append(record)
 
@@ -164,66 +277,106 @@ class CustomController(ControllerImpl):
 
         graph_vals = [float((r.get("fitness") or {}).get("graph_score", 0.0) or 0.0) for r in records]
         evidence_vals = [float((r.get("fitness") or {}).get("evidence_score", 0.0) or 0.0) for r in records]
+        evidence_cov_vals = [float((r.get("fitness") or {}).get("evidence_coverage_score", 0.0) or 0.0) for r in records]
         replication_flags = [bool((r.get("fitness") or {}).get("replication_ok", False)) for r in records if r.get("fitness")]
+        replication_verified_flags = [
+            bool((r.get("fitness") or {}).get("replication_verified", False)) for r in records if r.get("fitness")
+        ]
+        publishable_flags = [bool((r.get("fitness") or {}).get("publishable", False)) for r in records if r.get("fitness")]
+        preprint_flags = [bool((r.get("fitness") or {}).get("gate_preprint_pass", False)) for r in records if r.get("fitness")]
+        readiness_vals = [float((r.get("fitness") or {}).get("readiness_score", 0.0) or 0.0) for r in records]
+        replication_support_vals = [
+            float((r.get("fitness") or {}).get("replication_support_score", 0.0) or 0.0) for r in records if r.get("fitness")
+        ]
         budget_vals = [int((r.get("fitness") or {}).get("budget", 10) or 10) for r in records if r.get("fitness")]
         mean_budget = sum(budget_vals) / len(budget_vals) if budget_vals else 10
         cost = sum(float(rec.get("exp_count") or 0) / max(1.0, float(mean_budget)) for rec in records) / max(1, len(records))
         team_graph = sum(graph_vals) / max(1, len(graph_vals))
         team_evidence = sum(evidence_vals) / max(1, len(evidence_vals))
-        team_fitness = team_graph + 0.2 * team_evidence - cost
+        team_evidence_coverage = sum(evidence_cov_vals) / max(1, len(evidence_cov_vals))
         replication_all_pass = all(replication_flags) if replication_flags else False
-        replication_penalty = 0.3
-        if not replication_all_pass:
-            team_fitness *= replication_penalty
+        replication_pass_rate = (
+            sum(1.0 for x in replication_flags if x) / len(replication_flags) if replication_flags else 0.0
+        )
+        replication_verified_rate = (
+            sum(1.0 for x in replication_verified_flags if x) / len(replication_verified_flags)
+            if replication_verified_flags
+            else 0.0
+        )
+        publishable_rate = (
+            sum(1.0 for x in publishable_flags if x) / len(publishable_flags) if publishable_flags else 0.0
+        )
+        preprint_ready_rate = (
+            sum(1.0 for x in preprint_flags if x) / len(preprint_flags) if preprint_flags else 0.0
+        )
+        team_readiness = sum(readiness_vals) / max(1, len(readiness_vals))
+        team_replication_support = sum(replication_support_vals) / max(1, len(replication_support_vals)) if replication_support_vals else 0.0
 
-        world_spec = await self.run_environment("science", "get_world_spec")
-        current_episode_id = world_spec.get("episode_id")
-        trace_path = os.path.join(base, "logs", "app", "action", "trace.jsonl")
+        # Team protocol v4: smoother rates preserve evolutionary signal under strict pipelines.
+        team_quality = (
+            0.60 * team_graph
+            + 0.15 * team_evidence
+            + 0.05 * team_evidence_coverage
+            + 0.10 * replication_pass_rate
+            + 0.10 * publishable_rate
+        )
+        team_fitness = team_quality + (0.10 * team_readiness) + (0.05 * replication_verified_rate) - cost
+        # Smooth replication penalty replaces hard all-pass collapse.
+        replication_penalty = 0.80 + (0.20 * replication_pass_rate)
+        team_fitness *= replication_penalty
+        if replication_verified_rate <= 0.0:
+            team_fitness -= 0.05
+
         share_count = 0
         total_actions = 0
-        if os.path.exists(trace_path):
-            try:
-                with open(trace_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        rec = json.loads(line)
-                        if current_episode_id is not None and rec.get("episode_id") != current_episode_id:
-                            continue
-                        action = rec.get("action")
-                        if action:
-                            total_actions += 1
-                            if action in ("share_evidence", "share_observation"):
-                                share_count += 1
-            except Exception as e:
-                logger.warning(f"Failed to parse trace for collaboration ratio: {e}")
+        for rec in records:
+            counts = rec.get("episode_action_counts") or {}
+            if not isinstance(counts, dict):
+                continue
+            total_actions += sum(int(v or 0) for v in counts.values())
+            share_count += int(counts.get("share_evidence", 0) or 0) + int(counts.get("share_observation", 0) or 0)
         collaboration_ratio = float(share_count) / float(total_actions) if total_actions else 0.0
+        team_contrib_credit = sum(float(rec.get("contribution_credit_total") or 0.0) for rec in records)
+        team_share_sent_evidence = sum(int(rec.get("share_sent_evidence_count") or 0) for rec in records)
+        team_share_sent_observation = sum(int(rec.get("share_sent_observation_count") or 0) for rec in records)
 
         team_record = {
             "ts": datetime.utcnow().isoformat() + "Z",
             "episode_index": episode_index,
             "team_graph": team_graph,
             "team_evidence": team_evidence,
+            "team_evidence_coverage": team_evidence_coverage,
             "team_cost": cost,
             "team_fitness": team_fitness,
             "replication_all_pass": replication_all_pass,
-            "replication_penalty": replication_penalty if not replication_all_pass else 1.0,
+            "replication_penalty": replication_penalty,
+            "replication_pass_rate": replication_pass_rate,
+            "replication_verified_rate": replication_verified_rate,
+            "team_replication_support": team_replication_support,
+            "publishable_rate": publishable_rate,
+            "preprint_ready_rate": preprint_ready_rate,
+            "team_readiness": team_readiness,
             "collaboration_ratio": collaboration_ratio,
+            "team_contribution_credit": team_contrib_credit,
+            "team_share_sent_evidence": team_share_sent_evidence,
+            "team_share_sent_observation": team_share_sent_observation,
         }
+        self._last_team_record = dict(team_record)
 
         try:
-            with open(leaderboard_json_path, "w", encoding="utf-8") as f:
-                f.write(json.dumps({"ts": summary["ts"], "leaderboard": flat_rows}, ensure_ascii=False, indent=2))
-                f.write("\n")
-            with open(leaderboard_csv_path, "w", encoding="utf-8") as f:
-                f.write("rank,agent_id,paper_id,f1,graph_score,evidence_score,replication_ok,fitness,exp_count,hypothesis\n")
-                for row in flat_rows:
-                    hypothesis = row.get("hypothesis") or []
-                    hypothesis_str = "|".join(str(v) for v in hypothesis)
-                    f.write(
-                        f'{row["rank"]},{row["agent_id"]},{row.get("paper_id")},{row.get("f1")},{row.get("graph_score")},{row.get("evidence_score")},{row.get("replication_ok")},{row.get("fitness")},{row.get("exp_count")},{hypothesis_str}\n'
-                    )
+            if self._log_mode != "minimal":
+                with open(leaderboard_json_path, "w", encoding="utf-8") as f:
+                    f.write(json.dumps({"ts": summary["ts"], "leaderboard": flat_rows}, ensure_ascii=False, indent=2))
+                    f.write("\n")
+            if self._log_mode == "verbose":
+                with open(leaderboard_csv_path, "w", encoding="utf-8") as f:
+                    f.write("rank,agent_id,paper_id,f1,graph_score,evidence_score,replication_ok,fitness,exp_count,hypothesis\n")
+                    for row in flat_rows:
+                        hypothesis = row.get("hypothesis") or []
+                        hypothesis_str = "|".join(str(v) for v in hypothesis)
+                        f.write(
+                            f'{row["rank"]},{row["agent_id"]},{row.get("paper_id")},{row.get("f1")},{row.get("graph_score")},{row.get("evidence_score")},{row.get("replication_ok")},{row.get("fitness")},{row.get("exp_count")},{hypothesis_str}\n'
+                        )
             with open(team_metrics_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(team_record, ensure_ascii=False) + "\n")
 

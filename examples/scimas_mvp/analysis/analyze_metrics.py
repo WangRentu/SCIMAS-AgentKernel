@@ -191,8 +191,13 @@ def analyze(project_root: str) -> Dict[str, Any]:
                 "team_fitness",
                 "team_graph",
                 "team_evidence",
+                "team_evidence_coverage",
                 "team_cost",
                 "replication_all_pass",
+                "replication_pass_rate",
+                "replication_verified_rate",
+                "publishable_rate",
+                "team_readiness",
                 "collaboration_ratio",
             ]
         )
@@ -203,8 +208,13 @@ def analyze(project_root: str) -> Dict[str, Any]:
                     float(row.get("team_fitness", 0.0) or 0.0),
                     float(row.get("team_graph", 0.0) or 0.0),
                     float(row.get("team_evidence", 0.0) or 0.0),
+                    float(row.get("team_evidence_coverage", 0.0) or 0.0),
                     float(row.get("team_cost", 0.0) or 0.0),
                     bool(row.get("replication_all_pass", False)),
+                    float(row.get("replication_pass_rate", 0.0) or 0.0),
+                    float(row.get("replication_verified_rate", 0.0) or 0.0),
+                    float(row.get("publishable_rate", 0.0) or 0.0),
+                    float(row.get("team_readiness", 0.0) or 0.0),
                     float(row.get("collaboration_ratio", 0.0) or 0.0),
                 ]
             )

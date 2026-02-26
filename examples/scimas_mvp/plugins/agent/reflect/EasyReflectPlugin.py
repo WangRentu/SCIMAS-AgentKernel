@@ -22,15 +22,22 @@ class EasyReflectPlugin(ReflectPlugin):
         policy = await self.state_plug.get_state("policy") or {}
         action_space = await self.state_plug.get_state("action_space") or list(policy.keys())
         last_action = await self.state_plug.get_state("last_action")
+        last_effective_action = await self.state_plug.get_state("last_effective_action") or last_action
         last_reward = await self.state_plug.get_state("last_reward") or 0.0
+        last_learning_reward = await self.state_plug.get_state("last_learning_reward")
+        if last_learning_reward is None:
+            last_learning_reward = last_reward
         alpha = await self.state_plug.get_state("alpha") or 0.3
         beta = await self.state_plug.get_state("beta") or 2.0
 
         if not policy or not last_action:
             logger.info(f"Agent {self.agent_id} has no policy update this tick.")
             return {}
+        if last_effective_action not in action_space:
+            logger.info(f"Agent {self.agent_id} effective action {last_effective_action} not in action_space.")
+            return {}
 
-        rewards = {action: (last_reward if action == last_action else 0.0) for action in action_space}
+        rewards = {action: (last_learning_reward if action == last_effective_action else 0.0) for action in action_space}
         exp_vals = {action: math.exp(beta * reward) for action, reward in rewards.items()}
         denom = sum(exp_vals.values()) or 1.0
         softmax = {action: (value / denom) for action, value in exp_vals.items()}
@@ -46,4 +53,10 @@ class EasyReflectPlugin(ReflectPlugin):
 
         await self.state_plug.set_state("policy", updated)
         logger.info(f"Agent {self.agent_id} updated policy: {updated}")
-        return {"policy": updated, "last_action": last_action, "last_reward": last_reward}
+        return {
+            "policy": updated,
+            "last_action": last_action,
+            "last_effective_action": last_effective_action,
+            "last_reward": last_reward,
+            "last_learning_reward": last_learning_reward,
+        }

@@ -57,10 +57,23 @@ class EasyStatePlugin(StatePlugin):
         self._state_data.setdefault("shared_notes", [])
         self._state_data.setdefault("inbox_evidence", [])
         self._state_data.setdefault("last_action", None)
+        self._state_data.setdefault("last_effective_action", None)
         self._state_data.setdefault("last_reward", 0.0)
+        self._state_data.setdefault("last_learning_reward", 0.0)
+        self._state_data.setdefault("last_reward_components", {})
         self._state_data.setdefault("last_fitness", None)
         self._state_data.setdefault("last_paper_id", None)
         self._state_data.setdefault("current_task_id", None)
+        self._state_data.setdefault("episode_reward_ledger", {})
+        self._state_data.setdefault("episode_action_counts", {})
+        self._state_data.setdefault("credit_buffer", 0.0)
+        self._state_data.setdefault("contribution_credit_total", 0.0)
+        self._state_data.setdefault("share_sent_evidence_count", 0)
+        self._state_data.setdefault("share_sent_observation_count", 0)
+        self._state_data.setdefault("paper_write_count", 0)
+        self._state_data.setdefault("review_count", 0)
+        self._state_data.setdefault("replication_count", 0)
+        self._state_data.setdefault("last_selection_score", None)
         
     async def init(self):
         self.agent_id = self._component.agent.agent_id

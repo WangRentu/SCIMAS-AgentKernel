@@ -84,6 +84,8 @@ class EasyPlanPlugin(PlanPlugin):
     def _choose_open_task(self, tasks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not tasks:
             return None
+        ready_tasks = [t for t in tasks if t.get("ready", True)]
+        tasks = ready_tasks or tasks
         preferred = self._preferred_task_types()
         for task_type in preferred:
             for task in tasks:
