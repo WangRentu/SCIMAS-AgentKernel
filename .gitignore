@@ -32,3 +32,5 @@ mkdocs.yml
 generate_static_docs.py
 figure/
 per_tick_reports/
+data/airs_raw_datasets/
+runs/

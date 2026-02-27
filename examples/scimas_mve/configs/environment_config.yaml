@@ -1,0 +1,26 @@
+name: EasyEnvironment
+components:
+  relation:
+    plugin:
+      EasyRelationPlugin:
+        relations: 'agents_relation'
+  space:
+    plugin:
+      EasySpacePlugin:
+        agents: 'map_agents'
+  science:
+    plugin:
+      AIRSWorldPlugin:
+        tasks_root: "data/airs_tasks/rad"
+        shared_data_dir: "../../data/airs_raw_datasets"
+        workspace_root: "runs/airs_workspace"
+        seed: 42
+        budget: 8
+        lambda_cost: 0.25
+        hint_accuracy: 0.9
+        view_ratio: 0.35
+        task_sampling: "random"
+        strict_task_dependencies: true
+        active_worker_count: 8
+        max_claims_per_agent: 1
+        task_lease_ttl: 4

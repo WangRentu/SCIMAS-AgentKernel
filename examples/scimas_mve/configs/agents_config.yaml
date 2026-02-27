@@ -1,0 +1,31 @@
+templates:
+  - name: "EasyAgent"
+    component_order:
+        - "perceive"
+        - "plan"
+        - "invoke"
+        - "state"
+        - "reflect"
+    components:
+      profile:
+        plugin:
+          EasyProfilePlugin:
+            profile_data: "agent_profiles"
+      state:
+        plugin:
+          EasyStatePlugin:
+            alpha: 0.3
+            beta: 2.0
+            budget: 10
+      plan:
+        plugin:
+          EasyPlanPlugin: {}
+      invoke:
+        plugin:
+          EasyInvokePlugin: {}
+      perceive:
+        plugin:
+          EasyPerceivePlugin: {}
+      reflect:
+        plugin:
+          EasyReflectPlugin: {}
