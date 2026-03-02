@@ -1,0 +1,51 @@
+FROM python:3.11-slim
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+ARG TORCH_VERSION=2.5.1
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    g++ \
+    git \
+    curl \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY examples/scimas_mve/docker/requirements.airs.txt /tmp/requirements.airs.txt
+
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install --index-url ${TORCH_INDEX_URL} torch==${TORCH_VERSION} && \
+    python -m pip install -r /tmp/requirements.airs.txt
+
+RUN python - <<'PY'
+import importlib
+mods = [
+    "datasets",
+    "numpy",
+    "pandas",
+    "sklearn",
+    "scipy",
+    "sktime",
+    "torch",
+    "torchmetrics",
+    "rouge_score",
+]
+missing = []
+for m in mods:
+    try:
+        importlib.import_module(m)
+    except Exception as e:
+        missing.append((m, str(e)))
+if missing:
+    raise RuntimeError(f"Missing modules in image: {missing}")
+print("AIRS runtime dependency check passed.")
+PY
+
+CMD ["python", "-c", "print('scimas-airs-runtime ready')"]

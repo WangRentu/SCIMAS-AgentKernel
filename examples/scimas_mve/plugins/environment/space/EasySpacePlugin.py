@@ -14,6 +14,7 @@ class EasySpacePlugin(SpacePlugin):
     '''
     def __init__(self, agents: Optional[Dict[str, Any]] = None):
         self.agents = agents or None
+        self.objects: Dict[str, Any] = {}
         log_mode = (os.getenv("SCIMAS_LOG_MODE", "compact") or "compact").strip().lower()
         self._verbose_space_logs = os.getenv(
             "SCIMAS_VERBOSE_SPACE_LOGS",
@@ -22,6 +23,18 @@ class EasySpacePlugin(SpacePlugin):
         
         if self._verbose_space_logs:
             logger.info(f"EasySpacePlugin initialized with {len(agents)} agents.")
+
+    async def init(self) -> None:
+        """Space component uses in-memory state only; nothing async to initialize."""
+        return None
+
+    async def save_to_db(self) -> None:
+        """No-op persistence hook to satisfy framework's concurrent save pipeline."""
+        return None
+
+    async def load_from_db(self) -> None:
+        """No-op load hook since space state is rebuilt from runtime configs."""
+        return None
         
     async def get_agent(self, entity_id: str) -> Optional[Dict[str, Any]]:
         """MODIFIED: Gets agent info from memory."""

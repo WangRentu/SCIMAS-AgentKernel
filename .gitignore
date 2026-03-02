@@ -34,3 +34,4 @@ figure/
 per_tick_reports/
 data/airs_raw_datasets/
 runs/
+tmp/

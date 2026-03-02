@@ -43,12 +43,17 @@ class EasyPlanPlugin(PlanPlugin):
         notes = await self.state_plug.get_state("notes") or []
         shared_notes = await self.state_plug.get_state("shared_notes") or []
         shared_observations = await self.state_plug.get_state("shared_observations") or []
+        data_card = await self.state_plug.get_state("data_card")
+        method_card = await self.state_plug.get_state("method_card")
+        prepare_data_ready = bool(await self.state_plug.get_state("prepare_data_ready"))
 
         task_plan = await self._plan_from_taskboard(
             current_tick=current_tick,
             hypothesis=hypothesis,
             observations=observations,
             notes=notes,
+            data_card=data_card if isinstance(data_card, dict) else None,
+            method_card=method_card if isinstance(method_card, dict) else None,
         )
         if task_plan:
             self.plan.append(task_plan)
@@ -62,6 +67,12 @@ class EasyPlanPlugin(PlanPlugin):
             action = "read"
         if exp_count >= budget and action in ("experiment",):
             action = "write"
+        if action in ("profile_data", "experiment") and not prepare_data_ready:
+            action = "prepare_data"
+        if action == "experiment" and not isinstance(data_card, dict):
+            action = "profile_data"
+        if action == "experiment" and not isinstance(method_card, dict):
+            action = "retrieve_literature"
         if action == "share_evidence" and not notes:
             action = "read"
         if action == "share_observation" and not observations:
@@ -77,7 +88,7 @@ class EasyPlanPlugin(PlanPlugin):
         return {"plan": self.plan}
 
     def _preferred_task_types(self) -> List[str]:
-        ordered = ["read", "experiment", "write", "replicate", "review", "hypothesize"]
+        ordered = ["read", "prepare_data", "profile_data", "retrieve_literature", "hypothesize", "experiment", "write", "replicate", "review"]
         if not ordered:
             return []
         offset = abs(hash(self.agent_id)) % len(ordered)
@@ -101,7 +112,34 @@ class EasyPlanPlugin(PlanPlugin):
         hypothesis: List[str],
         observations: List[Dict[str, Any]],
         notes: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]],
+        method_card: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
+        remembered_task_id = await self.state_plug.get_state("current_task_id")
+        if remembered_task_id:
+            try:
+                task_get = await self._component.agent.controller.run_environment(
+                    "science",
+                    "task_get",
+                    task_id=str(remembered_task_id),
+                    current_tick=current_tick,
+                )
+            except Exception:
+                task_get = None
+            remembered_task = (task_get or {}).get("task") if isinstance(task_get, dict) else None
+            if isinstance(remembered_task, dict):
+                status = str(remembered_task.get("status") or "")
+                if status in {"claimed", "running"} and str(remembered_task.get("claimed_by") or "") == str(self.agent_id):
+                    plan_item: Dict[str, Any] = {
+                        "action": "complete_task",
+                        "task_id": remembered_task.get("task_id"),
+                        "task_action": remembered_task.get("task_type", "read"),
+                    }
+                    task_payload = dict(remembered_task.get("payload") or {})
+                    if task_payload:
+                        plan_item["task_payload"] = task_payload
+                    return plan_item
+
         listed_claimed = await self._component.agent.controller.run_environment(
             "science",
             "task_list",
@@ -114,6 +152,27 @@ class EasyPlanPlugin(PlanPlugin):
             task = claimed_tasks[0]
             task_action = task.get("task_type", "read")
             plan_item: Dict[str, Any] = {
+                "action": "complete_task",
+                "task_id": task.get("task_id"),
+                "task_action": task_action,
+            }
+            task_payload = dict(task.get("payload") or {})
+            if task_payload:
+                plan_item["task_payload"] = task_payload
+            return plan_item
+
+        listed_running = await self._component.agent.controller.run_environment(
+            "science",
+            "task_list",
+            status="running",
+            agent_id=self.agent_id,
+            current_tick=current_tick,
+        )
+        running_tasks = (listed_running or {}).get("tasks", []) if isinstance(listed_running, dict) else []
+        if running_tasks:
+            task = running_tasks[0]
+            task_action = task.get("task_type", "read")
+            plan_item = {
                 "action": "complete_task",
                 "task_id": task.get("task_id"),
                 "task_action": task_action,
@@ -143,6 +202,8 @@ class EasyPlanPlugin(PlanPlugin):
                     hypothesis=hypothesis,
                     observations=observations,
                     notes=notes,
+                    data_card=data_card,
+                    method_card=method_card,
                 ),
                 "non_claim_reason": "not_active_worker" if not active_worker else "claim_backoff",
             }
@@ -161,6 +222,8 @@ class EasyPlanPlugin(PlanPlugin):
                     hypothesis=hypothesis,
                     observations=observations,
                     notes=notes,
+                    data_card=data_card,
+                    method_card=method_card,
                 ),
                 "non_claim_reason": "no_open_task",
             }
@@ -176,8 +239,17 @@ class EasyPlanPlugin(PlanPlugin):
         hypothesis: List[str],
         observations: List[Dict[str, Any]],
         notes: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]],
+        method_card: Optional[Dict[str, Any]],
     ) -> str:
         # Keep non-active/backoff agents productive with low-cost supporting work.
+        prepare_data_ready = bool(data_card) and not bool(data_card.get("degraded", False)) if isinstance(data_card, dict) else False
+        if not prepare_data_ready:
+            return "prepare_data"
+        if not isinstance(data_card, dict):
+            return "profile_data"
+        if not isinstance(method_card, dict):
+            return "retrieve_literature"
         if len(notes) < 2:
             return "read"
         if not hypothesis:

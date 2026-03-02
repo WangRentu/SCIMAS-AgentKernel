@@ -9,9 +9,6 @@ evaluate_container_python_requirements:
   - pandas
   - numpy
   - torch
-  - pyext
-prepare_code_python_requirements:
-  - pyext
 logging_info:
   name: CodeGenerationAPPSPassAt5
   category: Code

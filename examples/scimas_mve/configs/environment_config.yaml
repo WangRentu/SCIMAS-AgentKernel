@@ -13,14 +13,43 @@ components:
       AIRSWorldPlugin:
         tasks_root: "data/airs_tasks/rad"
         shared_data_dir: "../../data/airs_raw_datasets"
-        workspace_root: "runs/airs_workspace"
+        workspace_root: "logs/runs/airs_workspace"
         seed: 42
         budget: 8
         lambda_cost: 0.25
         hint_accuracy: 0.9
         view_ratio: 0.35
-        task_sampling: "random"
+        task_sampling: "fixed_supported_list"
         strict_task_dependencies: true
-        active_worker_count: 8
+        active_worker_count: 4
         max_claims_per_agent: 1
         task_lease_ttl: 4
+        task_lease_ttl_experiment: 20
+        experiment_max_active_leases: 4
+        hard_budget_gate: true
+        max_experiment_runs: 8
+        max_episode_steps: 0
+        max_episode_cost: 0.0
+        experiment_min_completed_read: 1
+        experiment_min_completed_profile_data: 1
+        experiment_min_completed_retrieve_literature: 1
+        method_card_topk: 3
+        prepare_data_timeout_s: 1800
+        profile_min_completed_prepare_data: 1
+        profile_data_timeout_s: 180
+        profile_sample_rows: 500
+        profile_max_columns: 64
+        profile_use_cache_direct: true
+        profile_timeseries_max_rows: 1200
+        code_agent_enable: true
+        code_run_timeout_s: 600
+        code_cpu_limit_s: 240
+        code_memory_mb: 8192
+        code_forbid_network: true
+        code_executor_backend: "docker"
+        code_executor_fallback_soft: true
+        code_docker_image: "scimas-airs-runtime:py311-v1"
+        code_docker_bin: "docker"
+        code_docker_cpus: 2.0
+        code_docker_gpus: "all"
+        code_docker_keepalive: false

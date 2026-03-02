@@ -1,10 +1,35 @@
 from __future__ import annotations
 
-import html
 import json
 import os
-from collections import defaultdict
-from typing import Any, Dict, List, Tuple
+import re
+from collections import Counter, defaultdict
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+
+_STAGE_ORDER = [
+    "prepare",
+    "profile",
+    "literature",
+    "read",
+    "hypothesize",
+    "experiment",
+    "review",
+    "write",
+    "replicate",
+    "other",
+]
+
+
+def _read_json(path: str) -> Optional[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -27,55 +52,16 @@ def _latest_by_reset(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any
     if not rows:
         return []
     start_idx = 0
-    prev = rows[0].get(key)
-    try:
-        prev_num = int(prev)
-    except Exception:
-        prev_num = None
-    for idx in range(1, len(rows)):
-        cur = rows[idx].get(key)
+    prev_num = None
+    for idx, row in enumerate(rows):
         try:
-            cur_num = int(cur)
+            cur_num = int(row.get(key))
         except Exception:
             cur_num = None
         if prev_num is not None and cur_num is not None and cur_num < prev_num:
             start_idx = idx
         prev_num = cur_num
     return rows[start_idx:]
-
-
-def _latest_team_metrics(path: str) -> List[Dict[str, Any]]:
-    rows = _read_jsonl(path)
-    latest = _latest_by_reset(rows, "episode_index")
-    return sorted(latest, key=lambda r: int(r.get("episode_index", 0) or 0))
-
-
-def _tail_evolution_for_run(path: str, episodes_count: int) -> List[Dict[str, Any]]:
-    rows = _read_jsonl(path)
-    if not rows or episodes_count <= 1:
-        return []
-    return rows[-max(0, episodes_count - 1) :]
-
-
-def _latest_taskboard(path: str) -> List[Dict[str, Any]]:
-    return _latest_by_reset(_read_jsonl(path), "episode_id")
-
-
-def _latest_papers(path: str) -> List[Dict[str, Any]]:
-    return _latest_by_reset(_read_jsonl(path), "episode_id")
-
-
-def _latest_chain_metrics(path: str) -> List[Dict[str, Any]]:
-    rows = _read_jsonl(path)
-    latest = _latest_by_reset(rows, "episode_index")
-    return sorted(latest, key=lambda r: int(r.get("episode_index", 0) or 0))
-
-
-def _to_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
 
 
 def _to_int(v: Any, default: int = 0) -> int:
@@ -85,655 +71,1325 @@ def _to_int(v: Any, default: int = 0) -> int:
         return default
 
 
-def _sparkline_svg(
-    values: List[float],
-    width: int = 420,
-    height: int = 120,
-    color: str = "#1f77b4",
-    fill: str | None = None,
-) -> str:
-    if not values:
-        return f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}"></svg>'
-    lo = min(values)
-    hi = max(values)
-    if abs(hi - lo) < 1e-12:
-        hi = lo + 1.0
-    n = max(1, len(values) - 1)
-    pts: List[str] = []
-    for i, v in enumerate(values):
-        x = (i / n) * (width - 1)
-        y = (1.0 - (v - lo) / (hi - lo)) * (height - 18) + 8
-        pts.append(f"{x:.1f},{y:.1f}")
-    polyline = " ".join(pts)
-    baseline = height - 10
-    area = ""
-    if fill:
-        area = (
-            f'<polygon points="0,{baseline} {polyline} {width - 1},{baseline}" '
-            f'fill="{fill}" opacity="0.15"></polygon>'
-        )
-    return (
-        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="chart">'
-        f'<line x1="0" y1="{baseline}" x2="{width}" y2="{baseline}" stroke="#d9dde3" stroke-width="1"/>'
-        f"{area}"
-        f'<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>'
-        f"</svg>"
-    )
+def _to_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
 
 
-def _badge(ok: bool, label_true: str = "OK", label_false: str = "NO") -> str:
-    cls = "ok" if ok else "bad"
-    label = label_true if ok else label_false
-    return f'<span class="badge {cls}">{html.escape(label)}</span>'
+def _to_dt(ts: str) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
 
 
-def _aggregate_taskboard(rows: List[Dict[str, Any]], episodes_count: int) -> Dict[int, Dict[str, Any]]:
-    stats: Dict[int, Dict[str, Any]] = {
-        ep: {"create": 0, "claim": 0, "complete": 0, "release": 0, "release_reasons": defaultdict(int)}
-        for ep in range(1, episodes_count + 1)
-    }
-    for row in rows:
-        ep = _to_int(row.get("episode_id"), -1)
-        if ep < 1 or ep > episodes_count:
-            continue
-        event = str(row.get("event") or "")
-        if event in stats[ep]:
-            stats[ep][event] += 1
-        if event == "release":
-            meta = row.get("meta") or {}
-            reason = str(meta.get("reason") or "unknown")
-            stats[ep]["release_reasons"][reason] += 1
-    for ep in stats:
-        rel = int(stats[ep]["release"] or 0)
-        comp = int(stats[ep]["complete"] or 0)
-        stats[ep]["release_complete_ratio"] = (rel / comp) if comp else (1.0 if rel else 0.0)
-        stats[ep]["top_release_reason"] = ""
-        if stats[ep]["release_reasons"]:
-            stats[ep]["top_release_reason"] = max(
-                stats[ep]["release_reasons"].items(), key=lambda kv: kv[1]
-            )[0]
-        stats[ep]["release_reasons"] = dict(stats[ep]["release_reasons"])
-    return stats
+def _extract_error_signature(stderr_text: str) -> str:
+    text = str(stderr_text or "").strip()
+    if not text:
+        return ""
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    if not lines:
+        return ""
+    tail = lines[-1]
+    # Keep concise while still actionable (e.g., ValueError: xxx).
+    return tail[:220]
 
 
-def _aggregate_papers(rows: List[Dict[str, Any]], episodes_count: int) -> Dict[int, Dict[str, Any]]:
-    stats: Dict[int, Dict[str, Any]] = {
-        ep: {
-            "writes": 0,
-            "reviews": 0,
-            "avg_write_fitness": 0.0,
-            "avg_write_f1": 0.0,
-            "replication_verified_rate": 0.0,
-            "replication_ok_rate": 0.0,
-            "holdout_pass_rate": 0.0,
-        }
-        for ep in range(1, episodes_count + 1)
-    }
-    write_fit_vals: Dict[int, List[float]] = defaultdict(list)
-    write_f1_vals: Dict[int, List[float]] = defaultdict(list)
-    rep_verified: Dict[int, List[int]] = defaultdict(list)
-    rep_ok: Dict[int, List[int]] = defaultdict(list)
-    holdout_pass: Dict[int, List[int]] = defaultdict(list)
-
-    for row in rows:
-        ep = _to_int(row.get("episode_id"), -1)
-        if ep < 1 or ep > episodes_count:
-            continue
-        source = str(row.get("source") or "")
-        metrics = row.get("metrics") or {}
-        if source == "write":
-            stats[ep]["writes"] += 1
-            if "fitness" in metrics:
-                write_fit_vals[ep].append(_to_float(metrics.get("fitness")))
-            if "f1" in metrics:
-                write_f1_vals[ep].append(_to_float(metrics.get("f1")))
-        elif source == "review":
-            stats[ep]["reviews"] += 1
-        if metrics:
-            rep_verified[ep].append(1 if bool(metrics.get("replication_verified", False)) else 0)
-            rep_ok[ep].append(1 if bool(metrics.get("replication_ok", False)) else 0)
-            if metrics.get("replication_holdout_pass") is not None:
-                holdout_pass[ep].append(1 if bool(metrics.get("replication_holdout_pass", False)) else 0)
-
-    for ep in range(1, episodes_count + 1):
-        wf = write_fit_vals.get(ep, [])
-        w1 = write_f1_vals.get(ep, [])
-        rv = rep_verified.get(ep, [])
-        ro = rep_ok.get(ep, [])
-        hp = holdout_pass.get(ep, [])
-        stats[ep]["avg_write_fitness"] = sum(wf) / len(wf) if wf else 0.0
-        stats[ep]["avg_write_f1"] = sum(w1) / len(w1) if w1 else 0.0
-        stats[ep]["replication_verified_rate"] = sum(rv) / len(rv) if rv else 0.0
-        stats[ep]["replication_ok_rate"] = sum(ro) / len(ro) if ro else 0.0
-        stats[ep]["holdout_pass_rate"] = sum(hp) / len(hp) if hp else 0.0
-    return stats
-
-
-def _diagnosis(episode_rows: List[Dict[str, Any]]) -> List[str]:
-    if not episode_rows:
-        return ["没有可用 episode 指标。"]
-    fit = [r["team_fitness"] for r in episode_rows]
-    collab = [r["collaboration_ratio"] for r in episode_rows]
-    release_ratio = [
-        _to_float(r.get("task_release_complete_ratio"), _to_float(r.get("task_release_per_complete")))
-        for r in episode_rows
+def _extract_dev_score(stdout_text: str, stderr_text: str) -> Optional[float]:
+    merged = f"{stdout_text}\n{stderr_text}"
+    patterns = [
+        r"\bdev[_\s-]?score\b\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+        r"\b(score|metric|mase|accuracy|f1)\b\s*[:=]\s*(-?\d+(?:\.\d+)?)",
     ]
-    writes = [r["writes"] for r in episode_rows]
-
-    notes: List[str] = []
-    if fit[-1] < fit[0]:
-        notes.append("团队总分 `team_fitness` 首尾下降，当前演化未收敛。")
-    elif fit[-1] > fit[0]:
-        notes.append("团队总分 `team_fitness` 首尾上升，存在正向演化信号。")
-    else:
-        notes.append("团队总分 `team_fitness` 基本持平。")
-    if collab[-1] < collab[0]:
-        notes.append("协作占比 `collaboration_ratio` 首尾下降，协作未随演化增强。")
-    elif collab[-1] > collab[0]:
-        notes.append("协作占比 `collaboration_ratio` 首尾上升。")
-    if max(release_ratio) > 0.4:
-        notes.append("任务释放/完成比偏高，说明严格依赖或写作前置条件与当前策略不匹配。")
-    if sum(writes) == 0:
-        notes.append("没有成功写作记录，系统被流程门槛完全卡住。")
-    elif writes[-1] < max(writes):
-        notes.append("后期写作数量低于峰值，可能出现任务空转或前置条件失败。")
-    return notes
+    for pat in patterns:
+        m = re.search(pat, merged, flags=re.IGNORECASE)
+        if not m:
+            continue
+        g = m.group(1 if len(m.groups()) == 1 else 2)
+        try:
+            return float(g)
+        except Exception:
+            continue
+    return None
 
 
-def _series_card(title: str, values: List[float], color: str, unit: str = "") -> str:
-    if values:
-        first = values[0]
-        last = values[-1]
-        best = max(values)
-        delta = last - first
-    else:
-        first = last = best = delta = 0.0
-    return f"""
-    <section class="panel">
-      <div class="panel-head">
-        <h3>{html.escape(title)}</h3>
-        <div class="mini-stats">
-          <span>first: {first:.4f}{unit}</span>
-          <span>last: {last:.4f}{unit}</span>
-          <span>best: {best:.4f}{unit}</span>
-          <span class="{'pos' if delta >= 0 else 'neg'}">delta: {delta:+.4f}{unit}</span>
-        </div>
-      </div>
-      {_sparkline_svg(values, color=color, fill=color)}
-    </section>
-    """
+def _stage_for_task_type(task_type: str) -> str:
+    t = str(task_type or "").strip().lower()
+    if t in {"prepare_data"}:
+        return "prepare"
+    if t in {"profile_data"}:
+        return "profile"
+    if t in {"retrieve_literature"}:
+        return "literature"
+    if t in {"read"}:
+        return "read"
+    if t in {"hypothesize"}:
+        return "hypothesize"
+    if t in {"experiment"}:
+        return "experiment"
+    if t in {"review", "verify_issue", "verify_strength"}:
+        return "review"
+    if t in {"write"}:
+        return "write"
+    if t in {"replicate"}:
+        return "replicate"
+    return "other"
 
 
-def _build_dashboard_payload(base_dir: str) -> Dict[str, Any]:
+def _extract_run_id(obj: Any) -> Optional[str]:
+    if isinstance(obj, dict):
+        rid = obj.get("run_id")
+        if isinstance(rid, str) and rid.strip():
+            return rid.strip()
+        for v in obj.values():
+            out = _extract_run_id(v)
+            if out:
+                return out
+    elif isinstance(obj, list):
+        for item in obj:
+            out = _extract_run_id(item)
+            if out:
+                return out
+    return None
+
+
+def _parse_episode_task_name(episode_dir_name: str) -> Dict[str, Any]:
+    m = re.match(r"episode_(\d+)__(.+)$", episode_dir_name)
+    if not m:
+        return {"episode_id": 0, "task_name": episode_dir_name}
+    return {"episode_id": int(m.group(1)), "task_name": m.group(2)}
+
+
+def _collect_taskboard(base_dir: str) -> Dict[str, Any]:
+    tb_path = os.path.join(base_dir, "logs", "app", "environment", "taskboard.jsonl")
+    events = _latest_by_reset(_read_jsonl(tb_path), "episode_id")
+
+    task_latest: Dict[str, Dict[str, Any]] = {}
+    release_reasons = Counter()
+    agent_stats: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"claimed": 0, "completed": 0, "released": 0, "active": 0, "errors": 0}
+    )
+    timeline: List[Dict[str, Any]] = []
+    phase_counts: Dict[str, Counter] = defaultdict(Counter)
+    claim_start_durations: List[int] = []
+    start_complete_durations: List[int] = []
+    claim_complete_seconds: List[float] = []
+    claim_ts_by_task: Dict[str, str] = {}
+    artifacts_index: Dict[str, Dict[str, Any]] = {}
+
+    for idx, row in enumerate(events):
+        event = str(row.get("event") or "")
+        ts = str(row.get("ts") or "")
+        episode_id = _to_int(row.get("episode_id"), 0)
+        task = row.get("task") or {}
+        task_id = str(task.get("task_id") or "")
+        task_type = str(task.get("task_type") or "")
+        owner = str(task.get("claimed_by") or (row.get("meta") or {}).get("agent_id") or "")
+
+        if not task_id:
+            continue
+
+        if event == "release":
+            reason = str((row.get("meta") or {}).get("reason") or "unknown")
+            release_reasons[reason] += 1
+            if owner:
+                agent_stats[owner]["released"] += 1
+                if reason.startswith("inner_action_failed") or "timeout" in reason or "error" in reason:
+                    agent_stats[owner]["errors"] += 1
+        elif event == "claim":
+            if owner:
+                agent_stats[owner]["claimed"] += 1
+                agent_stats[owner]["active"] += 1
+        elif event == "complete":
+            if owner:
+                agent_stats[owner]["completed"] += 1
+                agent_stats[owner]["active"] = max(0, agent_stats[owner]["active"] - 1)
+
+        run_id = _extract_run_id((task.get("result") or {}))
+        started_tick = task.get("started_tick")
+        claimed_tick = task.get("claimed_tick")
+        last_heartbeat_tick = task.get("last_heartbeat_tick")
+        claim_to_start_ticks = None
+        start_to_complete_ticks = None
+        if claimed_tick is not None and started_tick is not None:
+            claim_to_start_ticks = _to_int(started_tick, -1) - _to_int(claimed_tick, -1)
+            if claim_to_start_ticks >= 0:
+                claim_start_durations.append(claim_to_start_ticks)
+        if started_tick is not None and last_heartbeat_tick is not None:
+            start_to_complete_ticks = _to_int(last_heartbeat_tick, -1) - _to_int(started_tick, -1)
+            if start_to_complete_ticks >= 0:
+                start_complete_durations.append(start_to_complete_ticks)
+
+        stage = _stage_for_task_type(task_type)
+        phase_counts[stage][event] += 1
+
+        if event == "claim":
+            claim_ts_by_task[task_id] = ts
+        if event == "complete":
+            t0 = _to_dt(claim_ts_by_task.get(task_id, ""))
+            t1 = _to_dt(ts)
+            if t0 and t1:
+                dt_s = (t1 - t0).total_seconds()
+                if dt_s >= 0:
+                    claim_complete_seconds.append(dt_s)
+
+            action_data = ((task.get("result") or {}).get("action_data") or {})
+            card = action_data.get("data_card")
+            if isinstance(card, dict) and card:
+                artifacts_index[f"{task_id}::data_card"] = {
+                    "artifact_type": "data_card",
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "episode_id": episode_id,
+                    "owner": owner,
+                    "run_id": run_id or "",
+                    "ts": ts,
+                    "payload": card,
+                }
+            method = action_data.get("method_card")
+            if isinstance(method, dict) and method:
+                artifacts_index[f"{task_id}::method_card"] = {
+                    "artifact_type": "method_card",
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "episode_id": episode_id,
+                    "owner": owner,
+                    "run_id": run_id or "",
+                    "ts": ts,
+                    "payload": method,
+                }
+            evidence = action_data.get("evidence_cards")
+            if isinstance(evidence, list) and evidence:
+                artifacts_index[f"{task_id}::evidence_cards"] = {
+                    "artifact_type": "evidence_cards",
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "episode_id": episode_id,
+                    "owner": owner,
+                    "run_id": run_id or "",
+                    "ts": ts,
+                    "payload": evidence[:30],
+                }
+            if task_type == "write":
+                artifacts_index[f"{task_id}::paper"] = {
+                    "artifact_type": "paper",
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "episode_id": episode_id,
+                    "owner": owner,
+                    "run_id": run_id or "",
+                    "ts": ts,
+                    "payload": action_data if isinstance(action_data, dict) else {},
+                }
+            if task_type == "replicate":
+                artifacts_index[f"{task_id}::replication_report"] = {
+                    "artifact_type": "replication_report",
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "episode_id": episode_id,
+                    "owner": owner,
+                    "run_id": run_id or "",
+                    "ts": ts,
+                    "payload": action_data if isinstance(action_data, dict) else {},
+                }
+
+        timeline.append(
+            {
+                "id": f"EV{idx:06d}",
+                "ts": ts,
+                "episode_id": episode_id,
+                "event": event,
+                "task_id": task_id,
+                "task_type": task_type,
+                "stage": stage,
+                "owner": owner,
+                "status": str(task.get("status") or ""),
+                "lease_ttl": _to_int(task.get("lease_ttl"), 0),
+                "heartbeat": _to_int(task.get("heartbeat_count"), 0),
+                "claimed_tick": claimed_tick,
+                "started_tick": started_tick,
+                "last_heartbeat_tick": last_heartbeat_tick,
+                "claim_to_start_ticks": claim_to_start_ticks,
+                "start_to_complete_ticks": start_to_complete_ticks,
+                "release_reason": str((row.get("meta") or {}).get("reason") or ""),
+                "run_id": run_id,
+                "result": task.get("result") or {},
+            }
+        )
+
+        task_latest[task_id] = {
+            "task_id": task_id,
+            "episode_id": episode_id,
+            "task_type": task_type,
+            "stage": stage,
+            "state": str(task.get("status") or ""),
+            "owner": owner,
+            "lease_ttl": _to_int(task.get("lease_ttl"), 0),
+            "heartbeat": _to_int(task.get("heartbeat_count"), 0),
+            "claimed_tick": claimed_tick,
+            "started_tick": started_tick,
+            "last_heartbeat_tick": last_heartbeat_tick,
+            "claim_to_start_ticks": claim_to_start_ticks,
+            "start_to_complete_ticks": start_to_complete_ticks,
+            "depends_on": list(task.get("depends_on") or []),
+            "last_update": ts,
+            "last_event": event,
+            "release_reason": str((row.get("meta") or {}).get("reason") or ""),
+            "run_id": run_id,
+            "result": task.get("result"),
+        }
+
+    task_rows = sorted(task_latest.values(), key=lambda x: (x.get("episode_id", 0), x.get("task_id", "")))
+    timeline = sorted(timeline, key=lambda x: x.get("ts", ""))
+
+    # agent status heuristics
+    agents: List[Dict[str, Any]] = []
+    for aid, s in sorted(agent_stats.items(), key=lambda kv: kv[0]):
+        if s["active"] > 0:
+            status = "running"
+        elif s["errors"] > 0 and s["completed"] == 0:
+            status = "error"
+        elif s["completed"] > 0:
+            status = "idle"
+        else:
+            status = "idle"
+        agents.append(
+            {
+                "agent_id": aid,
+                "status": status,
+                "claimed": s["claimed"],
+                "completed": s["completed"],
+                "released": s["released"],
+                "errors": s["errors"],
+            }
+        )
+
+    event_counts = Counter(x.get("event") for x in timeline)
+    top_release_reason = release_reasons.most_common(1)[0][0] if release_reasons else "-"
+    timing = {
+        "avg_claim_to_start_ticks": (sum(claim_start_durations) / len(claim_start_durations)) if claim_start_durations else 0.0,
+        "avg_start_to_complete_ticks": (sum(start_complete_durations) / len(start_complete_durations)) if start_complete_durations else 0.0,
+        "avg_claim_to_complete_s": (sum(claim_complete_seconds) / len(claim_complete_seconds)) if claim_complete_seconds else 0.0,
+        "samples_claim_to_start": len(claim_start_durations),
+        "samples_start_to_complete": len(start_complete_durations),
+        "samples_claim_to_complete": len(claim_complete_seconds),
+    }
+
+    return {
+        "events": timeline,
+        "task_snapshot": task_rows,
+        "agents": agents,
+        "event_counts": dict(event_counts),
+        "release_reasons": dict(release_reasons),
+        "top_release_reason": top_release_reason,
+        "phase_counts": {k: dict(v) for k, v in phase_counts.items()},
+        "timing": timing,
+        "artifacts_index": list(artifacts_index.values()),
+    }
+
+
+def _collect_workspace_runs(base_dir: str, max_runs: int = 200) -> Dict[str, Any]:
+    runs_root = os.path.join(base_dir, "logs", "runs", "airs_workspace")
+    rows: List[Dict[str, Any]] = []
+
+    if not os.path.exists(runs_root):
+        return {"runs": [], "artifacts": {}}
+
+    episode_dirs = sorted([x for x in os.listdir(runs_root) if x.startswith("episode_")])
+    for ep_dir in episode_dirs:
+        ep_info = _parse_episode_task_name(ep_dir)
+        ep_path = os.path.join(runs_root, ep_dir)
+
+        data_card_path = os.path.join(ep_path, "_analysis", "profile_data", "data_card.json")
+        method_card_path = os.path.join(ep_path, "_analysis", "method_card", "method_card.json")
+        data_card = _read_json(data_card_path)
+        method_card = _read_json(method_card_path)
+
+        run_dirs = sorted([x for x in os.listdir(ep_path) if x.startswith("RUN")])
+        for run_name in run_dirs:
+            agent_log = os.path.join(ep_path, run_name, "agent_log")
+            code_run_path = os.path.join(agent_log, "code_run.json")
+            solver_run_path = os.path.join(agent_log, "solver_run.json")
+            submission_path = os.path.join(agent_log, "submission.csv")
+
+            code_log = _read_json(code_run_path)
+            solver_log = _read_json(solver_run_path)
+            if not code_log and not solver_log and not os.path.exists(submission_path):
+                continue
+
+            code_plan = (code_log or {}).get("code_plan") or {}
+            files = []
+            for item in list(code_plan.get("files") or [])[:8]:
+                if not isinstance(item, dict):
+                    continue
+                files.append(
+                    {
+                        "path": str(item.get("path") or ""),
+                        "content": str(item.get("content") or "")[:120000],
+                    }
+                )
+
+            run_result = (code_log or {}).get("run_result") or {}
+            stdout_text = str(run_result.get("stdout") or "")
+            stderr_text = str(run_result.get("stderr") or "")
+            dev_score = _extract_dev_score(stdout_text, stderr_text)
+            error_signature = _extract_error_signature(stderr_text)
+            rows.append(
+                {
+                    "episode_id": ep_info.get("episode_id", 0),
+                    "task_name": (code_log or {}).get("task_name") or ep_info.get("task_name", ""),
+                    "run_id": run_name,
+                    "run_key": f"{ep_info.get('episode_id', 0)}::{run_name}",
+                    "executor": (code_log or {}).get("executor_used") or "",
+                    "exit_code": run_result.get("exit_code"),
+                    "duration_s": _to_float(run_result.get("duration_s"), 0.0),
+                    "timed_out": bool(run_result.get("timed_out", False)),
+                    "stderr": stderr_text[-12000:],
+                    "stdout": stdout_text[-12000:],
+                    "error_signature": error_signature,
+                    "dev_score": dev_score,
+                    "command": str(run_result.get("command") or ""),
+                    "artifacts": list(run_result.get("artifacts") or []),
+                    "code_plan": {
+                        "run_cmd": str(code_plan.get("run_cmd") or ""),
+                        "notes": str(code_plan.get("notes") or ""),
+                        "files": files,
+                    },
+                    "submission_exists": os.path.exists(submission_path),
+                    "submission_path": submission_path if os.path.exists(submission_path) else "",
+                    "data_card": data_card,
+                    "method_card": method_card,
+                    "code_log_path": code_run_path if code_log else "",
+                    "solver_log_path": solver_run_path if solver_log else "",
+                    "workspace_dir": str((code_log or {}).get("workspace_dir") or ""),
+                    "snapshot_before_run": str((code_log or {}).get("snapshot_before_run") or ""),
+                }
+            )
+
+    rows = sorted(rows, key=lambda x: (x.get("episode_id", 0), x.get("run_id", "")))
+    if len(rows) > max_runs:
+        rows = rows[-max_runs:]
+
+    artifacts = {
+        r["run_key"]: {
+            "submission_path": r.get("submission_path") or "",
+            "code_log_path": r.get("code_log_path") or "",
+            "solver_log_path": r.get("solver_log_path") or "",
+            "workspace_dir": r.get("workspace_dir") or "",
+            "snapshot_before_run": r.get("snapshot_before_run") or "",
+            "artifact_count": len(r.get("artifacts") or []),
+        }
+        for r in rows
+    }
+
+    return {"runs": rows, "artifacts": artifacts}
+
+
+def _collect_team_metrics(base_dir: str) -> Dict[str, Any]:
     sim_dir = os.path.join(base_dir, "logs", "app", "simulation")
-    env_dir = os.path.join(base_dir, "logs", "app", "environment")
+    team_rows = _latest_by_reset(_read_jsonl(os.path.join(sim_dir, "team_metrics.jsonl")), "episode_index")
+    chain_rows = _latest_by_reset(_read_jsonl(os.path.join(sim_dir, "research_chain_metrics.jsonl")), "episode_index")
 
-    team_rows = _latest_team_metrics(os.path.join(sim_dir, "team_metrics.jsonl"))
-    chain_rows = _latest_chain_metrics(os.path.join(sim_dir, "research_chain_metrics.jsonl"))
-    episodes_count = len(team_rows)
-    evo_rows = _tail_evolution_for_run(os.path.join(sim_dir, "evolution.jsonl"), episodes_count)
-    taskboard_rows = _latest_taskboard(os.path.join(env_dir, "taskboard.jsonl"))
-
-    task_stats = _aggregate_taskboard(taskboard_rows, episodes_count)
-    chain_by_ep = {int(r.get("episode_index", 0) or 0) + 1: r for r in chain_rows}
-
-    episode_rows: List[Dict[str, Any]] = []
-    for idx, row in enumerate(team_rows, start=1):
-        ep = idx
-        task = task_stats.get(ep, {})
+    chain_by_ep = {(_to_int(r.get("episode_index"), 0) + 1): r for r in chain_rows}
+    episodes: List[Dict[str, Any]] = []
+    for row in team_rows:
+        ep = _to_int(row.get("episode_index"), 0) + 1
         chain = chain_by_ep.get(ep, {})
-        evo = evo_rows[idx - 1] if idx - 1 < len(evo_rows) else {}
-        donor = ((evo or {}).get("top_donors") or [{}])[0] if evo else {}
-        task_claim = _to_int(row.get("taskboard_claim_events"), _to_int(chain.get("taskboard_claim_events"), _to_int(task.get("claim"))))
-        task_complete = _to_int(
-            row.get("taskboard_complete_events"),
-            _to_int(chain.get("taskboard_complete_events"), _to_int(task.get("complete"))),
-        )
-        task_release = _to_int(
-            row.get("taskboard_release_events"),
-            _to_int(chain.get("taskboard_release_events"), _to_int(task.get("release"))),
-        )
-        complete_per_claim = _to_float(
-            row.get("taskboard_complete_per_claim"),
-            _to_float(chain.get("taskboard_complete_per_claim"), (float(task_complete) / float(task_claim)) if task_claim else 0.0),
-        )
-        release_per_complete = _to_float(
-            row.get("taskboard_release_per_complete"),
-            _to_float(chain.get("taskboard_release_per_complete"), _to_float(task.get("release_complete_ratio"))),
-        )
-        writes = _to_int(chain.get("action_write"), 0)
-        reviews = _to_int(chain.get("action_review"), 0)
-        episode_rows.append(
+        episodes.append(
             {
                 "episode": ep,
-                "team_fitness": _to_float(row.get("team_fitness")),
-                "team_graph": _to_float(row.get("team_graph")),
-                "team_evidence": _to_float(row.get("team_evidence")),
-                "team_evidence_coverage": _to_float(row.get("team_evidence_coverage")),
-                "team_cost": _to_float(row.get("team_cost")),
-                "collaboration_ratio": _to_float(row.get("collaboration_ratio")),
-                "replication_all_pass": bool(row.get("replication_all_pass", False)),
-                "replication_pass_rate": _to_float(row.get("replication_pass_rate")),
-                "replication_verified_rate": _to_float(row.get("replication_verified_rate")),
-                "publishable_rate": _to_float(row.get("publishable_rate")),
-                "preprint_ready_rate": _to_float(row.get("preprint_ready_rate")),
-                "team_readiness": _to_float(row.get("team_readiness")),
-                "team_replication_support": _to_float(row.get("team_replication_support")),
-                "team_contribution_credit": _to_float(row.get("team_contribution_credit")),
-                "share_evidence": _to_int(row.get("team_share_sent_evidence")),
-                "share_observation": _to_int(row.get("team_share_sent_observation")),
-                "task_create": _to_int(task.get("create")),
-                "task_claim": task_claim,
-                "task_complete": task_complete,
-                "task_release": task_release,
-                "task_complete_per_claim": complete_per_claim,
-                "task_release_per_complete": release_per_complete,
-                # backward compatibility for old diagnosis/card keys
-                "task_release_complete_ratio": release_per_complete,
-                "task_top_release_reason": str(task.get("top_release_reason") or ""),
-                "writes": writes,
-                "reviews": reviews,
-                "avg_write_fitness": _to_float(chain.get("action_write"), float(writes)),
-                "avg_write_f1": 0.0,
-                "paper_replication_verified_rate": _to_float(row.get("replication_verified_rate")),
-                "paper_replication_ok_rate": _to_float(row.get("replication_pass_rate")),
-                "paper_holdout_pass_rate": 0.0,
-                "research_steps_total": _to_int(chain.get("research_steps_total"), 0),
-                "research_steps_per_claim": _to_float(chain.get("research_steps_per_claim"), 0.0),
-                "action_read": _to_int(chain.get("action_read"), 0),
-                "action_hypothesize": _to_int(chain.get("action_hypothesize"), 0),
+                "team_fitness": _to_float(row.get("team_fitness"), 0.0),
+                "collaboration_ratio": _to_float(row.get("collaboration_ratio"), 0.0),
+                "publishable_rate": _to_float(row.get("publishable_rate"), 0.0),
+                "replication_pass_rate": _to_float(row.get("replication_pass_rate"), 0.0),
+                "task_claim": _to_int(row.get("taskboard_claim_events"), _to_int(chain.get("taskboard_claim_events"), 0)),
+                "task_complete": _to_int(
+                    row.get("taskboard_complete_events"), _to_int(chain.get("taskboard_complete_events"), 0)
+                ),
+                "task_release": _to_int(
+                    row.get("taskboard_release_events"), _to_int(chain.get("taskboard_release_events"), 0)
+                ),
+                "release_per_complete": _to_float(
+                    row.get("taskboard_release_per_complete"), _to_float(chain.get("taskboard_release_per_complete"), 0.0)
+                ),
+                "complete_per_claim": _to_float(
+                    row.get("taskboard_complete_per_claim"), _to_float(chain.get("taskboard_complete_per_claim"), 0.0)
+                ),
                 "action_experiment": _to_int(chain.get("action_experiment"), 0),
                 "action_write": _to_int(chain.get("action_write"), 0),
                 "action_review": _to_int(chain.get("action_review"), 0),
                 "action_replicate": _to_int(chain.get("action_replicate"), 0),
-                "active_worker_count": _to_int(chain.get("active_worker_count"), _to_int(taskboard_rows[0].get("meta", {}).get("active_worker_count"), 0) if taskboard_rows else 0),
-                "top_donor": donor.get("agent_id"),
-                "top_donor_selection_score": _to_float(donor.get("selection_score")) if donor else None,
+                "task_top_release_reason": str(
+                    row.get("taskboard_top_release_reason") or chain.get("taskboard_top_release_reason") or ""
+                ),
             }
         )
 
+    summary = {
+        "episodes_count": len(episodes),
+        "final_team_fitness": episodes[-1]["team_fitness"] if episodes else 0.0,
+        "final_publishable_rate": episodes[-1]["publishable_rate"] if episodes else 0.0,
+        "final_replication_pass": episodes[-1]["replication_pass_rate"] if episodes else 0.0,
+        "final_complete_per_claim": episodes[-1]["complete_per_claim"] if episodes else 0.0,
+        "final_release_per_complete": episodes[-1]["release_per_complete"] if episodes else 0.0,
+    }
+    return {"episodes": episodes, "summary": summary}
+
+
+def _collect_papers(base_dir: str, max_rows: int = 200) -> List[Dict[str, Any]]:
+    papers_path = os.path.join(base_dir, "logs", "app", "research", "papers.jsonl")
+    rows = _latest_by_reset(_read_jsonl(papers_path), "episode_id")
+    out: List[Dict[str, Any]] = []
+    for r in rows[-max_rows:]:
+        metrics = r.get("metrics") or {}
+        out.append(
+            {
+                "ts": str(r.get("ts") or ""),
+                "episode_id": _to_int(r.get("episode_id"), 0),
+                "paper_id": str(r.get("paper_id") or ""),
+                "agent_id": str(r.get("agent_id") or ""),
+                "source": str(r.get("source") or ""),
+                "fitness": _to_float(metrics.get("fitness"), 0.0),
+                "f1": _to_float(metrics.get("f1"), 0.0),
+                "replication_ok": bool(metrics.get("replication_ok", False)),
+                "replication_verified": bool(metrics.get("replication_verified", False)),
+                "publishable": bool(metrics.get("publishable", False)),
+            }
+        )
+    return out
+
+
+def _collect_evidence_cards(base_dir: str, max_rows: int = 300) -> List[Dict[str, Any]]:
+    path = os.path.join(base_dir, "logs", "app", "research", "evidence_cards.jsonl")
+    rows = _latest_by_reset(_read_jsonl(path), "episode_id")
+    out: List[Dict[str, Any]] = []
+    for r in rows[-max_rows:]:
+        out.append(
+            {
+                "ts": str(r.get("ts") or ""),
+                "episode_id": _to_int(r.get("episode_id"), 0),
+                "evidence_id": str(r.get("evidence_id") or ""),
+                "agent_id": str(r.get("agent_id") or ""),
+                "source": str(r.get("source") or ""),
+                "task_id": str(r.get("task_id") or ""),
+                "run_id": str(r.get("run_id") or ""),
+                "kind": str(r.get("kind") or ""),
+                "content": r.get("content"),
+            }
+        )
+    return out
+
+
+def _collect_action_trace(base_dir: str, max_rows: int = 600) -> List[Dict[str, Any]]:
+    path = os.path.join(base_dir, "logs", "app", "action", "trace.jsonl")
+    rows = _latest_by_reset(_read_jsonl(path), "episode_id")
+    out: List[Dict[str, Any]] = []
+    for r in rows[-max_rows:]:
+        out.append(
+            {
+                "ts": str(r.get("ts") or ""),
+                "episode_id": _to_int(r.get("episode_id"), 0),
+                "agent_id": str(r.get("agent_id") or ""),
+                "action": str(r.get("action") or ""),
+                "status": str(r.get("status") or ""),
+                "task_id": str(r.get("task_id") or ""),
+                "run_id": str(r.get("run_id") or ""),
+                "reason": str((r.get("meta") or {}).get("reason") or ""),
+                "summary": str(r.get("summary") or ""),
+            }
+        )
+    return out
+
+
+def _build_dashboard_payload(base_dir: str) -> Dict[str, Any]:
+    tb = _collect_taskboard(base_dir)
+    tm = _collect_team_metrics(base_dir)
+    runs = _collect_workspace_runs(base_dir)
+    papers = _collect_papers(base_dir)
+    evidence_cards = _collect_evidence_cards(base_dir)
+    action_trace = _collect_action_trace(base_dir)
+
+    state_counts = Counter([str(x.get("state") or "unknown") for x in tb.get("task_snapshot") or []])
+    release_reasons = tb.get("release_reasons") or {}
+    alert_items: List[Dict[str, Any]] = []
+    lease_expired = _to_int(release_reasons.get("lease_expired"), 0)
+    if lease_expired > 0:
+        alert_items.append({"level": "warn", "key": "lease_expired", "value": lease_expired})
+    inner_failed = sum(
+        int(v or 0) for k, v in release_reasons.items() if "inner_action_failed" in str(k)
+    )
+    if inner_failed > 0:
+        alert_items.append({"level": "error", "key": "inner_action_failed", "value": inner_failed})
+    run_fail = sum(1 for r in (runs.get("runs") or []) if r.get("exit_code") not in (None, 0))
+    if run_fail > 0:
+        alert_items.append({"level": "error", "key": "code_run_failed", "value": run_fail})
+    timed_out = sum(1 for r in (runs.get("runs") or []) if bool(r.get("timed_out")))
+    if timed_out > 0:
+        alert_items.append({"level": "warn", "key": "code_run_timeout", "value": timed_out})
+    alert_count = len(alert_items)
+
+    health = "green"
+    if alert_count >= 2:
+        health = "red"
+    elif alert_count == 1:
+        health = "yellow"
+
+    episode_ids = {int(_to_int(x.get("episode_id"), 0)) for x in (tb.get("events") or [])}
+    episode_ids = {x for x in episode_ids if x > 0}
+    episodes_count_fallback = max(episode_ids) if episode_ids else 0
+    episodes_count = int(tm.get("summary", {}).get("episodes_count", 0) or 0) or episodes_count_fallback
+    try:
+        live_refresh_seconds = max(2.0, float(os.getenv("SCIMAS_DASHBOARD_BROWSER_REFRESH_S", "5")))
+    except Exception:
+        live_refresh_seconds = 5.0
+
+    meta = {
+        "health": health,
+        "alert_count": alert_count,
+        "alerts": alert_items,
+        "state_counts": dict(state_counts),
+        "top_release_reason": tb.get("top_release_reason", "-"),
+        "episodes_count": episodes_count,
+        "log_mode": str(os.getenv("SCIMAS_LOG_MODE", "compact")),
+        "live_refresh_seconds": live_refresh_seconds,
+    }
+
     return {
-        "episodes": episode_rows,
-        "meta": {
-            "episodes_count": episodes_count,
-            "team_metrics_rows": len(team_rows),
-            "chain_metrics_rows": len(chain_rows),
-            "evolution_rows": len(evo_rows),
-            "taskboard_rows_latest_run": len(taskboard_rows),
-            "log_mode": (os.getenv("SCIMAS_LOG_MODE", "compact") or "compact"),
-        },
+        "meta": meta,
+        "team": tm,
+        "taskboard": tb,
+        "runs": runs,
+        "papers": papers,
+        "evidence_cards": evidence_cards,
+        "action_trace": action_trace,
     }
 
 
+def build_dashboard_payload(base_dir: str) -> Dict[str, Any]:
+    """Public payload builder for separated frontend-backend dashboard servers."""
+    return _build_dashboard_payload(base_dir=base_dir)
+
+
 def _render_html(payload: Dict[str, Any]) -> str:
-    episodes = payload.get("episodes") or []
-    meta = payload.get("meta") or {}
-    if not episodes:
-        return """<!doctype html><html><head><meta charset="utf-8"><title>SCIMAS Dashboard</title></head>
-<body><h2>SCIMAS Evolution Dashboard</h2><p>No episode metrics found yet.</p></body></html>"""
-
-    fit = [r["team_fitness"] for r in episodes]
-    graph = [r["team_graph"] for r in episodes]
-    evidence = [r["team_evidence"] for r in episodes]
-    collab = [r["collaboration_ratio"] for r in episodes]
-    team_ready = [r["team_readiness"] for r in episodes]
-    publishable = [r["publishable_rate"] for r in episodes]
-    rep_pass = [r["replication_pass_rate"] for r in episodes]
-    rep_verified = [r["replication_verified_rate"] for r in episodes]
-    claim_events = [float(r["task_claim"]) for r in episodes]
-    complete_per_claim = [r["task_complete_per_claim"] for r in episodes]
-    release_per_complete = [r["task_release_per_complete"] for r in episodes]
-    research_steps_total = [float(r["research_steps_total"]) for r in episodes]
-    research_steps_per_claim = [r["research_steps_per_claim"] for r in episodes]
-    write_actions = [float(r["action_write"]) for r in episodes]
-    experiment_actions = [float(r["action_experiment"]) for r in episodes]
-
-    final_row = episodes[-1]
-    best_fit_ep = max(episodes, key=lambda r: r["team_fitness"])
-    best_flow_ep = max(episodes, key=lambda r: r["task_complete_per_claim"])
-    worst_flow_ep = max(episodes, key=lambda r: r["task_release_per_complete"])
-
-    flow_ok = final_row["task_complete_per_claim"] >= 0.60 and final_row["task_release_per_complete"] <= 0.35
-    replication_ok = final_row["replication_pass_rate"] >= 0.30
-    publishable_ok = final_row["publishable_rate"] >= 0.15
-    rc_alert_threshold = float(os.getenv("SCIMAS_DASHBOARD_RC_ALERT", "0.4"))
-    cc_warn_threshold = float(os.getenv("SCIMAS_DASHBOARD_CC_WARN", "0.5"))
-
-    rows_html = []
-    rc_alert_eps: List[int] = []
-    cc_warn_eps: List[int] = []
-    for r in episodes:
-        ep = int(r["episode"])
-        rc_alert = float(r["task_release_per_complete"]) > rc_alert_threshold
-        cc_warn = float(r["task_complete_per_claim"]) < cc_warn_threshold
-        row_cls = "row-alert" if (rc_alert or cc_warn) else ""
-        rc_cls = "cell-danger" if rc_alert else ""
-        cc_cls = "cell-warn" if cc_warn else ""
-        if rc_alert:
-            rc_alert_eps.append(ep)
-        if cc_warn:
-            cc_warn_eps.append(ep)
-        rows_html.append(
-            f'<tr class="{row_cls}">'
-            f"<td>{r['episode']}</td>"
-            f"<td>{r['team_fitness']:.4f}</td>"
-            f"<td>{r['task_claim']}/{r['task_complete']}/{r['task_release']}</td>"
-            f'<td class="{cc_cls}">{r["task_complete_per_claim"]:.2f}</td>'
-            f'<td class="{rc_cls}">{r["task_release_per_complete"]:.2f}</td>'
-            f"<td>{r['research_steps_total']}</td>"
-            f"<td>{r['research_steps_per_claim']:.2f}</td>"
-            f"<td>{r['action_read']}/{r['action_hypothesize']}/{r['action_experiment']}/{r['action_write']}</td>"
-            f"<td>{r['collaboration_ratio']:.3f}</td>"
-            f"<td>{r['publishable_rate']:.2f}</td>"
-            f"<td>{r['replication_pass_rate']:.2f}</td>"
-            f"<td>{_badge(r['replication_all_pass'])}</td>"
-            f"<td>{html.escape(str(r.get('top_donor') or '-'))}</td>"
-            "</tr>"
-        )
-
-    cards = [
-        ("Episodes", str(meta.get("episodes_count", len(episodes))), f"log_mode={html.escape(str(meta.get('log_mode')))}"),
-        ("Final Team Fitness", f"{final_row['team_fitness']:.4f}", f"best: EP{best_fit_ep['episode']}={best_fit_ep['team_fitness']:.4f}"),
-        ("Task Flow (C/C)", f"{final_row['task_complete_per_claim']:.2f}", f"best: EP{best_flow_ep['episode']}={best_flow_ep['task_complete_per_claim']:.2f}"),
-        ("Task Flow (R/C)", f"{final_row['task_release_per_complete']:.2f}", f"worst: EP{worst_flow_ep['episode']}={worst_flow_ep['task_release_per_complete']:.2f}"),
-        ("Research Steps", str(final_row["research_steps_total"]), f"steps/claim={final_row['research_steps_per_claim']:.2f}"),
-        ("Action Mix (R/H/E/W)", f"{final_row['action_read']}/{final_row['action_hypothesize']}/{final_row['action_experiment']}/{final_row['action_write']}", "科研动作主链"),
-        ("Publishable Rate", f"{final_row['publishable_rate']:.2f}", f"team_readiness={final_row['team_readiness']:.2f}"),
-        ("Replication Pass", f"{final_row['replication_pass_rate']:.2f}", f"verified={final_row['replication_verified_rate']:.2f}"),
-    ]
-    cards_html = "".join(
-        f'<div class="card"><div class="label">{html.escape(k)}</div><div class="value">{html.escape(v)}</div><div class="hint">{html.escape(h)}</div></div>'
-        for k, v, h in cards
-    )
-
-    metric_defs = [
-        ("task_claim/task_complete/task_release", "任务板三元事件：认领、完成、释放。用于判断是否空转。"),
-        ("task_complete_per_claim", "完成/认领。越高说明任务被实质推进。"),
-        ("task_release_per_complete", "释放/完成。越低越好，高值常见于依赖不满足或写作失败回滚。"),
-        ("research_steps_total", "科研动作总数（read/hypothesize/experiment/write/review/replicate）。越高说明不止在抢任务。"),
-        ("research_steps_per_claim", "科研动作总数/任务认领数。越高说明每次认领更有产出。"),
-        ("Action Mix (R/H/E/W)", "读任务、假设、实验、写作四类关键动作计数。用于看链路是否断在某个环节。"),
-        ("team_fitness", "团队总体目标分（质量+复现+成本）。"),
-        ("publishable_rate", "可发表比例（通过门槛的论文占比）。"),
-        ("replication_pass_rate", "复现通过比例。"),
-        ("collaboration_ratio", "共享动作占比（share_evidence/share_observation）。"),
-    ]
-    metric_defs_html = "".join(
-        f'<tr><td><b>{html.escape(name)}</b></td><td>{html.escape(desc)}</td></tr>' for name, desc in metric_defs
-    )
-
-    diagnosis = _diagnosis(episodes)
-    if rc_alert_eps:
-        diagnosis.append(
-            f"R/C 高风险回合（>{rc_alert_threshold:.2f}）：EP {', '.join(str(x) for x in rc_alert_eps)}。"
-        )
-    if cc_warn_eps:
-        diagnosis.append(
-            f"C/C 低效回合（<{cc_warn_threshold:.2f}）：EP {', '.join(str(x) for x in cc_warn_eps)}。"
-        )
-    diagnosis_html = "".join(f"<li>{html.escape(x)}</li>" for x in diagnosis)
-
-    return f"""<!doctype html>
-<html lang="zh-CN">
+    payload_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    template = """<!doctype html>
+<html lang=\"zh-CN\">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SCIMAS Evolution Dashboard</title>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>SCIMAS ResearchOps Console</title>
   <style>
     :root {{
-      --bg: #f4f8fb;
-      --panel: #ffffff;
-      --ink: #17202a;
-      --muted: #607087;
-      --line: #e6eaf0;
-      --accent: #0a6a95;
-      --danger: #b42318;
-      --good: #067647;
+      --bg: #0b1220;
+      --bg2: #101a2c;
+      --panel: #131f35;
+      --panel2: #172641;
+      --line: #253858;
+      --text: #e7edf7;
+      --muted: #95a4be;
+      --accent: #4cc9f0;
+      --ok: #20bf6b;
+      --warn: #f6c453;
+      --err: #ff6b6b;
+      --chip: #1a2b47;
     }}
     * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      background:
-        radial-gradient(circle at 0% 0%, #d9f2ee, transparent 38%),
-        radial-gradient(circle at 100% 100%, #d8ecf8, transparent 34%),
-        var(--bg);
-      color: var(--ink);
-      font: 14px/1.5 "IBM Plex Sans", "Source Han Sans SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
-    }}
-    .wrap {{ max-width: 1320px; margin: 0 auto; padding: 22px; }}
-    .hero {{
-      background: linear-gradient(130deg, #0e3b5f, #0a6a95);
-      color: #fff;
-      border-radius: 14px;
-      padding: 18px 20px 16px;
-      margin-bottom: 16px;
-      box-shadow: 0 10px 28px rgba(16,59,92,.18);
-    }}
-    .hero h1 {{ margin: 0 0 6px; font-size: 22px; }}
-    .hero p {{ margin: 0; color: rgba(255,255,255,.88); }}
-    .chip-row {{ margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }}
-    .chip {{
-      border-radius: 999px;
-      padding: 4px 10px;
-      background: rgba(255,255,255,.14);
-      color: #fff;
-      font-size: 12px;
-      border: 1px solid rgba(255,255,255,.28);
-    }}
-    .grid {{
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      margin-bottom: 14px;
-    }}
-    .card {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 12px 14px;
-      min-height: 92px;
-    }}
-    .label {{ color: var(--muted); font-size: 12px; }}
-    .value {{ font-size: 24px; font-weight: 700; margin-top: 4px; }}
-    .hint {{ color: var(--muted); margin-top: 4px; }}
-    .stack {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin-bottom: 12px;
-    }}
-    .stack.cols3 {{
-      grid-template-columns: repeat(3, 1fr);
-    }}
-    .panel {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 12px;
-    }}
-    .panel h2, .panel h3 {{ margin: 0; font-size: 16px; }}
-    .panel-head {{ display: flex; justify-content: space-between; gap: 8px; align-items: baseline; margin-bottom: 8px; }}
-    .mini-stats {{ display: flex; gap: 10px; color: var(--muted); font-size: 12px; flex-wrap: wrap; justify-content: flex-end; }}
-    .mini-stats .pos {{ color: var(--good); }}
-    .mini-stats .neg {{ color: var(--danger); }}
-    .mono {{ font-family: "JetBrains Mono", "Consolas", "SFMono-Regular", monospace; }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      overflow: hidden;
-    }}
-    th, td {{
-      border-bottom: 1px solid var(--line);
-      padding: 8px 10px;
-      text-align: left;
-      vertical-align: middle;
-      white-space: nowrap;
-    }}
-    th {{ background: #f8fafc; color: var(--muted); font-weight: 600; }}
-    tr:last-child td {{ border-bottom: none; }}
-    tr.row-alert td {{
-      background: #fffdfa;
-    }}
-    td.cell-warn {{
-      background: #fff7d6 !important;
-      color: #8a5a00;
-      font-weight: 700;
-    }}
-    td.cell-danger {{
-      background: #ffe4e2 !important;
-      color: #9f1239;
-      font-weight: 700;
-    }}
-    .legend {{
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 12px;
-      border-radius: 999px;
-      padding: 2px 8px;
-      border: 1px solid var(--line);
-      background: #fafcff;
-      color: var(--muted);
-    }}
-    .dot {{
-      width: 10px;
-      height: 10px;
-      border-radius: 99px;
-      display: inline-block;
-      border: 1px solid rgba(0,0,0,.08);
-    }}
-    .dot.warn {{ background: #fff2b2; }}
-    .dot.danger {{ background: #fecaca; }}
-    .badge {{
-      display: inline-block;
-      font-size: 11px;
-      padding: 2px 7px;
-      border-radius: 999px;
-      border: 1px solid;
-    }}
-    .badge.ok {{ color: var(--good); border-color: #9ae6b4; background: #ecfdf3; }}
-    .badge.bad {{ color: var(--danger); border-color: #f7b7b2; background: #fff1f1; }}
-    .footer {{
-      color: var(--muted);
-      margin-top: 10px;
-      font-size: 12px;
-    }}
-    @media (max-width: 980px) {{
-      .grid, .stack {{ grid-template-columns: 1fr; }}
-      .stack.cols3 {{ grid-template-columns: 1fr; }}
-      .panel-head {{ flex-direction: column; align-items: flex-start; }}
-      .mini-stats {{ justify-content: flex-start; }}
+    html, body {{ margin: 0; height: 100%; background: radial-gradient(circle at 0% 0%, #132540 0%, transparent 35%), radial-gradient(circle at 100% 100%, #10243a 0%, transparent 32%), var(--bg); color: var(--text); font: 14px/1.45 "IBM Plex Sans", "Noto Sans SC", "Microsoft YaHei", sans-serif; }}
+    .app {{ display: grid; grid-template-rows: 56px 1fr; height: 100%; }}
+    .header {{ display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-bottom: 1px solid var(--line); background: rgba(9,15,28,.65); backdrop-filter: blur(6px); position: sticky; top: 0; z-index: 10; }}
+    .title {{ font-weight: 650; letter-spacing: .2px; }}
+    .header-left, .header-right {{ display: flex; align-items: center; gap: 10px; }}
+    .badge {{ border: 1px solid var(--line); background: var(--chip); padding: 4px 10px; border-radius: 999px; color: var(--muted); font-size: 12px; }}
+    .health-dot {{ width: 10px; height: 10px; border-radius: 99px; display: inline-block; margin-right: 6px; }}
+    .green {{ background: var(--ok); }} .yellow {{ background: var(--warn); }} .red {{ background: var(--err); }}
+
+    .body {{ display: grid; grid-template-columns: 300px 1fr 460px; min-height: 0; transition: grid-template-columns .2s ease; }}
+    .body.inspector-collapsed {{ grid-template-columns: 300px 1fr 0px; }}
+    .sidebar, .main, .inspector {{ min-height: 0; overflow: hidden; }}
+    .sidebar {{ border-right: 1px solid var(--line); background: linear-gradient(180deg, rgba(15,24,42,.98), rgba(14,21,36,.95)); padding: 12px; display: flex; flex-direction: column; gap: 12px; }}
+    .main {{ padding: 12px; overflow: auto; display: grid; grid-template-rows: minmax(280px, 44%) minmax(280px, 56%); gap: 12px; }}
+    .inspector {{ border-left: 1px solid var(--line); background: linear-gradient(180deg, rgba(18,30,50,.97), rgba(14,24,41,.95)); padding: 12px; display: grid; grid-template-rows: auto auto 1fr; gap: 10px; }}
+    .body.inspector-collapsed .inspector {{ display: none; }}
+
+    .panel {{ border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(180deg, rgba(21,34,58,.98), rgba(17,29,49,.95)); overflow: hidden; }}
+    .panel-head {{ display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--line); background: rgba(10,18,33,.45); }}
+    .panel-title {{ font-weight: 620; }}
+    .panel-body {{ padding: 10px 12px; }}
+
+    .filters input[type=text], .filters select {{ width: 100%; background: #0f1b30; border: 1px solid #243958; color: var(--text); border-radius: 8px; padding: 8px 10px; }}
+    .chip-row {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+    .chip {{ border: 1px solid var(--line); background: var(--chip); color: var(--muted); border-radius: 999px; padding: 3px 8px; font-size: 12px; }}
+    .agent-list {{ max-height: 260px; overflow: auto; }}
+    .agent-item {{ display: flex; justify-content: space-between; padding: 7px 8px; border-radius: 8px; cursor: pointer; }}
+    .agent-item:hover, .agent-item.active {{ background: #1b2f4f; }}
+
+    .timeline-wrap {{ display: grid; grid-template-columns: repeat(10, minmax(150px,1fr)); gap: 8px; overflow: auto; padding-bottom: 6px; }}
+    .lane {{ border: 1px solid var(--line); border-radius: 10px; background: rgba(12,21,37,.55); min-height: 220px; }}
+    .lane-head {{ padding: 8px; font-weight: 620; color: #b9cae3; border-bottom: 1px solid var(--line); text-transform: capitalize; }}
+    .lane-body {{ padding: 8px; display: flex; flex-direction: column; gap: 8px; }}
+    .event-card {{ border: 1px solid #2a456c; border-left: 3px solid #4e7fb7; border-radius: 8px; padding: 7px; background: #132440; cursor: pointer; }}
+    .event-card.success {{ border-left-color: var(--ok); }}
+    .event-card.fail {{ border-left-color: var(--err); }}
+    .event-card.release {{ border-left-color: var(--warn); }}
+    .event-card:hover {{ filter: brightness(1.08); }}
+    .event-meta {{ color: var(--muted); font-size: 12px; }}
+
+    .stats-row {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }}
+    .stat-pill {{ border: 1px solid var(--line); background: #14253f; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #bdd0eb; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 12.5px; }}
+    th, td {{ padding: 7px 8px; border-bottom: 1px solid #223655; text-align: left; white-space: nowrap; }}
+    th {{ color: #9fb2ce; background: #11213a; position: sticky; top: 0; z-index: 2; }}
+    tr:hover td {{ background: #1a2e4d; }}
+    tr.selected td {{ background: #213a5f !important; }}
+    .table-wrap {{ max-height: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 10px; }}
+
+    .tabs {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+    .tab-btn {{ border: 1px solid #2a4266; background: #152945; color: #c8d8ef; border-radius: 8px; padding: 5px 10px; cursor: pointer; font-size: 12px; }}
+    .tab-btn.active {{ background: #1f3a62; border-color: #3e6da9; color: #fff; }}
+    .action-btn {{ border: 1px solid var(--line); background: #162b48; color: #d7e7fb; border-radius: 8px; padding: 4px 10px; cursor: pointer; }}
+    .action-btn:hover {{ filter: brightness(1.1); }}
+    .alert-list {{ list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }}
+    .alert-item {{ border: 1px solid #324b70; border-radius: 8px; padding: 6px 8px; font-size: 12px; }}
+    .alert-item.warn {{ border-color: #8a6a2c; background: rgba(246, 196, 83, 0.08); }}
+    .alert-item.error {{ border-color: #7f3434; background: rgba(255, 107, 107, 0.08); }}
+    .inspector-content {{ border: 1px solid var(--line); border-radius: 10px; background: #0f1c31; overflow: auto; padding: 10px; }}
+    .kv {{ display: grid; grid-template-columns: 120px 1fr; gap: 6px 10px; font-size: 12.5px; }}
+    .k {{ color: var(--muted); }}
+    .mono {{ font-family: "JetBrains Mono", "Consolas", monospace; font-size: 12px; }}
+    pre {{ margin: 0; white-space: pre-wrap; word-break: break-word; background: #0a1528; border: 1px solid #213452; border-radius: 8px; padding: 8px; max-height: 280px; overflow: auto; }}
+    .file-tabs {{ display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }}
+    .file-tab {{ border: 1px solid #2a4266; border-radius: 8px; background: #132947; color: #c9d8f0; font-size: 12px; padding: 3px 8px; cursor: pointer; }}
+    .file-tab.active {{ background: #214170; }}
+
+    @media (max-width: 1440px) {{
+      .body {{ grid-template-columns: 270px 1fr 420px; }}
+      .timeline-wrap {{ grid-template-columns: repeat(10, minmax(130px,1fr)); }}
     }}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <section class="hero">
-      <h1>SCIMAS 演化运行仪表盘</h1>
-      <p>核心聚焦：任务流是否有效推进（claim→complete→release）以及科研主链动作是否真实发生并转化为质量提升。</p>
-      <div class="chip-row">
-        <span class="chip">流程健康: {_badge(flow_ok, "正常", "待修复")}</span>
-        <span class="chip">复现通过: {_badge(replication_ok, "达标", "偏低")}</span>
-        <span class="chip">可发表率: {_badge(publishable_ok, "达标", "偏低")}</span>
+  <script id=\"scimas-payload\" type=\"application/json\">__PAYLOAD_JSON__</script>
+  <div class=\"app\">
+    <div class=\"header\">
+      <div class=\"header-left\">
+        <div class=\"title\">SCIMAS ResearchOps Console</div>
+        <span class=\"badge\"><span id=\"health-dot\" class=\"health-dot\"></span><span id=\"health-text\">health</span></span>
+        <span class=\"badge\" id=\"alert-chip\">alerts: 0</span>
+        <span class=\"badge\" id=\"top-release-chip\">top release: -</span>
+        <button id=\"snapshot-btn\" class=\"action-btn\" type=\"button\">Snapshot</button>
+        <button id=\"export-btn\" class=\"action-btn\" type=\"button\">Export JSON</button>
       </div>
-    </section>
-
-    <section class="grid">{cards_html}</section>
-
-    <section class="stack cols3">
-      {_series_card("Task Claim Events", claim_events, "#1d4ed8")}
-      {_series_card("Task Complete/Claim", complete_per_claim, "#0f766e")}
-      {_series_card("Task Release/Complete", release_per_complete, "#b42318")}
-      {_series_card("Research Steps Total", research_steps_total, "#0ea5e9")}
-      {_series_card("Research Steps/Claim", research_steps_per_claim, "#10b981")}
-      {_series_card("Write Actions", write_actions, "#7c3aed")}
-    </section>
-
-    <section class="stack">
-      {_series_card("Team Fitness", fit, "#0f766e")}
-      {_series_card("Collaboration Ratio", collab, "#1d4ed8")}
-      {_series_card("Experiment Actions", experiment_actions, "#2563eb")}
-      {_series_card("Team Graph Score", graph, "#0ea5e9")}
-      {_series_card("Team Evidence Score", evidence, "#f59e0b")}
-      {_series_card("Team Readiness", team_ready, "#10b981")}
-      {_series_card("Publishable Rate", publishable, "#14b8a6")}
-      {_series_card("Replication Pass Rate", rep_pass, "#ef4444")}
-      {_series_card("Replication Verified Rate", rep_verified, "#dc2626")}
-    </section>
-
-    <section class="panel" style="margin-bottom:12px;">
-      <div class="panel-head">
-        <h2>指标说明（当前面板）</h2>
-        <div class="mini-stats">
-          <span>高优先级先看任务流 + steps/claim</span>
-          <span class="mono">release/complete 越低越好</span>
-        </div>
+      <div class=\"header-right\">
+        <input id=\"run-search\" class=\"badge\" style=\"min-width:190px; background:#0f1d33; color:#d9e8fb;\" placeholder=\"Run/Episode Search\" />
+        <select id=\"episode-select\" class=\"badge\"></select>
+        <select id=\"mode-select\" class=\"badge\"><option value=\"live\">Live</option><option value=\"replay\">Replay</option></select>
+        <input id=\"replay-slider\" type=\"range\" min=\"0\" max=\"100\" value=\"100\" style=\"width:160px; display:none;\" />
+        <span class=\"badge\" id=\"tick-chip\">tick: -</span>
+        <button id=\"inspector-toggle\" class=\"action-btn\" type=\"button\">Hide Inspector</button>
       </div>
-      <table>
-        <thead>
-          <tr><th>指标</th><th>含义解释</th></tr>
-        </thead>
-        <tbody>{metric_defs_html}</tbody>
-      </table>
-    </section>
+    </div>
 
-    <section class="panel" style="margin-bottom:12px;">
-      <div class="panel-head">
-        <h2>Episode 明细</h2>
-        <div class="mini-stats">
-          <span class="mono">C/C = complete/claim</span>
-          <span class="mono">R/C = release/complete</span>
-          <span class="legend"><i class="dot warn"></i>C/C &lt; {cc_warn_threshold:.2f}</span>
-          <span class="legend"><i class="dot danger"></i>R/C &gt; {rc_alert_threshold:.2f}</span>
-        </div>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>EP</th>
-            <th>team_fit</th>
-            <th>claim/complete/release</th>
-            <th>C/C</th>
-            <th>R/C</th>
-            <th>steps</th>
-            <th>steps/claim</th>
-            <th>R/H/E/W</th>
-            <th>collab</th>
-            <th>publishable_rate</th>
-            <th>rep_pass_rate</th>
-            <th>team replication</th>
-            <th>top donor</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(rows_html)}
-        </tbody>
-      </table>
-    </section>
+    <div class=\"body\" id=\"layout-body\">
+      <aside class=\"sidebar\">
+        <section class=\"panel\">
+          <div class=\"panel-head\"><div class=\"panel-title\">Filters</div></div>
+          <div class=\"panel-body filters\">
+            <input id=\"search-input\" type=\"text\" placeholder=\"search task/agent/error...\" />
+            <div style=\"height:8px\"></div>
+            <div class=\"chip-row\" id=\"type-filters\"></div>
+            <div style=\"height:8px\"></div>
+            <div class=\"chip-row\" id=\"error-filters\"></div>
+          </div>
+        </section>
 
-    <section class="panel" style="margin-bottom:12px;">
-      <h2>诊断建议</h2>
-      <ul>{diagnosis_html}</ul>
-    </section>
+        <section class=\"panel\">
+          <div class=\"panel-head\"><div class=\"panel-title\">Agents</div><div class=\"event-meta\" id=\"agent-count\"></div></div>
+          <div class=\"panel-body agent-list\" id=\"agent-list\"></div>
+        </section>
 
-    <section class="panel" style="margin-bottom:12px;">
-      <h2>如何阅读（建议顺序）</h2>
-      <ol>
-        <li>先看 `Task Complete/Claim` 和 `Task Release/Complete`。这两个决定系统是否在空转。</li>
-        <li>再看 `Research Steps/Claim` 与 `Action Mix`。判断 claim 后有没有真的进入科研动作链。</li>
-        <li>最后看 `Team Fitness / Publishable / Replication Pass`，确认流程优化是否转化为科研质量。</li>
-      </ol>
-    </section>
+        <section class=\"panel\">
+          <div class=\"panel-head\"><div class=\"panel-title\">Alert Center</div><div class=\"event-meta\" id=\"alert-count-mini\"></div></div>
+          <div class=\"panel-body\">
+            <ul class=\"alert-list\" id=\"alert-list\"></ul>
+          </div>
+        </section>
+      </aside>
 
-    <div class="footer">
-      数据来源：`team_metrics.jsonl` / `research_chain_metrics.jsonl` / `evolution.jsonl` / `taskboard.jsonl`（当前 run 自动截取最新一段）。
+      <main class=\"main\">
+        <section class=\"panel\" style=\"min-height:0;\">
+          <div class=\"panel-head\">
+            <div class=\"panel-title\">Process Timeline</div>
+            <div class=\"event-meta\">read → hypothesize → experiment → review → write → replicate</div>
+          </div>
+          <div class=\"panel-body\" style=\"min-height:0; height:100%;\">
+            <div class=\"timeline-wrap\" id=\"timeline\"></div>
+          </div>
+        </section>
+
+        <section class=\"panel\" style=\"min-height:0;\">
+          <div class=\"panel-head\"><div class=\"panel-title\">Taskboard Live</div><div class=\"event-meta\" id=\"task-summary\"></div></div>
+          <div class=\"panel-body\" style=\"min-height:0; height:100%;\">
+            <div class=\"stats-row\" id=\"task-pills\"></div>
+            <div class=\"table-wrap\" style=\"height: calc(100% - 38px);\">
+              <table>
+                <thead>
+                  <tr><th>Task ID</th><th>Type</th><th>State</th><th>Owner</th><th>Lease/HB</th><th>Deps</th><th>C→S</th><th>S→C</th><th>Last Update</th><th>Release Reason</th><th>Artifacts</th><th>Run</th></tr>
+                </thead>
+                <tbody id=\"task-tbody\"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <aside class=\"inspector\">
+        <section class=\"panel\">
+          <div class=\"panel-head\"><div class=\"panel-title\">Inspector</div><div class=\"event-meta\" id=\"inspector-hint\">select event/task/agent</div></div>
+          <div class=\"panel-body\"><div class=\"kv\" id=\"inspector-summary\"></div></div>
+        </section>
+        <section class=\"tabs\" id=\"inspector-tabs\"></section>
+        <section class=\"inspector-content\" id=\"inspector-content\"></section>
+      </aside>
     </div>
   </div>
+
+  <script>
+    const payload = JSON.parse(document.getElementById('scimas-payload').textContent || '{}');
+    const state = {
+      episode: 0,
+      mode: 'live',
+      search: '',
+      runSearch: '',
+      typeFilter: new Set(),
+      errFilter: new Set(),
+      agent: '',
+      selected: null,
+      tab: 'overview',
+      filePath: '',
+      replayPercent: 100,
+      inspectorCollapsed: false,
+      snapshots: [],
+    };
+
+    const stageOrder = ['prepare','profile','literature','read','hypothesize','experiment','review','write','replicate','other'];
+    const events = (payload.taskboard && payload.taskboard.events) || [];
+    const tasks = (payload.taskboard && payload.taskboard.task_snapshot) || [];
+    const agents = (payload.taskboard && payload.taskboard.agents) || [];
+    const runs = (payload.runs && payload.runs.runs) || [];
+    const papers = payload.papers || [];
+    const evidenceCards = payload.evidence_cards || [];
+    const actionTrace = payload.action_trace || [];
+    const alertItems = (payload.meta && payload.meta.alerts) || [];
+    const runMap = Object.fromEntries(runs.map(r => [r.run_id, r]));
+
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+    }
+
+    function toLocal(ts) {
+      if (!ts) return '-';
+      try { return new Date(ts).toLocaleString(); } catch { return String(ts); }
+    }
+
+    function getReplayTimeCutoff() {
+      if (state.mode !== 'replay') return null;
+      const tsList = events.map(e => Date.parse(e.ts)).filter(v => Number.isFinite(v)).sort((a, b) => a - b);
+      if (!tsList.length) return null;
+      const idx = Math.max(0, Math.min(tsList.length - 1, Math.floor((state.replayPercent / 100) * (tsList.length - 1))));
+      return tsList[idx];
+    }
+
+    function artifactBadges(taskRow) {
+      const bits = [];
+      if (taskRow.run_id) bits.push('run');
+      const resultText = JSON.stringify(taskRow.result || {}).toLowerCase();
+      if (resultText.includes('data_card')) bits.push('data');
+      if (resultText.includes('method_card')) bits.push('method');
+      if (resultText.includes('evidence')) bits.push('evidence');
+      if (taskRow.task_type === 'write') bits.push('paper');
+      if (taskRow.task_type === 'replicate') bits.push('repl');
+      return bits.join('|') || '-';
+    }
+
+    function formatTick(v) {
+      if (v == null || v === '' || Number(v) < 0) return '-';
+      return String(v);
+    }
+
+    function setHeader() {
+      const meta = payload.meta || {};
+      const health = meta.health || 'green';
+      document.getElementById('health-dot').className = `health-dot ${health}`;
+      document.getElementById('health-text').textContent = `health: ${health}`;
+      document.getElementById('alert-chip').textContent = `alerts: ${meta.alert_count || 0}`;
+      document.getElementById('top-release-chip').textContent = `top release: ${meta.top_release_reason || '-'}`;
+      const episodesCount = (payload.team && payload.team.summary && payload.team.summary.episodes_count) || 0;
+      const timing = (payload.taskboard && payload.taskboard.timing) || {};
+      const avgCs = Number(timing.avg_claim_to_start_ticks || 0).toFixed(1);
+      const avgSc = Number(timing.avg_start_to_complete_ticks || 0).toFixed(1);
+      document.getElementById('tick-chip').textContent = `episodes: ${episodesCount} | C→S:${avgCs} S→C:${avgSc}`;
+      document.getElementById('alert-count-mini').textContent = `${meta.alert_count || 0} active`;
+      const alertList = document.getElementById('alert-list');
+      alertList.innerHTML = (alertItems.length ? alertItems : [{ level: 'warn', key: 'none', value: 0 }]).map(a =>
+        `<li class=\"alert-item ${esc(a.level || 'warn')}\"><b>${esc(a.key)}</b> <span class=\"event-meta\">${esc(a.value)}</span></li>`
+      ).join('');
+    }
+
+    function setupEpisodeSelect() {
+      const select = document.getElementById('episode-select');
+      const eps = new Set();
+      events.forEach(e => eps.add(Number(e.episode_id || 0)));
+      runs.forEach(r => eps.add(Number(r.episode_id || 0)));
+      const sorted = [...eps].filter(x => x > 0).sort((a, b) => a - b);
+      select.innerHTML = `<option value=\"0\">All Episodes</option>` + sorted.map(ep => `<option value=\"${ep}\">Episode ${ep}</option>`).join('');
+      select.value = '0';
+      select.onchange = () => { state.episode = Number(select.value || 0); renderAll(); };
+      const modeSel = document.getElementById('mode-select');
+      const replaySlider = document.getElementById('replay-slider');
+      modeSel.onchange = (e) => {
+        state.mode = e.target.value;
+        replaySlider.style.display = state.mode === 'replay' ? 'inline-block' : 'none';
+        renderAll();
+      };
+      replaySlider.oninput = () => { state.replayPercent = Number(replaySlider.value || 100); renderAll(); };
+
+      const runSearch = document.getElementById('run-search');
+      runSearch.oninput = () => { state.runSearch = runSearch.value.trim().toLowerCase(); renderAll(); };
+
+      document.getElementById('inspector-toggle').onclick = () => {
+        state.inspectorCollapsed = !state.inspectorCollapsed;
+        const body = document.getElementById('layout-body');
+        const btn = document.getElementById('inspector-toggle');
+        body.classList.toggle('inspector-collapsed', state.inspectorCollapsed);
+        btn.textContent = state.inspectorCollapsed ? 'Show Inspector' : 'Hide Inspector';
+      };
+
+      document.getElementById('snapshot-btn').onclick = () => {
+        const snap = {
+          ts: new Date().toISOString(),
+          mode: state.mode,
+          episode: state.episode,
+          selected: state.selected,
+          taskboard_timing: (payload.taskboard && payload.taskboard.timing) || {},
+          top_release_reason: (payload.meta && payload.meta.top_release_reason) || '',
+          alerts: alertItems,
+        };
+        state.snapshots.push(snap);
+        const blob = new Blob([JSON.stringify(snap, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `scimas_snapshot_ep${state.episode || 'all'}_${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      };
+
+      document.getElementById('export-btn').onclick = () => {
+        const exportData = {
+          meta: payload.meta || {},
+          team: payload.team || {},
+          taskboard: payload.taskboard || {},
+          runs: payload.runs || {},
+          papers,
+          evidence_cards: evidenceCards,
+          action_trace: actionTrace,
+          snapshots: state.snapshots,
+        };
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `scimas_console_export_${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      };
+    }
+
+    function setupAutoRefresh() {
+      const secs = Number((payload.meta && payload.meta.live_refresh_seconds) || 0);
+      if (!(secs > 0)) return;
+      const intervalMs = Math.max(2000, Math.floor(secs * 1000));
+      const timer = window.setInterval(() => {
+        if (state.mode !== 'live') return;
+        if (document.hidden) return;
+        window.location.reload();
+      }, intervalMs);
+      window.addEventListener('beforeunload', () => window.clearInterval(timer));
+    }
+
+    function setupFilters() {
+      const typeValues = [...new Set(tasks.map(t => String(t.task_type || '')))].filter(Boolean).sort();
+      const typeWrap = document.getElementById('type-filters');
+      typeWrap.innerHTML = typeValues.map(t => `<button class=\"chip\" data-type=\"${esc(t)}\">${esc(t)}</button>`).join('');
+      typeWrap.querySelectorAll('button').forEach(btn => {
+        btn.onclick = () => {
+          const t = btn.dataset.type;
+          if (state.typeFilter.has(t)) state.typeFilter.delete(t); else state.typeFilter.add(t);
+          btn.style.borderColor = state.typeFilter.has(t) ? '#4cc9f0' : 'var(--line)';
+          btn.style.color = state.typeFilter.has(t) ? '#dff6ff' : 'var(--muted)';
+          renderAll();
+        };
+      });
+
+      const errValues = ['lease_expired','inner_action_failed','timeout','oom','json_parse'];
+      const errWrap = document.getElementById('error-filters');
+      errWrap.innerHTML = errValues.map(t => `<button class=\"chip\" data-err=\"${esc(t)}\">${esc(t)}</button>`).join('');
+      errWrap.querySelectorAll('button').forEach(btn => {
+        btn.onclick = () => {
+          const t = btn.dataset.err;
+          if (state.errFilter.has(t)) state.errFilter.delete(t); else state.errFilter.add(t);
+          btn.style.borderColor = state.errFilter.has(t) ? '#f6c453' : 'var(--line)';
+          btn.style.color = state.errFilter.has(t) ? '#fff6d9' : 'var(--muted)';
+          renderAll();
+        };
+      });
+
+      const search = document.getElementById('search-input');
+      search.oninput = () => { state.search = search.value.trim().toLowerCase(); renderAll(); };
+    }
+
+    function matchFilters(obj) {
+      const ep = Number(obj.episode_id || 0);
+      if (state.episode > 0 && ep !== state.episode) return false;
+      const replayCut = getReplayTimeCutoff();
+      if (replayCut != null) {
+        const tsVal = Date.parse(obj.ts || obj.last_update || '');
+        if (Number.isFinite(tsVal) && tsVal > replayCut) return false;
+      }
+      if (state.agent && String(obj.owner || obj.agent_id || '').toLowerCase() !== state.agent.toLowerCase()) return false;
+      if (state.typeFilter.size > 0) {
+        const t = String(obj.task_type || '');
+        if (!state.typeFilter.has(t)) return false;
+      }
+      const text = JSON.stringify(obj).toLowerCase();
+      if (state.search && !text.includes(state.search)) return false;
+      if (state.runSearch) {
+        const runText = `${obj.run_id || ''} ${obj.task_id || ''} ${obj.owner || ''}`.toLowerCase();
+        if (!runText.includes(state.runSearch)) return false;
+      }
+      if (state.errFilter.size > 0) {
+        let ok = false;
+        for (const e of state.errFilter) {
+          if (text.includes(e)) { ok = true; break; }
+        }
+        if (!ok) return false;
+      }
+      return true;
+    }
+
+    function renderAgents() {
+      const box = document.getElementById('agent-list');
+      const rows = agents.filter(a => (state.episode <= 0) || true);
+      document.getElementById('agent-count').textContent = `${rows.length} agents`;
+      box.innerHTML = rows.map(a => {
+        const active = state.agent === a.agent_id ? 'active' : '';
+        const dot = a.status === 'running' ? 'green' : (a.status === 'error' ? 'red' : 'yellow');
+        return `<div class=\"agent-item ${active}\" data-agent=\"${esc(a.agent_id)}\"><div><span class=\"health-dot ${dot}\"></span>${esc(a.agent_id)}</div><div class=\"event-meta\">${a.claimed}/${a.completed}/${a.released}</div></div>`;
+      }).join('');
+      box.querySelectorAll('.agent-item').forEach(el => {
+        el.onclick = () => {
+          const aid = el.dataset.agent || '';
+          state.agent = (state.agent === aid) ? '' : aid;
+          renderAll();
+        };
+      });
+    }
+
+    function renderTimeline() {
+      const wrap = document.getElementById('timeline');
+      const lanes = Object.fromEntries(stageOrder.map(s => [s, []]));
+      const filtered = events.filter(matchFilters);
+      filtered.forEach(ev => {
+        const stage = stageOrder.includes(ev.stage) ? ev.stage : 'other';
+        lanes[stage].push(ev);
+      });
+      for (const k of stageOrder) lanes[k] = lanes[k].slice(-20);
+
+      wrap.innerHTML = stageOrder.map(stage => {
+        const items = lanes[stage] || [];
+        return `<section class=\"lane\">
+          <div class=\"lane-head\">${stage} <span class=\"event-meta\">${items.length}</span></div>
+          <div class=\"lane-body\">${items.map(ev => {
+            const cls = ev.event === 'complete' ? 'success' : (ev.event === 'release' ? 'release fail' : (ev.event === 'claim' ? 'running' : ''));
+            const c2s = ev.claim_to_start_ticks != null ? `C→S:${ev.claim_to_start_ticks}` : '';
+            const s2c = ev.start_to_complete_ticks != null ? `S→C:${ev.start_to_complete_ticks}` : '';
+            return `<article class=\"event-card ${cls}\" data-ev=\"${ev.id}\">
+              <div><b>${esc(ev.task_type || ev.stage)}</b></div>
+              <div class=\"event-meta\">${esc(ev.task_id)} · ${esc(ev.owner || '-')}</div>
+              <div class=\"event-meta\">${esc(ev.event)} · ${toLocal(ev.ts)}</div>
+              <div class=\"event-meta\">${esc(c2s)} ${esc(s2c)} ${esc(ev.run_id || '')}</div>
+            </article>`;
+          }).join('')}</div>
+        </section>`;
+      }).join('');
+
+      wrap.querySelectorAll('.event-card').forEach(el => {
+        el.onclick = () => {
+          const ev = events.find(x => x.id === el.dataset.ev);
+          state.selected = { type: 'event', value: ev };
+          state.tab = 'overview';
+          renderInspector();
+        };
+      });
+    }
+
+    function renderTaskboard() {
+      const filtered = tasks.filter(matchFilters);
+      const counts = new CounterPolyfill(filtered.map(x => String(x.state || 'unknown')));
+      const c2sVals = filtered.map(x => Number(x.claim_to_start_ticks)).filter(v => Number.isFinite(v) && v >= 0);
+      const s2cVals = filtered.map(x => Number(x.start_to_complete_ticks)).filter(v => Number.isFinite(v) && v >= 0);
+      const avg = (arr) => arr.length ? (arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2) : '-';
+
+      const pills = [
+        ['open', counts.get('open')],
+        ['claimed', counts.get('claimed')],
+        ['running', counts.get('running')],
+        ['completed', counts.get('completed')],
+        ['released', counts.get('released')],
+        ['avg C→S', avg(c2sVals)],
+        ['avg S→C', avg(s2cVals)],
+      ];
+      document.getElementById('task-pills').innerHTML = pills.map(([k, v]) => `<span class=\"stat-pill\">${k}: ${v || 0}</span>`).join('');
+      document.getElementById('task-summary').textContent = `rows: ${filtered.length}`;
+
+      const tbody = document.getElementById('task-tbody');
+      tbody.innerHTML = filtered.map(t => {
+        const selected = state.selected && state.selected.type === 'task' && state.selected.value.task_id === t.task_id ? 'selected' : '';
+        const deps = (t.depends_on || []).slice(0, 2).join('→') || '-';
+        const rr = t.release_reason || '-';
+        return `<tr class=\"${selected}\" data-task=\"${esc(t.task_id)}\">` +
+          `<td>${esc(t.task_id)}</td><td>${esc(t.task_type || '')}</td><td>${esc(t.state || '')}</td>` +
+          `<td>${esc(t.owner || '-')}</td><td>${esc(String(t.lease_ttl || 0))}/${esc(String(t.heartbeat || 0))}</td>` +
+          `<td>${esc(deps)}</td><td>${esc(formatTick(t.claim_to_start_ticks))}</td><td>${esc(formatTick(t.start_to_complete_ticks))}</td>` +
+          `<td>${esc(toLocal(t.last_update))}</td><td>${esc(rr)}</td><td>${esc(artifactBadges(t))}</td><td>${esc(t.run_id || '-')}</td></tr>`;
+      }).join('');
+
+      tbody.querySelectorAll('tr').forEach(el => {
+        el.onclick = () => {
+          const t = tasks.find(x => x.task_id === el.dataset.task);
+          state.selected = { type: 'task', value: t };
+          state.tab = 'overview';
+          renderInspector();
+          renderTaskboard();
+        };
+      });
+    }
+
+    function findRunBySelected(sel) {
+      if (!sel) return null;
+      if (sel.type === 'run') return sel.value;
+      const runId = sel.value && sel.value.run_id;
+      if (!runId) return null;
+      return runs.find(r => r.run_id === runId && ((state.episode <= 0) || Number(r.episode_id) === state.episode)) || runs.find(r => r.run_id === runId);
+    }
+
+    function renderInspector() {
+      const sel = state.selected;
+      const summary = document.getElementById('inspector-summary');
+      const hint = document.getElementById('inspector-hint');
+      const tabs = document.getElementById('inspector-tabs');
+      const content = document.getElementById('inspector-content');
+
+      if (!sel) {
+        hint.textContent = 'select event/task/agent';
+        summary.innerHTML = '<div class=\"k\">status</div><div>No selection</div>';
+        tabs.innerHTML = '';
+        content.innerHTML = '<div class=\"event-meta\">点击时间线或任务行查看细节。</div>';
+        return;
+      }
+
+      const run = findRunBySelected(sel);
+      const v = sel.value || {};
+      hint.textContent = `${sel.type} · ${v.task_id || v.run_id || v.id || '-'}`;
+      summary.innerHTML = `
+        <div class=\"k\">episode</div><div>${esc(v.episode_id || (run && run.episode_id) || '-')}</div>
+        <div class=\"k\">task</div><div>${esc(v.task_type || (run && run.task_name) || '-')}</div>
+        <div class=\"k\">owner</div><div>${esc(v.owner || '-')}</div>
+        <div class=\"k\">state</div><div>${esc(v.state || v.event || '-')}</div>
+        <div class=\"k\">run_id</div><div class=\"mono\">${esc((run && run.run_id) || v.run_id || '-')}</div>
+      `;
+
+      const tabNames = ['overview', 'code', 'console', 'artifacts', 'reasoning', 'paper', 'compare'];
+      tabs.innerHTML = tabNames.map(name => `<button class=\"tab-btn ${state.tab===name?'active':''}\" data-tab=\"${name}\">${name}</button>`).join('');
+      tabs.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.onclick = () => { state.tab = btn.dataset.tab; renderInspector(); };
+      });
+
+      if (state.tab === 'overview') {
+        const linkedRuns = runs.filter(r => Number(r.episode_id) === Number(v.episode_id || 0)).slice(-8);
+        const phase = (payload.taskboard && payload.taskboard.phase_counts && payload.taskboard.phase_counts[v.stage || v.task_type || '']) || {};
+        content.innerHTML = `
+          <div class=\"event-meta\">Linked runs in episode: ${linkedRuns.length}</div>
+          <div style=\"height:8px\"></div>
+          <div class=\"mono\">${linkedRuns.map(r => `${r.run_id} | exit=${r.exit_code} | dev=${r.dev_score ?? '-'} | ${r.duration_s.toFixed(2)}s`).join('<br/>') || '-'}</div>
+          <div style=\"height:8px\"></div>
+          <div class=\"event-meta\">Phase Counts</div>
+          <pre class=\"mono\">${esc(JSON.stringify(phase, null, 2))}</pre>
+        `;
+      } else if (state.tab === 'code') {
+        if (!run) { content.innerHTML = '<div class=\"event-meta\">No linked run.</div>'; return; }
+        const files = (run.code_plan && run.code_plan.files) || [];
+        if (files.length === 0) {
+          content.innerHTML = '<div class=\"event-meta\">No code plan files.</div>'; return;
+        }
+        if (!state.filePath || !files.some(f => f.path === state.filePath)) state.filePath = files[0].path;
+        content.innerHTML = `
+          <div class=\"event-meta\">run_cmd: <span class=\"mono\">${esc((run.code_plan && run.code_plan.run_cmd) || '-')}</span></div>
+          <div style=\"height:8px\"></div>
+          <div class=\"file-tabs\">${files.map(f => `<button class=\"file-tab ${state.filePath===f.path?'active':''}\" data-file=\"${esc(f.path)}\">${esc(f.path)}</button>`).join('')}</div>
+          <pre class=\"mono\">${esc((files.find(f => f.path === state.filePath) || {}).content || '')}</pre>
+        `;
+        content.querySelectorAll('.file-tab').forEach(btn => {
+          btn.onclick = () => { state.filePath = btn.dataset.file; renderInspector(); };
+        });
+      } else if (state.tab === 'console') {
+        if (!run) { content.innerHTML = '<div class=\"event-meta\">No linked run.</div>'; return; }
+        const errRows = runs
+          .filter(r => Number(r.episode_id) === Number(run.episode_id))
+          .map(r => r.error_signature || '')
+          .filter(Boolean);
+        const grouped = {};
+        errRows.forEach(e => grouped[e] = (grouped[e] || 0) + 1);
+        const topErr = Object.entries(grouped).sort((a, b) => b[1] - a[1]).slice(0, 8);
+        content.innerHTML = `
+          <div class=\"kv\">
+            <div class=\"k\">exit_code</div><div>${esc(run.exit_code)}</div>
+            <div class=\"k\">duration_s</div><div>${esc(Number(run.duration_s || 0).toFixed(3))}</div>
+            <div class=\"k\">timed_out</div><div>${esc(run.timed_out)}</div>
+            <div class=\"k\">error_signature</div><div>${esc(run.error_signature || '-')}</div>
+          </div>
+          <div style=\"height:8px\"></div>
+          <div class=\"event-meta\">error clusters (episode)</div>
+          <pre class=\"mono\">${esc(JSON.stringify(topErr, null, 2))}</pre>
+          <div style=\"height:8px\"></div>
+          <div class=\"event-meta\">stderr</div>
+          <pre class=\"mono\">${esc(run.stderr || '')}</pre>
+          <div style=\"height:8px\"></div>
+          <div class=\"event-meta\">stdout</div>
+          <pre class=\"mono\">${esc(run.stdout || '')}</pre>
+        `;
+      } else if (state.tab === 'artifacts') {
+        if (!run) { content.innerHTML = '<div class=\"event-meta\">No linked run.</div>'; return; }
+        const dc = run.data_card || {};
+        const mc = run.method_card || {};
+        const evidenceRows = evidenceCards
+          .filter(e => String(e.run_id || '') === String(run.run_id || '') || Number(e.episode_id || 0) === Number(run.episode_id || 0))
+          .slice(-20);
+        const linkedPapers = papers.filter(p => Number(p.episode_id || 0) === Number(run.episode_id || 0)).slice(-10);
+        const artifactLines = (run.artifacts || []).map(a => `<li class=\"mono\">${esc(a)}</li>`).join('') || '<li>-</li>';
+        content.innerHTML = `
+          <div class=\"kv\">
+            <div class=\"k\">submission</div><div class=\"mono\">${esc(run.submission_path || '-')}</div>
+            <div class=\"k\">code_log</div><div class=\"mono\">${esc(run.code_log_path || '-')}</div>
+            <div class=\"k\">solver_log</div><div class=\"mono\">${esc(run.solver_log_path || '-')}</div>
+            <div class=\"k\">workspace</div><div class=\"mono\">${esc(run.workspace_dir || '-')}</div>
+            <div class=\"k\">snapshot</div><div class=\"mono\">${esc(run.snapshot_before_run || '-')}</div>
+          </div>
+          <div style=\"height:8px\"></div>
+          <div class=\"event-meta\">run artifacts</div><ul>${artifactLines}</ul>
+          <div class=\"event-meta\">data card</div>
+          <pre class=\"mono\">${esc(JSON.stringify({
+            task_name: dc.task_name, degraded: dc.degraded, split_stats: dc.split_stats, risk_flags: dc.risk_flags
+          }, null, 2))}</pre>
+          <div class=\"event-meta\">method card</div>
+          <pre class=\"mono\">${esc(JSON.stringify({
+            task_name: mc.task_name, metric: mc.metric, category: mc.category, baselines: (mc.recommended_baselines || []).map(x => x.name)
+          }, null, 2))}</pre>
+          <div class=\"event-meta\">lineage: run → evidence → paper</div>
+          <pre class=\"mono\">${esc(JSON.stringify({
+            run_id: run.run_id,
+            evidence_refs: evidenceRows.map(e => e.evidence_id || e.task_id || e.kind),
+            paper_refs: linkedPapers.map(p => p.paper_id),
+          }, null, 2))}</pre>
+        `;
+      } else if (state.tab === 'reasoning') {
+        const traces = actionTrace
+          .filter(t => (state.episode <= 0 || Number(t.episode_id) === state.episode))
+          .filter(t => !v.owner || String(t.agent_id || '') === String(v.owner || ''))
+          .slice(-40);
+        content.innerHTML = `
+          <div class=\"event-meta\">structured trace (non-CoT)</div>
+          <pre class=\"mono\">${esc(JSON.stringify((v.result || v), null, 2))}</pre>
+          <div style=\"height:8px\"></div>
+          <div class=\"event-meta\">recent action trace</div>
+          <pre class=\"mono\">${esc(JSON.stringify(traces, null, 2))}</pre>
+        `;
+      } else if (state.tab === 'paper') {
+        const ep = Number(v.episode_id || 0);
+        const rows = papers.filter(p => ep <= 0 || Number(p.episode_id) === ep).slice(-20);
+        const evRows = evidenceCards.filter(e => ep <= 0 || Number(e.episode_id) === ep).slice(-20);
+        content.innerHTML = rows.length ? rows.map(p => `
+          <div class=\"panel\" style=\"margin-bottom:8px;\">
+            <div class=\"panel-body\">
+              <div><b>${esc(p.paper_id || '-')}</b> <span class=\"event-meta\">${esc(p.source || '')}</span></div>
+              <div class=\"kv\" style=\"margin-top:6px;\">
+                <div class=\"k\">agent</div><div>${esc(p.agent_id || '-')}</div>
+                <div class=\"k\">fitness</div><div>${esc(p.fitness)}</div>
+                <div class=\"k\">f1</div><div>${esc(p.f1)}</div>
+                <div class=\"k\">publishable</div><div>${esc(p.publishable)}</div>
+                <div class=\"k\">replication_ok</div><div>${esc(p.replication_ok)}</div>
+              </div>
+            </div>
+          </div>
+        `).join('') : '<div class=\"event-meta\">No paper records.</div>';
+        content.innerHTML += `<div style=\"height:8px\"></div><div class=\"event-meta\">evidence refs</div><pre class=\"mono\">${esc(JSON.stringify(evRows, null, 2))}</pre>`;
+      } else if (state.tab === 'compare') {
+        const byEp = {};
+        runs.filter(r => state.episode <= 0 || Number(r.episode_id) === state.episode).forEach(r => {
+          const epk = String(r.episode_id || 0);
+          if (!byEp[epk]) byEp[epk] = { runs: 0, fail: 0, timeout: 0, avg_dur: 0, dev_scores: [] };
+          byEp[epk].runs += 1;
+          byEp[epk].avg_dur += Number(r.duration_s || 0);
+          if (r.exit_code !== null && r.exit_code !== 0) byEp[epk].fail += 1;
+          if (r.timed_out) byEp[epk].timeout += 1;
+          if (r.dev_score != null) byEp[epk].dev_scores.push(Number(r.dev_score));
+        });
+        Object.values(byEp).forEach(vv => {
+          vv.avg_dur = vv.runs ? vv.avg_dur / vv.runs : 0;
+          vv.dev_avg = vv.dev_scores.length ? vv.dev_scores.reduce((a, b) => a + b, 0) / vv.dev_scores.length : null;
+        });
+        content.innerHTML = `
+          <div class=\"event-meta\">episode compare (runs/errors/dev score)</div>
+          <pre class=\"mono\">${esc(JSON.stringify(byEp, null, 2))}</pre>
+        `;
+      }
+    }
+
+    class CounterPolyfill {
+      constructor(items) { this.map = new Map(); for (const x of items || []) this.map.set(x, (this.map.get(x) || 0) + 1); }
+      get(k) { return this.map.get(k) || 0; }
+    }
+
+    function renderAll() {
+      renderAgents();
+      renderTimeline();
+      renderTaskboard();
+      renderInspector();
+    }
+
+    function bootstrap() {
+      setHeader();
+      setupEpisodeSelect();
+      setupFilters();
+      setupAutoRefresh();
+      renderAll();
+    }
+
+    bootstrap();
+  </script>
 </body>
-</html>"""
+</html>
+"""
+    return template.replace("__PAYLOAD_JSON__", payload_json)
 
 
 def generate_trend_dashboard(base_dir: str, out_dir: str) -> Dict[str, Any]:
@@ -746,6 +1402,8 @@ def generate_trend_dashboard(base_dir: str, out_dir: str) -> Dict[str, Any]:
     return {
         "path": out_path,
         "status": "ok",
-        "episodes": len(payload.get("episodes") or []),
+        "episodes": int((payload.get("meta") or {}).get("episodes_count", 0)),
         "meta": payload.get("meta") or {},
+        "task_rows": len(((payload.get("taskboard") or {}).get("task_snapshot") or [])),
+        "run_rows": len(((payload.get("runs") or {}).get("runs") or [])),
     }

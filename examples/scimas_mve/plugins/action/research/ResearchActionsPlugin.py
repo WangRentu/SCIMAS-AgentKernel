@@ -63,6 +63,17 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         }
         self._llm_max_cards = int(os.getenv("SCIMAS_LLM_MAX_CARDS", "10"))
         self._llm_max_runs = int(os.getenv("SCIMAS_LLM_MAX_RUNS", "8"))
+        self._code_loop_enabled = os.getenv("SCIMAS_CODE_AGENT_ENABLE", "1").lower() not in {"0", "false", "no"}
+        self._code_debug_rounds = int(max(1, int(os.getenv("SCIMAS_CODE_DEBUG_ROUNDS", "4"))))
+        self._code_optimize_after_success = os.getenv("SCIMAS_CODE_OPTIMIZE_AFTER_SUCCESS", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._code_optimize_patience = int(max(1, int(os.getenv("SCIMAS_CODE_OPTIMIZE_PATIENCE", "2"))))
+        self._code_max_files = int(max(1, int(os.getenv("SCIMAS_CODE_MAX_FILES", "8"))))
+        self._code_max_file_chars = int(max(2000, int(os.getenv("SCIMAS_CODE_MAX_FILE_CHARS", "60000"))))
+        self._code_error_tail_chars = int(max(300, int(os.getenv("SCIMAS_CODE_ERROR_TAIL_CHARS", "3000"))))
         self._cards_log_enabled = os.getenv("SCIMAS_EVIDENCE_LOG_ENABLE", "1" if self._log_mode == "verbose" else "0").lower() not in {
             "0",
             "false",
@@ -82,9 +93,27 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         self._write_min_notes = int(os.getenv("SCIMAS_WRITE_MIN_NOTES", "1"))
         self._write_min_observations = int(os.getenv("SCIMAS_WRITE_MIN_OBS", "1"))
         self._write_min_hypothesis = int(os.getenv("SCIMAS_WRITE_MIN_HYP", "1"))
+        self._experiment_require_data_card = os.getenv("SCIMAS_EXPERIMENT_REQUIRE_DATA_CARD", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._experiment_require_method_card = os.getenv("SCIMAS_EXPERIMENT_REQUIRE_METHOD_CARD", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._experiment_min_notes = int(max(0, int(os.getenv("SCIMAS_EXPERIMENT_MIN_NOTES", "1"))))
+        self._experiment_min_hypothesis = int(max(0, int(os.getenv("SCIMAS_EXPERIMENT_MIN_HYP", "0"))))
         self._claim_backoff_base = int(max(1, int(os.getenv("SCIMAS_CLAIM_BACKOFF_BASE", "1"))))
         self._claim_backoff_max = int(max(self._claim_backoff_base, int(os.getenv("SCIMAS_CLAIM_BACKOFF_MAX", "8"))))
         self._claim_cost = float(max(0.0, float(os.getenv("SCIMAS_CLAIM_COST", "0.002"))))
+        self._claim_dispatch_enabled = os.getenv("SCIMAS_CLAIM_DISPATCH_ENABLE", "1").lower() not in {"0", "false", "no"}
+        dispatch_raw = str(os.getenv("SCIMAS_CLAIM_DISPATCH_TASK_TYPES", "experiment") or "").strip()
+        self._claim_dispatch_task_types = {
+            t.strip().lower() for t in dispatch_raw.split(",") if t.strip()
+        } or {"experiment"}
+        self._task_heartbeat_enabled = os.getenv("SCIMAS_TASK_HEARTBEAT_ENABLE", "1").lower() not in {"0", "false", "no"}
         self._review_min_issue_count = int(max(1, int(os.getenv("SCIMAS_REVIEW_MIN_ISSUES", "2"))))
         self._review_min_revision_actions = int(max(1, int(os.getenv("SCIMAS_REVIEW_MIN_ACTIONS", "2"))))
         self._review_revision_trigger_score = float(
@@ -314,7 +343,19 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         return value[: limit - 3] + "..."
 
     def _safe_task_types(self, values: Any, *, fallback: Optional[List[str]] = None) -> List[str]:
-        allowed = {"read", "hypothesize", "experiment", "write", "review", "replicate", "verify_strength", "verify_issue"}
+        allowed = {
+            "read",
+            "prepare_data",
+            "profile_data",
+            "retrieve_literature",
+            "hypothesize",
+            "experiment",
+            "write",
+            "review",
+            "replicate",
+            "verify_strength",
+            "verify_issue",
+        }
         result: List[str] = []
         if isinstance(values, list):
             for item in values:
@@ -334,6 +375,136 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             if text:
                 out.append(self._truncate(text, item_limit))
         return out
+
+    def _compact_data_card(self, data_card: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(data_card, dict):
+            return {}
+        split_stats = data_card.get("split_stats") if isinstance(data_card.get("split_stats"), dict) else {}
+        sampled_rows = data_card.get("sampled_rows") if isinstance(data_card.get("sampled_rows"), dict) else {}
+        schema = data_card.get("schema") if isinstance(data_card.get("schema"), list) else []
+        schema_short = []
+        for col in schema[:8]:
+            if not isinstance(col, dict):
+                continue
+            schema_short.append(
+                {
+                    "name": col.get("name"),
+                    "dtype": col.get("dtype"),
+                    "missing_ratio": col.get("missing_ratio"),
+                    "unique": col.get("unique"),
+                }
+            )
+        label_profile = data_card.get("label_profile") if isinstance(data_card.get("label_profile"), dict) else {}
+        info_dyn = data_card.get("information_dynamics") if isinstance(data_card.get("information_dynamics"), dict) else {}
+        dist_stab = data_card.get("distribution_stability") if isinstance(data_card.get("distribution_stability"), dict) else {}
+        quality_diag = data_card.get("quality_diagnostics") if isinstance(data_card.get("quality_diagnostics"), dict) else {}
+        task_priors = data_card.get("task_priors") if isinstance(data_card.get("task_priors"), dict) else {}
+        naive_baseline = data_card.get("naive_baseline") if isinstance(data_card.get("naive_baseline"), dict) else {}
+
+        top_assoc = []
+        for item in (info_dyn.get("feature_target_association") or [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            top_assoc.append(
+                {
+                    "feature": item.get("feature"),
+                    "abs_corr": item.get("abs_corr"),
+                    "mutual_info": item.get("mutual_info"),
+                    "feature_source": item.get("feature_source"),
+                }
+            )
+        top_shift = []
+        for item in (dist_stab.get("train_test_shift") or [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            top_shift.append(
+                {
+                    "feature": item.get("feature"),
+                    "psi": item.get("psi"),
+                    "ks_stat": item.get("ks_stat"),
+                }
+            )
+        quality_hot = []
+        for item in (quality_diag.get("numeric_distribution") or [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            quality_hot.append(
+                {
+                    "feature": item.get("feature"),
+                    "skewness": item.get("skewness"),
+                    "iqr_outlier_ratio": item.get("iqr_outlier_ratio"),
+                }
+            )
+
+        prior_items = []
+        for item in (task_priors.get("priors") or [])[:3]:
+            if not isinstance(item, dict):
+                continue
+            prior_items.append(
+                {
+                    "domain": item.get("domain"),
+                    "recommended_features": self._safe_text_list(item.get("recommended_features"), limit=4, item_limit=120),
+                    "unit_checks": self._safe_text_list(item.get("unit_checks"), limit=3, item_limit=120),
+                    "recommended_protocol": self._safe_text_list(item.get("recommended_protocol"), limit=4, item_limit=120),
+                }
+            )
+        return {
+            "target_column": data_card.get("target_column"),
+            "split_stats": split_stats,
+            "sampled_rows": sampled_rows,
+            "label_profile": label_profile,
+            "schema": schema_short,
+            "information_dynamics": {
+                "summary": info_dyn.get("summary"),
+                "top_feature_association": top_assoc,
+                "leakage_suspects": info_dyn.get("leakage_suspects"),
+                "multicollinearity_pairs": (info_dyn.get("multicollinearity_pairs") or [])[:5],
+            },
+            "distribution_stability": {
+                "summary": dist_stab.get("summary"),
+                "top_shift_features": top_shift,
+                "severe_shift_features": (dist_stab.get("severe_shift_features") or [])[:5],
+            },
+            "quality_diagnostics": {
+                "summary": quality_diag.get("summary"),
+                "top_numeric_flags": quality_hot,
+            },
+            "task_priors": {
+                "dataset": task_priors.get("dataset"),
+                "category": task_priors.get("category"),
+                "priors": prior_items,
+            },
+            "naive_baseline": {
+                "available": naive_baseline.get("available"),
+                "best": naive_baseline.get("best"),
+                "candidates": (naive_baseline.get("candidates") or [])[:3],
+            },
+            "risk_flags": self._safe_text_list(data_card.get("risk_flags"), limit=6, item_limit=120),
+        }
+
+    def _compact_method_card(self, method_card: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(method_card, dict):
+            return {}
+        baselines = []
+        for item in (method_card.get("recommended_baselines") or [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            baselines.append(
+                {
+                    "name": item.get("name"),
+                    "use_when": self._truncate(item.get("use_when"), 120),
+                    "key_steps": self._safe_text_list(item.get("key_steps"), limit=4, item_limit=140),
+                    "pitfalls": self._safe_text_list(item.get("pitfalls"), limit=4, item_limit=140),
+                }
+            )
+        return {
+            "topic": method_card.get("topic"),
+            "metric": method_card.get("metric"),
+            "category": method_card.get("category"),
+            "recommended_baselines": baselines,
+            "evaluation_protocol": self._safe_text_list(method_card.get("evaluation_protocol"), limit=5, item_limit=140),
+            "common_pitfalls": self._safe_text_list(method_card.get("common_pitfalls"), limit=6, item_limit=140),
+        }
 
     def _default_solver_plan(self, world_spec: Dict[str, Any]) -> Dict[str, Any]:
         metric = str(world_spec.get("metric") or "").lower()
@@ -882,7 +1053,7 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             - Metric: {world_spec.get('metric')}
             - Category: {world_spec.get('category')}
             - Budget: {world_spec.get('budget')}
-            - Taskboard summary: {json.dumps(world_spec.get('taskboard') or {{}}, ensure_ascii=False)}
+            - Taskboard summary: {json.dumps(world_spec.get('taskboard') or {}, ensure_ascii=False)}
 
             Agent local context:
             - hypothesis_tags: {json.dumps(hypothesis[:6], ensure_ascii=False)}
@@ -901,16 +1072,23 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             Return ONLY JSON:
             {{
               "role_name": "methodologist|experimenter|writer|reviewer|replicator|reader",
-              "preferred_task_types": ["experiment", "hypothesize", "write", "verify_issue"],
+              "preferred_task_types": ["prepare_data", "profile_data", "retrieve_literature", "experiment", "hypothesize", "write", "verify_issue"],
               "primary_task_id": "Txxx",
               "selection_rationale": ["...", "..."],
               "risk_controls": ["...", "..."],
-              "fallback_if_blocked": ["verify_issue", "verify_strength", "read", "hypothesize"]
+              "fallback_if_blocked": ["verify_issue", "verify_strength", "prepare_data", "profile_data", "retrieve_literature", "read", "hypothesize"]
             }}
             """
         ).strip()
 
-    def _build_plan_prompt(self, world_spec: Dict[str, Any], cards: List[Dict[str, Any]], recent_runs: List[Dict[str, Any]]) -> str:
+    def _build_plan_prompt(
+        self,
+        world_spec: Dict[str, Any],
+        cards: List[Dict[str, Any]],
+        recent_runs: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]] = None,
+        method_card: Optional[Dict[str, Any]] = None,
+    ) -> str:
         cards_short = [
             {
                 "id": c.get("citation_id"),
@@ -932,6 +1110,8 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             }
             for r in recent_runs[-self._llm_max_runs :]
         ]
+        data_card_short = self._compact_data_card(data_card)
+        method_card_short = self._compact_method_card(method_card)
         return textwrap.dedent(
             f"""
             You are an AIRS-Bench senior scientist drafting a rigorous research hypothesis and protocol.
@@ -945,6 +1125,12 @@ class ResearchActionsPlugin(OtherActionsPlugin):
 
             Evidence cards:
             {json.dumps(cards_short, ensure_ascii=False)}
+
+            Data card (structured dataset evidence):
+            {json.dumps(data_card_short, ensure_ascii=False)}
+
+            Method card (task-type baselines and pitfalls):
+            {json.dumps(method_card_short, ensure_ascii=False)}
 
             Recent experimental traces:
             {json.dumps(runs_short, ensure_ascii=False)}
@@ -985,6 +1171,8 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         plan_spec: Dict[str, Any],
         notes: List[Dict[str, Any]],
         observations: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]],
+        method_card: Optional[Dict[str, Any]],
         exp_count: int,
         budget: int,
     ) -> str:
@@ -1015,6 +1203,8 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             }
             for o in observations[-self._llm_max_runs :]
         ]
+        data_card_short = self._compact_data_card(data_card)
+        method_card_short = self._compact_method_card(method_card)
         return textwrap.dedent(
             f"""
             You are an experimental ML researcher designing the NEXT AIRS run.
@@ -1031,6 +1221,12 @@ class ResearchActionsPlugin(OtherActionsPlugin):
 
             Evidence snippets:
             {json.dumps(notes_short, ensure_ascii=False)}
+
+            Data card:
+            {json.dumps(data_card_short, ensure_ascii=False)}
+
+            Method card:
+            {json.dumps(method_card_short, ensure_ascii=False)}
 
             Previous run outcomes:
             {json.dumps(obs_short, ensure_ascii=False)}
@@ -1244,6 +1440,610 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             """
         ).strip()
 
+    def _normalize_code_plan(self, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        files_raw = payload.get("files")
+        files: List[Dict[str, str]] = []
+        if isinstance(files_raw, list):
+            for item in files_raw[: self._code_max_files]:
+                if not isinstance(item, dict):
+                    continue
+                rel_path = str(item.get("path") or "").replace("\\", "/").strip()
+                content = item.get("content")
+                if not rel_path or not isinstance(content, str):
+                    continue
+                if rel_path.startswith("/") or rel_path.startswith("../") or "/../" in rel_path:
+                    continue
+                files.append({"path": rel_path[:220], "content": content[: self._code_max_file_chars]})
+        run_cmd = str(payload.get("run_cmd") or "").strip()
+        if not run_cmd:
+            run_cmd = "python src/main.py --data-dir ./data --output-dir ./outputs --task-manifest ./.task_manifest.json"
+        plan = {
+            "run_cmd": run_cmd[:600],
+            "files": files,
+        }
+        if isinstance(payload.get("notes"), str):
+            plan["notes"] = self._truncate(payload.get("notes"), 500)
+        return plan
+
+    def _build_code_experiment_prompt(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        hypothesis: List[str],
+        notes: List[Dict[str, Any]],
+        observations: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]],
+        method_card: Optional[Dict[str, Any]],
+        plan_spec: Dict[str, Any],
+        exp_count: int,
+        budget: int,
+        phase: str,
+        round_idx: int,
+        max_rounds: int,
+        previous_plan: Optional[Dict[str, Any]] = None,
+        failure_context: Optional[str] = None,
+        best_dev_score_norm: Optional[float] = None,
+    ) -> str:
+        notes_short = []
+        for n in notes[-4:]:
+            cards = (n or {}).get("cards", []) or []
+            notes_short.append(
+                {
+                    "topic": n.get("topic"),
+                    "hints": (n.get("hints") or [])[:3],
+                    "cards": [
+                        {
+                            "citation_id": c.get("citation_id"),
+                            "title": c.get("title"),
+                            "text": self._truncate(c.get("text"), 120),
+                        }
+                        for c in cards[:3]
+                    ],
+                }
+            )
+        obs_short = [
+            {
+                "run_id": o.get("run_id"),
+                "ok": o.get("ok"),
+                "dev_score_norm": o.get("dev_score_norm"),
+                "score_norm": o.get("score_norm"),
+                "solver_mode": o.get("solver_mode"),
+                "error": self._truncate(o.get("error"), 180),
+            }
+            for o in observations[-self._llm_max_runs :]
+        ]
+        data_card_short = self._compact_data_card(data_card)
+        method_card_short = self._compact_method_card(method_card)
+        phase_guidance = {
+            "generate": "Write first executable baseline code for this task.",
+            "repair": "Fix execution/runtime errors and keep scientific validity.",
+            "optimize": "Improve dev score while preserving reproducibility and format validity.",
+        }.get(phase, "Write executable research code.")
+
+        return textwrap.dedent(
+            f"""
+            You are an autonomous ML researcher working in a controlled AIRS code sandbox.
+            Objective: produce runnable code, iterate from errors, and improve dev metrics.
+
+            Phase: {phase}
+            Round: {round_idx}/{max_rounds}
+            Guidance: {phase_guidance}
+
+            Task context:
+            - task_name: {world_spec.get('task_name')}
+            - metric: {world_spec.get('metric')}
+            - category: {world_spec.get('category')}
+            - research_problem: {world_spec.get('research_problem')}
+            - budget_used: {exp_count}/{budget}
+            - best_dev_score_norm_so_far: {best_dev_score_norm if best_dev_score_norm is not None else "N/A"}
+            - current_strategy: {plan_spec.get('strategy')}
+
+            Scientific hypotheses:
+            {json.dumps(hypothesis[:8], ensure_ascii=False)}
+
+            Evidence cards / notes:
+            {json.dumps(notes_short, ensure_ascii=False)}
+
+            Data card:
+            {json.dumps(data_card_short, ensure_ascii=False)}
+
+            Method card:
+            {json.dumps(method_card_short, ensure_ascii=False)}
+
+            Previous run summaries:
+            {json.dumps(obs_short, ensure_ascii=False)}
+
+            Previous code plan:
+            {json.dumps(previous_plan or {}, ensure_ascii=False)}
+
+            Failure context (if any):
+            {failure_context or "N/A"}
+
+            Sandbox contract:
+            1) You must write file-level code updates.
+            2) Code must run via one command.
+            3) Must output `outputs/submission.csv` for test-format predictions.
+            4) Should output `outputs/dev_predictions.csv` for dev evaluation.
+            5) No network calls, no package installs, no external downloads.
+            6) Keep code deterministic (set seeds if applicable).
+            7) IMPORTANT: Do NOT assume `./data/train.csv` or `./data/test.csv` always exist.
+               AIRS data is often HuggingFace `datasets.save_to_disk` format under:
+               - `./data/train/` and `./data/test/` (arrow + state.json)
+               Prefer robust loading:
+               - first try `datasets.load_from_disk('./data/train')`
+               - fallback to `pd.read_csv('./data/train.csv')` only if CSV exists.
+            8) Read `.task_manifest.json` to get metric/category/scoring_column and format submission accordingly.
+
+            Return ONLY JSON:
+            {{
+              "run_cmd": "python src/main.py --data-dir ./data --output-dir ./outputs --task-manifest ./.task_manifest.json",
+              "files": [
+                {{"path": "src/main.py", "content": "FULL PYTHON CODE"}},
+                {{"path": "src/feature_engineering.py", "content": "OPTIONAL"}}
+              ],
+              "notes": "brief explanation of this iteration"
+            }}
+            """
+        ).strip()
+
+    async def _run_code_research_loop(
+        self,
+        *,
+        agent_id: str,
+        world_spec: Dict[str, Any],
+        hypothesis: List[str],
+        plan_spec: Dict[str, Any],
+        notes: List[Dict[str, Any]],
+        prior_observations: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]],
+        method_card: Optional[Dict[str, Any]],
+        exp_count: int,
+        budget: int,
+        base_run_config: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not self._code_loop_enabled or not self._llm_ready("experiment"):
+            return None
+        if not bool(world_spec.get("code_agent_enable", False)):
+            return None
+
+        attempts: List[Dict[str, Any]] = []
+        best_result: Optional[Dict[str, Any]] = None
+        best_score = -1.0
+        best_plan: Dict[str, Any] = {}
+        previous_plan: Dict[str, Any] = {}
+        failure_context = ""
+        no_improve_rounds = 0
+
+        max_rounds = min(self._code_debug_rounds, max(1, int(budget or self._code_debug_rounds)))
+
+        for idx in range(max_rounds):
+            has_success = best_result is not None
+            if not has_success and idx == 0:
+                phase = "generate"
+            elif not has_success:
+                phase = "repair"
+            else:
+                phase = "optimize"
+                if not self._code_optimize_after_success:
+                    break
+
+            prompt = self._build_code_experiment_prompt(
+                world_spec=world_spec,
+                hypothesis=hypothesis,
+                notes=notes,
+                observations=prior_observations + [a.get("result") or {} for a in attempts],
+                data_card=data_card,
+                method_card=method_card,
+                plan_spec=plan_spec,
+                exp_count=exp_count + idx,
+                budget=budget,
+                phase=phase,
+                round_idx=idx + 1,
+                max_rounds=max_rounds,
+                previous_plan=previous_plan,
+                failure_context=failure_context,
+                best_dev_score_norm=best_score if best_score >= 0.0 else None,
+            )
+            llm_result = await self._call_llm_json(agent_id=agent_id, action_name="experiment", prompt=prompt)
+            if not llm_result.get("ok") or not isinstance(llm_result.get("data"), dict):
+                attempts.append(
+                    {
+                        "round": idx + 1,
+                        "phase": phase,
+                        "llm_ok": False,
+                        "llm_reason": llm_result.get("reason"),
+                    }
+                )
+                break
+
+            code_plan = self._normalize_code_plan(llm_result.get("data") or {})
+            previous_plan = code_plan
+            if not bool(code_plan.get("files")):
+                attempts.append(
+                    {
+                        "round": idx + 1,
+                        "phase": phase,
+                        "llm_ok": True,
+                        "llm_reason": "code_plan_files_empty",
+                    }
+                )
+                failure_context = "LLM returned empty files list; provide full runnable files."
+                continue
+
+            current_tick = int(await self.controller.run_system("timer", "get_tick"))
+            run_config = dict(base_run_config or {})
+            run_config["strategy"] = "code_agent_iterative"
+            run_config["code_phase"] = phase
+            run_config["code_round"] = idx + 1
+            run_config["code_plan"] = code_plan
+
+            result = await self.controller.run_environment(
+                "science",
+                "run_experiment",
+                config=run_config,
+                agent_id=agent_id,
+                current_tick=current_tick,
+            )
+            attempts.append(
+                {
+                    "round": idx + 1,
+                    "phase": phase,
+                    "llm_ok": True,
+                    "code_plan": code_plan,
+                    "result": result,
+                }
+            )
+
+            ok = bool((result or {}).get("ok", False))
+            if not ok:
+                err_parts = [
+                    str((result or {}).get("error") or ""),
+                    str((result or {}).get("stderr_tail") or ""),
+                    str((result or {}).get("stdout_tail") or ""),
+                ]
+                failure_context = self._truncate("\n".join([x for x in err_parts if x]).strip(), self._code_error_tail_chars)
+                continue
+
+            score = (result or {}).get("dev_score_norm")
+            if not isinstance(score, (int, float)):
+                score = (result or {}).get("score_norm")
+            score_f = self._clamp01(score or 0.0)
+            if best_result is None or score_f > best_score + 1e-6:
+                best_result = result
+                best_score = score_f
+                best_plan = code_plan
+                no_improve_rounds = 0
+            else:
+                no_improve_rounds += 1
+
+            if has_success and no_improve_rounds >= self._code_optimize_patience:
+                break
+
+        if not attempts:
+            return None
+
+        final_result = best_result
+        final_plan = best_plan
+        if final_result is None:
+            last = attempts[-1]
+            if isinstance(last.get("result"), dict):
+                final_result = last.get("result")
+            final_plan = last.get("code_plan") if isinstance(last.get("code_plan"), dict) else {}
+        if not isinstance(final_result, dict):
+            return None
+
+        return {
+            "result": final_result,
+            "run_config": {
+                "strategy": "code_agent_iterative",
+                "code_plan": final_plan,
+            },
+            "llm_experiment_plan": {
+                "mode": "code_agent_loop",
+                "attempts": attempts,
+                "best_dev_score_norm": best_score if best_score >= 0.0 else None,
+            },
+            "code_attempts": attempts,
+        }
+
+    def _experiment_precondition_failures(
+        self,
+        *,
+        hypothesis: List[str],
+        notes: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]],
+        method_card: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        failures: List[str] = []
+        if self._experiment_require_data_card and not isinstance(data_card, dict):
+            failures.append("need_data_card")
+        if self._experiment_require_method_card and not isinstance(method_card, dict):
+            failures.append("need_method_card")
+        if self._experiment_min_notes > 0 and len(notes or []) < self._experiment_min_notes:
+            failures.append(f"need_notes>={self._experiment_min_notes}")
+        if self._experiment_min_hypothesis > 0 and len(hypothesis or []) < self._experiment_min_hypothesis:
+            failures.append(f"need_hypothesis>={self._experiment_min_hypothesis}")
+        return failures
+
+    def _has_notes_failure(self, failures: List[str]) -> bool:
+        return any(str(item).startswith("need_notes>=") for item in (failures or []))
+
+    def _build_method_note_from_card(self, method_card: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(method_card, dict):
+            return None
+        baselines = method_card.get("recommended_baselines") if isinstance(method_card.get("recommended_baselines"), list) else []
+        cards: List[Dict[str, Any]] = []
+        hints: List[str] = []
+        for idx, baseline in enumerate(baselines[: self._llm_max_cards], start=1):
+            if not isinstance(baseline, dict):
+                continue
+            citation_id = f"M{idx:04d}"
+            title = str(baseline.get("name") or f"baseline_{idx}")
+            steps = self._safe_text_list(baseline.get("key_steps"), limit=3, item_limit=120)
+            pitfalls = self._safe_text_list(baseline.get("pitfalls"), limit=2, item_limit=120)
+            text_parts = [f"use_when={self._truncate(baseline.get('use_when'), 120)}"]
+            if steps:
+                text_parts.append("steps=" + "; ".join(steps))
+            if pitfalls:
+                text_parts.append("pitfalls=" + "; ".join(pitfalls))
+            cards.append(
+                {
+                    "citation_id": citation_id,
+                    "kind": "method_card",
+                    "title": title,
+                    "text": " | ".join(text_parts),
+                }
+            )
+            hints.append(f"[{citation_id}] {title}")
+        if not cards and isinstance(method_card.get("task_evidence_refs"), list):
+            for ref in method_card.get("task_evidence_refs")[: self._llm_max_cards]:
+                if not isinstance(ref, dict):
+                    continue
+                cid = str(ref.get("citation_id") or "")
+                title = str(ref.get("title") or "method_ref")
+                cards.append(
+                    {
+                        "citation_id": cid or f"MR{len(cards) + 1:04d}",
+                        "kind": "method_ref",
+                        "title": title,
+                        "text": self._truncate(ref.get("snippet"), 220),
+                    }
+                )
+                hints.append(f"[{cards[-1]['citation_id']}] {title}")
+        if not cards:
+            return None
+        return {
+            "topic": "task_baselines",
+            "hints": hints,
+            "cards": cards,
+            "task_name": method_card.get("task_name"),
+            "source": "method_card",
+        }
+
+    def _build_data_note_from_card(self, data_card: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(data_card, dict):
+            return None
+        split_stats = data_card.get("split_stats") if isinstance(data_card.get("split_stats"), dict) else {}
+        schema = data_card.get("schema") if isinstance(data_card.get("schema"), list) else []
+        cards: List[Dict[str, Any]] = []
+        hints: List[str] = []
+        cards.append(
+            {
+                "citation_id": "D0001",
+                "kind": "data_profile",
+                "title": "split_stats",
+                "text": self._truncate(json.dumps(split_stats, ensure_ascii=False), 320),
+            }
+        )
+        hints.append("[D0001] split_stats")
+        for idx, col in enumerate(schema[:6], start=2):
+            if not isinstance(col, dict):
+                continue
+            name = str(col.get("name") or f"col_{idx}")
+            desc = {
+                "dtype": col.get("dtype"),
+                "missing_ratio": col.get("missing_ratio"),
+                "unique": col.get("unique"),
+            }
+            cards.append(
+                {
+                    "citation_id": f"D{idx:04d}",
+                    "kind": "data_schema",
+                    "title": name,
+                    "text": self._truncate(json.dumps(desc, ensure_ascii=False), 220),
+                }
+            )
+            hints.append(f"[D{idx:04d}] {name}")
+        return {
+            "topic": "data_profile",
+            "hints": hints,
+            "cards": cards,
+            "task_name": data_card.get("task_name"),
+            "source": "data_card",
+        }
+
+    async def _hydrate_experiment_prerequisites(
+        self,
+        *,
+        agent_id: str,
+        hypothesis: List[str],
+        notes: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]],
+        method_card: Optional[Dict[str, Any]],
+        failures: List[str],
+    ) -> Dict[str, Any]:
+        """Synchronize episode-level shared artifacts into agent-local state before experiment."""
+        summary: Dict[str, Any] = {
+            "used_shared_artifacts": False,
+            "hydrate_steps": [],
+            "remaining_failures": list(failures or []),
+        }
+        if not failures:
+            return summary
+
+        local_notes = await self._get_state(agent_id, "notes") or []
+        changed_notes = False
+        shared_artifacts: Dict[str, Any] = {}
+
+        need_data = "need_data_card" in failures and not isinstance(data_card, dict)
+        need_method = "need_method_card" in failures and not isinstance(method_card, dict)
+        need_notes = self._has_notes_failure(failures)
+
+        if need_data or need_method or need_notes:
+            try:
+                shared_artifacts = await self.controller.run_environment(
+                    "science",
+                    "get_shared_artifacts",
+                    include_cards=True,
+                    max_refs=max(4, min(12, self._llm_max_cards)),
+                )
+                if isinstance(shared_artifacts, dict) and shared_artifacts.get("ok"):
+                    summary["used_shared_artifacts"] = True
+                    summary["hydrate_steps"].append("fetched_shared_artifacts")
+            except Exception as e:
+                summary["hydrate_steps"].append(f"shared_artifacts_failed:{self._truncate(str(e), 160)}")
+
+        if need_data and not isinstance(data_card, dict):
+            shared_data = shared_artifacts.get("data_card") if isinstance(shared_artifacts.get("data_card"), dict) else None
+            if isinstance(shared_data, dict):
+                data_card = dict(shared_data)
+                await self._set_state(agent_id, "data_card", data_card)
+                summary["hydrate_steps"].append("data_card_from_shared_cache")
+            else:
+                prof = await self.controller.run_environment("science", "profile_data", agent_id=agent_id, refresh=False)
+                if isinstance(prof, dict) and bool(prof.get("ok", False)):
+                    data_card = prof
+                    await self._set_state(agent_id, "data_card", data_card)
+                    summary["hydrate_steps"].append("data_card_from_profile_data")
+                else:
+                    summary["hydrate_steps"].append(
+                        "data_card_unavailable:" + self._truncate((prof or {}).get("reason"), 140)
+                    )
+
+        if need_method and not isinstance(method_card, dict):
+            shared_method = shared_artifacts.get("method_card") if isinstance(shared_artifacts.get("method_card"), dict) else None
+            if isinstance(shared_method, dict):
+                method_card = dict(shared_method)
+                await self._set_state(agent_id, "method_card", method_card)
+                summary["hydrate_steps"].append("method_card_from_shared_cache")
+            else:
+                method = await self.controller.run_environment(
+                    "science",
+                    "retrieve_method_card",
+                    agent_id=agent_id,
+                    topic="task_baselines",
+                    refresh=False,
+                )
+                if isinstance(method, dict) and bool(method.get("ok", False)):
+                    method_card = method
+                    await self._set_state(agent_id, "method_card", method_card)
+                    summary["hydrate_steps"].append("method_card_from_retrieve")
+                else:
+                    summary["hydrate_steps"].append(
+                        "method_card_unavailable:" + self._truncate((method or {}).get("reason"), 140)
+                    )
+
+        if need_notes:
+            note_count = len((local_notes or []) + (await self._get_state(agent_id, "shared_notes") or []))
+            if note_count < self._experiment_min_notes:
+                shared_template = (
+                    shared_artifacts.get("notes_template")
+                    if isinstance(shared_artifacts.get("notes_template"), dict)
+                    else None
+                )
+                if isinstance(shared_template, dict):
+                    local_notes.append(shared_template)
+                    changed_notes = True
+                    summary["hydrate_steps"].append("notes_from_shared_template")
+            note_count = len((local_notes or []) + (await self._get_state(agent_id, "shared_notes") or []))
+            if note_count < self._experiment_min_notes:
+                method_note = self._build_method_note_from_card(method_card)
+                if isinstance(method_note, dict):
+                    local_notes.append(method_note)
+                    changed_notes = True
+                    summary["hydrate_steps"].append("notes_from_method_card")
+            note_count = len((local_notes or []) + (await self._get_state(agent_id, "shared_notes") or []))
+            if note_count < self._experiment_min_notes:
+                data_note = self._build_data_note_from_card(data_card)
+                if isinstance(data_note, dict):
+                    local_notes.append(data_note)
+                    changed_notes = True
+                    summary["hydrate_steps"].append("notes_from_data_card")
+            note_count = len((local_notes or []) + (await self._get_state(agent_id, "shared_notes") or []))
+            if note_count < self._experiment_min_notes:
+                lit = await self.controller.run_environment(
+                    "science",
+                    "read_literature",
+                    agent_id=agent_id,
+                    topic="task_requirements",
+                )
+                if isinstance(lit, dict):
+                    local_notes.append(lit)
+                    changed_notes = True
+                    summary["hydrate_steps"].append("notes_from_read_literature")
+
+        if changed_notes:
+            await self._set_state(agent_id, "notes", local_notes)
+
+        refreshed_hypothesis = await self._get_state(agent_id, "hypothesis") or hypothesis
+        refreshed_notes = (await self._get_state(agent_id, "notes") or []) + (await self._get_state(agent_id, "shared_notes") or [])
+        refreshed_data = await self._get_state(agent_id, "data_card")
+        refreshed_method = await self._get_state(agent_id, "method_card")
+        summary["remaining_failures"] = self._experiment_precondition_failures(
+            hypothesis=refreshed_hypothesis,
+            notes=refreshed_notes,
+            data_card=refreshed_data if isinstance(refreshed_data, dict) else None,
+            method_card=refreshed_method if isinstance(refreshed_method, dict) else None,
+        )
+        summary["counts"] = {
+            "hypothesis": len(refreshed_hypothesis or []),
+            "notes": len(refreshed_notes or []),
+            "has_data_card": isinstance(refreshed_data, dict),
+            "has_method_card": isinstance(refreshed_method, dict),
+        }
+        return summary
+
+    async def _enqueue_prereq_recovery_tasks(self, *, failures: List[str]) -> Dict[str, Any]:
+        """Create recovery tasks only when the required task type is absent on taskboard."""
+        open_list = await self.controller.run_environment("science", "task_list", status="open")
+        claimed_list = await self.controller.run_environment("science", "task_list", status="claimed")
+        known_types = set()
+        for listing in (open_list, claimed_list):
+            tasks = (listing or {}).get("tasks", []) if isinstance(listing, dict) else []
+            for task in tasks:
+                known_types.add(str((task or {}).get("task_type") or ""))
+
+        created: List[str] = []
+        required_task_types: List[str] = []
+        if "need_data_card" in failures:
+            required_task_types.append("profile_data")
+        if "need_method_card" in failures:
+            required_task_types.append("retrieve_literature")
+        if self._has_notes_failure(failures):
+            required_task_types.append("read")
+        if any(str(f).startswith("need_hypothesis>=") for f in failures):
+            required_task_types.append("hypothesize")
+
+        for task_type in required_task_types:
+            if task_type in known_types:
+                continue
+            created_task = await self.controller.run_environment(
+                "science",
+                "task_create",
+                task_type=task_type,
+                payload={},
+                priority=8,
+            )
+            if isinstance(created_task, dict) and created_task.get("ok"):
+                tid = str((created_task.get("task") or {}).get("task_id") or "")
+                if tid:
+                    created.append(tid)
+                known_types.add(task_type)
+
+        return {"created_task_ids": created, "required_task_types": required_task_types}
+
     def _write_precondition_failures(
         self,
         *,
@@ -1418,6 +2218,21 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         task_id: str,
         current_tick: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
+        try:
+            direct = await self.controller.run_environment(
+                "science",
+                "task_get",
+                task_id=task_id,
+                current_tick=current_tick,
+            )
+            task = (direct or {}).get("task") if isinstance(direct, dict) else None
+            if isinstance(task, dict):
+                status = str(task.get("status") or "")
+                if status in {"claimed", "running"} and str(task.get("claimed_by") or "") == str(agent_id):
+                    return task
+        except Exception:
+            pass
+
         listed = await self.controller.run_environment(
             "science",
             "task_list",
@@ -1427,6 +2242,17 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         )
         tasks = (listed or {}).get("tasks", []) if isinstance(listed, dict) else []
         for task in tasks:
+            if task.get("task_id") == task_id:
+                return task
+        listed_running = await self.controller.run_environment(
+            "science",
+            "task_list",
+            status="running",
+            agent_id=agent_id,
+            current_tick=current_tick,
+        )
+        tasks_running = (listed_running or {}).get("tasks", []) if isinstance(listed_running, dict) else []
+        for task in tasks_running:
             if task.get("task_id") == task_id:
                 return task
         return None
@@ -1440,6 +2266,16 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         payload = task_payload or {}
         if task_action == "read":
             return await self.read(agent_id=agent_id, topic=payload.get("topic"))
+        if task_action == "prepare_data":
+            return await self.prepare_data(agent_id=agent_id, refresh=bool(payload.get("refresh")))
+        if task_action == "profile_data":
+            return await self.profile_data(agent_id=agent_id, focus_cols=payload.get("focus_cols"), refresh=bool(payload.get("refresh")))
+        if task_action == "retrieve_literature":
+            return await self.retrieve_literature(
+                agent_id=agent_id,
+                topic=payload.get("topic"),
+                refresh=bool(payload.get("refresh")),
+            )
         if task_action == "hypothesize":
             return await self.hypothesize(agent_id=agent_id)
         if task_action == "experiment":
@@ -1502,11 +2338,154 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         return ar
 
     @AgentCall
+    async def profile_data(
+        self,
+        agent_id: str,
+        focus_cols: Optional[List[str]] = None,
+        refresh: bool = False,
+    ) -> ActionResult:
+        data_card = await self.controller.run_environment(
+            "science",
+            "profile_data",
+            agent_id=agent_id,
+            focus_cols=focus_cols,
+            refresh=bool(refresh),
+        )
+        ok = isinstance(data_card, dict) and bool(data_card.get("ok", False))
+        reward = 0.01 if ok else -0.01
+        if ok:
+            await self._set_state(agent_id, "data_card", data_card)
+
+        ar = ActionResult.success(
+            method_name="profile_data",
+            message="Data card generated." if ok else "Data profiling failed.",
+            data={
+                "ok": ok,
+                "data_card": data_card,
+                "reward": reward,
+                "effective_action": "profile_data",
+                "reward_components": {
+                    "learning_reward": float(reward),
+                    "profile_data_reward": float(reward),
+                },
+            },
+        )
+        await self._append_trace(agent_id, "profile_data", reward, ar.data or {})
+        return ar
+
+    @AgentCall
+    async def prepare_data(
+        self,
+        agent_id: str,
+        refresh: bool = False,
+    ) -> ActionResult:
+        prep = await self.controller.run_environment(
+            "science",
+            "prepare_data",
+            agent_id=agent_id,
+            refresh=bool(refresh),
+        )
+        ok = isinstance(prep, dict) and bool(prep.get("ok", False))
+        reward = 0.008 if ok else -0.01
+        if ok:
+            await self._set_state(agent_id, "prepare_data_ready", True)
+
+        ar = ActionResult.success(
+            method_name="prepare_data",
+            message="Prepared AIRS data cache is ready." if ok else "prepare_data failed.",
+            data={
+                "ok": ok,
+                "prepare_data": prep,
+                "reward": reward,
+                "effective_action": "prepare_data",
+                "reward_components": {
+                    "learning_reward": float(reward),
+                    "prepare_data_reward": float(reward),
+                },
+            },
+        )
+        await self._append_trace(agent_id, "prepare_data", reward, ar.data or {})
+        return ar
+
+    @AgentCall
+    async def retrieve_literature(
+        self,
+        agent_id: str,
+        topic: Optional[str] = None,
+        refresh: bool = False,
+    ) -> ActionResult:
+        method_card = await self.controller.run_environment(
+            "science",
+            "retrieve_method_card",
+            agent_id=agent_id,
+            topic=topic,
+            refresh=bool(refresh),
+        )
+        ok = isinstance(method_card, dict) and bool(method_card.get("ok", False))
+        reward = 0.01 if ok else -0.01
+        if ok:
+            await self._set_state(agent_id, "method_card", method_card)
+            notes = await self._get_state(agent_id, "notes") or []
+            baselines = (method_card.get("recommended_baselines") or []) if isinstance(method_card, dict) else []
+            cards = []
+            hints = []
+            for idx, baseline in enumerate(baselines[: self._llm_max_cards], start=1):
+                if not isinstance(baseline, dict):
+                    continue
+                citation_id = f"M{idx:04d}"
+                title = str(baseline.get("name") or f"baseline_{idx}")
+                steps = self._safe_text_list(baseline.get("key_steps"), limit=3, item_limit=120)
+                pitfalls = self._safe_text_list(baseline.get("pitfalls"), limit=2, item_limit=120)
+                text_parts = [f"use_when={self._truncate(baseline.get('use_when'), 120)}"]
+                if steps:
+                    text_parts.append("steps=" + "; ".join(steps))
+                if pitfalls:
+                    text_parts.append("pitfalls=" + "; ".join(pitfalls))
+                cards.append(
+                    {
+                        "citation_id": citation_id,
+                        "kind": "method_card",
+                        "title": title,
+                        "text": " | ".join(text_parts),
+                    }
+                )
+                hints.append(f"[{citation_id}] {title}")
+            method_note = {
+                "topic": topic or "task_baselines",
+                "hints": hints,
+                "cards": cards,
+                "task_name": method_card.get("task_name"),
+                "source": "method_card",
+            }
+            notes.append(method_note)
+            await self._set_state(agent_id, "notes", notes)
+            await self._log_evidence_cards(agent_id, method_note, source="retrieve_literature")
+
+        ar = ActionResult.success(
+            method_name="retrieve_literature",
+            message="Method card retrieved." if ok else "Method retrieval failed.",
+            data={
+                "ok": ok,
+                "method_card": method_card,
+                "reward": reward,
+                "effective_action": "retrieve_literature",
+                "reward_components": {
+                    "learning_reward": float(reward),
+                    "retrieve_literature_reward": float(reward),
+                },
+            },
+        )
+        await self._append_trace(agent_id, "retrieve_literature", reward, ar.data or {})
+        return ar
+
+    @AgentCall
     async def hypothesize(self, agent_id: str, hypothesis: Optional[List[str]] = None) -> ActionResult:
         notes = (await self._get_state(agent_id, "notes") or []) + (await self._get_state(agent_id, "shared_notes") or [])
         observations = (await self._get_state(agent_id, "observations") or []) + (
             await self._get_state(agent_id, "shared_observations") or []
         )
+        data_card = await self._get_state(agent_id, "data_card")
+        method_card = await self._get_state(agent_id, "method_card")
         world_spec = await self.controller.run_environment("science", "get_world_spec")
         existing_plan = await self._get_state(agent_id, "plan_spec") or {}
         plan_spec = self._merge_solver_plan(self._default_solver_plan(world_spec), existing_plan if isinstance(existing_plan, dict) else {})
@@ -1516,7 +2495,13 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             cards = []
             for n in notes[-4:]:
                 cards.extend((n or {}).get("cards", [])[:3])
-            prompt = self._build_plan_prompt(world_spec=world_spec, cards=cards, recent_runs=observations)
+            prompt = self._build_plan_prompt(
+                world_spec=world_spec,
+                cards=cards,
+                recent_runs=observations,
+                data_card=data_card,
+                method_card=method_card,
+            )
             llm_result = await self._call_llm_json(agent_id=agent_id, action_name="hypothesize", prompt=prompt)
             if llm_result.get("ok") and isinstance(llm_result.get("data"), dict):
                 data = llm_result.get("data") or {}
@@ -1563,49 +2548,119 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         notes = (await self._get_state(agent_id, "notes") or []) + (await self._get_state(agent_id, "shared_notes") or [])
         prior_observations = await self._get_state(agent_id, "observations") or []
         hypothesis = await self._get_state(agent_id, "hypothesis") or []
+        data_card = await self._get_state(agent_id, "data_card")
+        method_card = await self._get_state(agent_id, "method_card")
+        precondition_failures = self._experiment_precondition_failures(
+            hypothesis=hypothesis,
+            notes=notes,
+            data_card=data_card if isinstance(data_card, dict) else None,
+            method_card=method_card if isinstance(method_card, dict) else None,
+        )
+        if precondition_failures:
+            hydrate_summary = await self._hydrate_experiment_prerequisites(
+                agent_id=agent_id,
+                hypothesis=hypothesis,
+                notes=notes,
+                data_card=data_card if isinstance(data_card, dict) else None,
+                method_card=method_card if isinstance(method_card, dict) else None,
+                failures=precondition_failures,
+            )
+            precondition_failures = list(hydrate_summary.get("remaining_failures") or [])
+            if precondition_failures:
+                recovery = await self._enqueue_prereq_recovery_tasks(failures=precondition_failures)
+                ar = ActionResult.success(
+                    method_name="experiment",
+                    message="Experiment deferred: prerequisites pending.",
+                    data={
+                        "ok": False,
+                        "pending_prereq": True,
+                        "precondition_failed": True,
+                        "precondition_failures": precondition_failures,
+                        "hydrate_summary": hydrate_summary,
+                        "recovery_tasks": recovery,
+                        "counts": {
+                            "hypothesis": len(hypothesis),
+                            "notes": len(notes),
+                            "observations": len(prior_observations),
+                        },
+                        "reward": 0.0,
+                        "effective_action": "experiment",
+                        "reward_components": {"learning_reward": 0.0, "experiment_reward": 0.0},
+                    },
+                )
+                await self._append_trace(agent_id, "experiment", 0.0, ar.data or {})
+                return ar
+            hypothesis = await self._get_state(agent_id, "hypothesis") or hypothesis
+            notes = (await self._get_state(agent_id, "notes") or []) + (await self._get_state(agent_id, "shared_notes") or [])
+            data_card = await self._get_state(agent_id, "data_card")
+            method_card = await self._get_state(agent_id, "method_card")
         run_config = dict(config or {})
         solver_spec = plan_spec.get("solver_spec") if isinstance(plan_spec.get("solver_spec"), dict) else {}
         run_config.setdefault("strategy", plan_spec.get("strategy", "iterative_solver_baseline"))
         if solver_spec:
             run_config.setdefault("solver_spec", json.loads(json.dumps(solver_spec)))
         llm_experiment_plan: Optional[Dict[str, Any]] = None
-
-        if self._llm_ready("experiment"):
-            prompt = self._build_experiment_prompt(
-                world_spec=world_spec,
-                hypothesis=hypothesis,
-                plan_spec=plan_spec,
-                notes=notes,
-                observations=prior_observations,
-                exp_count=exp_count,
-                budget=budget,
-            )
-            llm_result = await self._call_llm_json(agent_id=agent_id, action_name="experiment", prompt=prompt)
-            if llm_result.get("ok") and isinstance(llm_result.get("data"), dict):
-                llm_experiment_plan = llm_result.get("data") or {}
-                strategy = llm_experiment_plan.get("strategy")
-                if isinstance(strategy, str) and strategy.strip():
-                    run_config["strategy"] = strategy.strip()[:120]
-                cfg = llm_experiment_plan.get("config")
-                if isinstance(cfg, dict):
-                    # Treat LLM config as solver override for this run.
-                    run_config["solver_spec"] = self._merge_solver_plan(
-                        {"solver_spec": run_config.get("solver_spec", {})},
-                        {"solver_spec": cfg},
-                    ).get("solver_spec")
-                validity_checks = self._safe_text_list(llm_experiment_plan.get("validity_checks"), limit=6, item_limit=180)
-                failure_modes = self._safe_text_list(llm_experiment_plan.get("failure_modes"), limit=6, item_limit=180)
-                if validity_checks:
-                    run_config["validity_checks"] = validity_checks
-                if failure_modes:
-                    run_config["failure_modes"] = failure_modes
-
-        result = await self.controller.run_environment(
-            "science",
-            "run_experiment",
-            config=run_config,
+        code_attempts = None
+        code_loop_payload = await self._run_code_research_loop(
             agent_id=agent_id,
+            world_spec=world_spec,
+            hypothesis=hypothesis,
+            plan_spec=plan_spec,
+            notes=notes,
+            prior_observations=prior_observations,
+            data_card=data_card if isinstance(data_card, dict) else None,
+            method_card=method_card if isinstance(method_card, dict) else None,
+            exp_count=exp_count,
+            budget=budget,
+            base_run_config=run_config,
         )
+
+        if isinstance(code_loop_payload, dict) and isinstance(code_loop_payload.get("result"), dict):
+            result = code_loop_payload.get("result") or {}
+            run_config = code_loop_payload.get("run_config") or run_config
+            llm_experiment_plan = code_loop_payload.get("llm_experiment_plan")
+            code_attempts = code_loop_payload.get("code_attempts")
+        else:
+            if self._llm_ready("experiment"):
+                prompt = self._build_experiment_prompt(
+                    world_spec=world_spec,
+                    hypothesis=hypothesis,
+                    plan_spec=plan_spec,
+                    notes=notes,
+                    observations=prior_observations,
+                    data_card=data_card if isinstance(data_card, dict) else None,
+                    method_card=method_card if isinstance(method_card, dict) else None,
+                    exp_count=exp_count,
+                    budget=budget,
+                )
+                llm_result = await self._call_llm_json(agent_id=agent_id, action_name="experiment", prompt=prompt)
+                if llm_result.get("ok") and isinstance(llm_result.get("data"), dict):
+                    llm_experiment_plan = llm_result.get("data") or {}
+                    strategy = llm_experiment_plan.get("strategy")
+                    if isinstance(strategy, str) and strategy.strip():
+                        run_config["strategy"] = strategy.strip()[:120]
+                    cfg = llm_experiment_plan.get("config")
+                    if isinstance(cfg, dict):
+                        # Treat LLM config as solver override for this run.
+                        run_config["solver_spec"] = self._merge_solver_plan(
+                            {"solver_spec": run_config.get("solver_spec", {})},
+                            {"solver_spec": cfg},
+                        ).get("solver_spec")
+                    validity_checks = self._safe_text_list(llm_experiment_plan.get("validity_checks"), limit=6, item_limit=180)
+                    failure_modes = self._safe_text_list(llm_experiment_plan.get("failure_modes"), limit=6, item_limit=180)
+                    if validity_checks:
+                        run_config["validity_checks"] = validity_checks
+                    if failure_modes:
+                        run_config["failure_modes"] = failure_modes
+
+            current_tick = int(await self.controller.run_system("timer", "get_tick"))
+            result = await self.controller.run_environment(
+                "science",
+                "run_experiment",
+                config=run_config,
+                agent_id=agent_id,
+                current_tick=current_tick,
+            )
 
         observations = await self._get_state(agent_id, "observations") or []
         observation = {
@@ -1621,12 +2676,21 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             "solver_log_path": (result or {}).get("solver_log_path"),
             "solver_mode": (result or {}).get("solver_mode"),
             "fallback_reason": (result or {}).get("fallback_reason"),
+            "eval_split": (result or {}).get("eval_split", "dev"),
+            "stderr_tail": (result or {}).get("stderr_tail"),
+            "code_workspace": (result or {}).get("code_workspace"),
+            "code_log_path": (result or {}).get("code_log_path"),
+            "code_artifacts": (result or {}).get("code_artifacts"),
+            "dev_eval": (result or {}).get("dev_eval"),
+            "executor_used": (result or {}).get("executor_used"),
+            "executor_fallback_used": (result or {}).get("executor_fallback_used"),
             "ok": bool((result or {}).get("ok", False)),
             "error": (result or {}).get("error"),
             "elapsed_s": (result or {}).get("elapsed_s"),
             "strategy": run_config.get("strategy"),
             "config": run_config.get("solver_spec") or run_config,
             "llm_experiment_plan": llm_experiment_plan,
+            "code_attempts": code_attempts,
         }
         observations.append(observation)
         await self._set_state(agent_id, "observations", observations)
@@ -1646,19 +2710,20 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             reward = -0.02
 
         # Keep an experiment -> review loop on taskboard for iterative refinement.
-        try:
-            await self.controller.run_environment(
-                "science",
-                "task_create",
-                task_type="review",
-                payload={
-                    "run_id": observation.get("run_id"),
-                    "revision_reason": "post_experiment_diagnosis",
-                },
-                priority=6,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to enqueue post-experiment review task: {e}")
+        if bool((result or {}).get("ok", False)):
+            try:
+                await self.controller.run_environment(
+                    "science",
+                    "task_create",
+                    task_type="review",
+                    payload={
+                        "run_id": observation.get("run_id"),
+                        "revision_reason": "post_experiment_diagnosis",
+                    },
+                    priority=6,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to enqueue post-experiment review task: {e}")
 
         ar = ActionResult.success(
             method_name="experiment",
@@ -1738,7 +2803,32 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             ),
             reverse=True,
         )[0]
-        metric_name = str(best_run.get("metric_name") or world_spec.get("metric") or "score")
+        best_run_for_write = dict(best_run)
+        official_eval = await self.controller.run_environment(
+            "science",
+            "evaluate_submission",
+            submission_path=best_run_for_write.get("submission_path"),
+        )
+        if not isinstance(official_eval, dict) or not bool(official_eval.get("ok")):
+            ar = self._action_error(
+                "write",
+                "Final write requires successful test evaluation but evaluate_submission failed.",
+                effective_action="write",
+                detail={
+                    "precondition_failed": True,
+                    "reason": "evaluate_submission_failed",
+                    "evaluate_submission": official_eval,
+                    "best_run_id": best_run_for_write.get("run_id"),
+                },
+            )
+            await self._append_trace(agent_id, "write", 0.0, ar.data or {})
+            return ar
+
+        best_run_for_write["metric_name"] = official_eval.get("metric_name") or best_run_for_write.get("metric_name")
+        best_run_for_write["raw_score"] = official_eval.get("raw_score")
+        best_run_for_write["score_norm"] = official_eval.get("score_norm")
+        best_run_for_write["official_eval"] = official_eval
+        metric_name = str(best_run_for_write.get("metric_name") or world_spec.get("metric") or "score")
         citations_for_prompt: List[str] = []
         for note in notes:
             for card in (note or {}).get("cards", []) or []:
@@ -1755,7 +2845,7 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         if self._llm_ready("write"):
             prompt = self._build_write_prompt(
                 world_spec=world_spec,
-                best_run=best_run,
+                best_run=best_run_for_write,
                 hypothesis=hypothesis,
                 plan_spec=plan_spec,
                 citations=citations_for_prompt,
@@ -1770,7 +2860,7 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         paper = self._build_paper_payload(
             task_name=task_name,
             metric_name=metric_name,
-            best_run=best_run,
+            best_run=best_run_for_write,
             notes=notes,
             observations=observations,
             hypothesis=hypothesis,
@@ -1829,6 +2919,7 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 "paper_id": paper_id,
                 "paper": paper,
                 "llm_write_spec": llm_write_spec,
+                "official_eval": official_eval,
                 "credit_by_agent": contribution_credit,
                 "reward": reward,
                 "effective_action": "write",
@@ -2475,6 +3566,9 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                             "preferred_task_types": self._safe_task_types(
                                 llm_selection.get("preferred_task_types"),
                                 fallback=[
+                                    "prepare_data",
+                                    "profile_data",
+                                    "retrieve_literature",
                                     "experiment",
                                     "hypothesize",
                                     "write",
@@ -2487,7 +3581,7 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                             ),
                             "fallback_if_blocked": self._safe_task_types(
                                 llm_selection.get("fallback_if_blocked"),
-                                fallback=["verify_issue", "verify_strength", "read", "hypothesize"],
+                                fallback=["verify_issue", "verify_strength", "prepare_data", "profile_data", "read", "hypothesize"],
                             ),
                             "primary_task_id": str(llm_selection.get("primary_task_id") or ""),
                             "selection_rationale": self._safe_text_list(
@@ -2574,6 +3668,29 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         reward = (0.01 if ok else 0.0) - self._claim_cost
         if ok:
             await self._set_state(agent_id, "current_task_id", selected_task_id)
+            await self._set_state(agent_id, "current_task_type", str((task or {}).get("task_type") or ""))
+
+        auto_dispatch: Optional[ActionResult] = None
+        task_type_lower = str((task or {}).get("task_type") or "").strip().lower()
+        if ok and self._claim_dispatch_enabled and task_type_lower in self._claim_dispatch_task_types:
+            try:
+                auto_dispatch = await self.complete_task(
+                    agent_id=agent_id,
+                    task_id=str(selected_task_id),
+                    task_action=str((task or {}).get("task_type") or ""),
+                    task_payload=dict((task or {}).get("payload") or {}),
+                )
+            except Exception as e:
+                logger.warning(f"Auto-dispatch failed for task {selected_task_id}: {e}", exc_info=True)
+
+        effective_action = "claim_task"
+        if isinstance(auto_dispatch, ActionResult) and isinstance(auto_dispatch.data, dict):
+            dispatched_effective = str(auto_dispatch.data.get("effective_action") or "").strip()
+            if dispatched_effective:
+                effective_action = dispatched_effective
+            dispatch_reward = auto_dispatch.data.get("reward")
+            if isinstance(dispatch_reward, (int, float)):
+                reward = float(reward) + float(dispatch_reward)
 
         ar = ActionResult.success(
             method_name="claim_task",
@@ -2584,8 +3701,17 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 "ok": ok,
                 "reward": reward,
                 "llm_selection": llm_selection,
-                "effective_action": "claim_task",
+                "effective_action": effective_action,
                 "claim_result": claim_res,
+                "auto_dispatch": (
+                    {
+                        "status": auto_dispatch.status,
+                        "message": auto_dispatch.message,
+                        "data": auto_dispatch.data if isinstance(auto_dispatch.data, dict) else {},
+                    }
+                    if isinstance(auto_dispatch, ActionResult)
+                    else None
+                ),
                 "reward_components": {
                     "task_claim_reward": float(reward),
                     "task_claim_cost": float(self._claim_cost),
@@ -2606,13 +3732,90 @@ class ResearchActionsPlugin(OtherActionsPlugin):
     ) -> ActionResult:
         current_tick = int(await self.controller.run_system("timer", "get_tick"))
         task = await self._get_claimed_task(agent_id, task_id, current_tick=current_tick)
+        if task is None:
+            remembered_task_id = await self._get_state(agent_id, "current_task_id")
+            if remembered_task_id and str(remembered_task_id) == str(task_id):
+                try:
+                    direct = await self.controller.run_environment(
+                        "science",
+                        "task_get",
+                        task_id=task_id,
+                        current_tick=current_tick,
+                    )
+                    candidate = (direct or {}).get("task") if isinstance(direct, dict) else None
+                    if isinstance(candidate, dict):
+                        st = str(candidate.get("status") or "")
+                        if st in {"claimed", "running"} and str(candidate.get("claimed_by") or "") == str(agent_id):
+                            task = candidate
+                except Exception:
+                    task = None
         action_name = task_action or (task or {}).get("task_type")
         payload = dict((task or {}).get("payload") or {})
         payload.update(task_payload or {})
 
+        if task is None:
+            ar = ActionResult.error(
+                method_name="complete_task",
+                message="Task not currently owned by agent (missing or expired lease).",
+                data={
+                    "task_id": task_id,
+                    "task_action": action_name,
+                    "ok": False,
+                    "reward": 0.0,
+                    "effective_action": action_name or "complete_task",
+                    "reason": "task_missing_or_expired",
+                    "reward_components": {
+                        "learning_reward": 0.0,
+                        "task_complete_bonus": 0.0,
+                        "task_complete_total": 0.0,
+                    },
+                },
+            )
+            await self._append_trace(agent_id, "complete_task", 0.0, ar.data or {})
+            return ar
+
+        if self._task_heartbeat_enabled:
+            try:
+                await self.controller.run_environment(
+                    "science",
+                    "task_start",
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    current_tick=current_tick,
+                    phase=f"start:{action_name or 'unknown'}",
+                )
+            except Exception as e:
+                logger.warning(f"task_start failed for {task_id}: {e}")
+
         action_result = ActionResult.success(method_name="noop", message="No action executed.", data={"reward": 0.0})
         if action_name:
-            action_result = await self._execute_task_action(agent_id=agent_id, task_action=action_name, task_payload=payload)
+            try:
+                action_result = await self._execute_task_action(agent_id=agent_id, task_action=action_name, task_payload=payload)
+            except Exception as e:
+                action_result = ActionResult.error(
+                    method_name=str(action_name),
+                    message=f"Inner action raised exception: {self._truncate(str(e), 220)}",
+                    data={
+                        "ok": False,
+                        "exception": self._truncate(str(e), 400),
+                        "reward": 0.0,
+                        "effective_action": action_name or "complete_task",
+                        "reward_components": {"learning_reward": 0.0},
+                    },
+                )
+
+        if self._task_heartbeat_enabled:
+            try:
+                await self.controller.run_environment(
+                    "science",
+                    "task_heartbeat",
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    current_tick=current_tick,
+                    phase=f"done:{action_name or 'unknown'}",
+                )
+            except Exception as e:
+                logger.warning(f"task_heartbeat failed for {task_id}: {e}")
 
         if isinstance(action_result, ActionResult) and not action_result.is_successful():
             release_res = await self.controller.run_environment(
@@ -2666,6 +3869,7 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         reward = inner_reward + (0.01 if ok else 0.0)
         if ok:
             await self._set_state(agent_id, "current_task_id", None)
+            await self._set_state(agent_id, "current_task_type", None)
 
         ar = ActionResult.success(
             method_name="complete_task",

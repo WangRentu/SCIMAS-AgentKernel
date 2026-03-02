@@ -199,6 +199,8 @@ class CustomController(ControllerImpl):
             await self.run_agent_method(aid, "state", "set_state", "hypothesis", [])
             await self.run_agent_method(aid, "state", "set_state", "notes", [])
             await self.run_agent_method(aid, "state", "set_state", "shared_notes", [])
+            await self.run_agent_method(aid, "state", "set_state", "data_card", None)
+            await self.run_agent_method(aid, "state", "set_state", "method_card", None)
             await self.run_agent_method(aid, "state", "set_state", "inbox_evidence", [])
             await self.run_agent_method(aid, "state", "set_state", "last_action", None)
             await self.run_agent_method(aid, "state", "set_state", "last_effective_action", None)
@@ -208,6 +210,7 @@ class CustomController(ControllerImpl):
             await self.run_agent_method(aid, "state", "set_state", "last_fitness", None)
             await self.run_agent_method(aid, "state", "set_state", "last_paper_id", None)
             await self.run_agent_method(aid, "state", "set_state", "current_task_id", None)
+            await self.run_agent_method(aid, "state", "set_state", "current_task_type", None)
             await self.run_agent_method(aid, "state", "set_state", "claim_backoff_until_tick", 0)
             await self.run_agent_method(aid, "state", "set_state", "claim_fail_streak", 0)
             await self.run_agent_method(aid, "state", "set_state", "llm_role_plan", None)
@@ -371,7 +374,7 @@ class CustomController(ControllerImpl):
             "team_share_sent_observation": team_share_sent_observation,
         }
 
-        core_actions = ["read", "hypothesize", "experiment", "write", "review", "replicate"]
+        core_actions = ["read", "prepare_data", "profile_data", "retrieve_literature", "hypothesize", "experiment", "write", "review", "replicate"]
         action_totals: Dict[str, int] = {}
         for action_name in core_actions + ["claim_task", "share_evidence", "share_observation"]:
             action_totals[action_name] = 0
@@ -384,9 +387,13 @@ class CustomController(ControllerImpl):
 
         taskboard_metrics = await self.run_environment("science", "get_taskboard_metrics")
         tb_event_counts = (taskboard_metrics or {}).get("event_counts") or {}
+        release_reason_counts = (taskboard_metrics or {}).get("release_reason_counts") or {}
+        top_release_reason = str((taskboard_metrics or {}).get("top_release_reason") or "")
         claim_events = int(tb_event_counts.get("claim", 0) or 0)
         complete_events = int(tb_event_counts.get("complete", 0) or 0)
         release_events = int(tb_event_counts.get("release", 0) or 0)
+        exp_inner_failed_release = int(release_reason_counts.get("inner_action_failed:experiment", 0) or 0)
+        lease_expired_release = int(release_reason_counts.get("lease_expired", 0) or 0)
 
         chain_research_steps = sum(int(action_totals.get(name, 0) or 0) for name in core_actions)
         chain_record = {
@@ -398,7 +405,17 @@ class CustomController(ControllerImpl):
             "taskboard_release_events": release_events,
             "taskboard_complete_per_claim": (float(complete_events) / float(claim_events)) if claim_events else 0.0,
             "taskboard_release_per_complete": (float(release_events) / float(complete_events)) if complete_events else 0.0,
+            "taskboard_top_release_reason": top_release_reason,
+            "taskboard_release_reason_counts": release_reason_counts,
+            "taskboard_release_inner_action_failed_experiment": exp_inner_failed_release,
+            "taskboard_release_lease_expired": lease_expired_release,
+            "taskboard_release_inner_failed_per_claim": (float(exp_inner_failed_release) / float(claim_events))
+            if claim_events
+            else 0.0,
             "action_read": int(action_totals.get("read", 0) or 0),
+            "action_prepare_data": int(action_totals.get("prepare_data", 0) or 0),
+            "action_profile_data": int(action_totals.get("profile_data", 0) or 0),
+            "action_retrieve_literature": int(action_totals.get("retrieve_literature", 0) or 0),
             "action_hypothesize": int(action_totals.get("hypothesize", 0) or 0),
             "action_experiment": int(action_totals.get("experiment", 0) or 0),
             "action_write": int(action_totals.get("write", 0) or 0),
@@ -419,6 +436,9 @@ class CustomController(ControllerImpl):
         team_record["taskboard_release_events"] = release_events
         team_record["taskboard_complete_per_claim"] = chain_record["taskboard_complete_per_claim"]
         team_record["taskboard_release_per_complete"] = chain_record["taskboard_release_per_complete"]
+        team_record["taskboard_top_release_reason"] = top_release_reason
+        team_record["taskboard_release_inner_action_failed_experiment"] = exp_inner_failed_release
+        team_record["taskboard_release_lease_expired"] = lease_expired_release
         self._last_team_record = dict(team_record)
 
         try:

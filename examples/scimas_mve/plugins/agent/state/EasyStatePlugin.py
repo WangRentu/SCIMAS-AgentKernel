@@ -27,6 +27,9 @@ class EasyStatePlugin(StatePlugin):
         ).lower() in {"1", "true", "yes"}
         self._default_action_space = action_space or [
             "read",
+            "prepare_data",
+            "profile_data",
+            "retrieve_literature",
             "hypothesize",
             "experiment",
             "replicate",
@@ -38,14 +41,17 @@ class EasyStatePlugin(StatePlugin):
             "complete_task",
         ]
         self._default_policy = policy or {
-            "read": 0.18,
-            "hypothesize": 0.14,
-            "experiment": 0.22,
+            "read": 0.14,
+            "prepare_data": 0.05,
+            "profile_data": 0.07,
+            "retrieve_literature": 0.05,
+            "hypothesize": 0.12,
+            "experiment": 0.20,
             "replicate": 0.02,
-            "write": 0.14,
+            "write": 0.12,
             "review": 0.08,
-            "share_evidence": 0.06,
-            "share_observation": 0.06,
+            "share_evidence": 0.05,
+            "share_observation": 0.05,
             "claim_task": 0.06,
             "complete_task": 0.04,
         }
@@ -61,6 +67,9 @@ class EasyStatePlugin(StatePlugin):
         self._state_data.setdefault("hypothesis", [])
         self._state_data.setdefault("notes", [])
         self._state_data.setdefault("shared_notes", [])
+        self._state_data.setdefault("data_card", None)
+        self._state_data.setdefault("prepare_data_ready", False)
+        self._state_data.setdefault("method_card", None)
         self._state_data.setdefault("inbox_evidence", [])
         self._state_data.setdefault("last_action", None)
         self._state_data.setdefault("last_effective_action", None)

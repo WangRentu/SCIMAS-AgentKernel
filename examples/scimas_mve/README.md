@@ -43,5 +43,22 @@ To simplify the process, we have provided basic implementations for five core pl
     - Episode time series CSV: `examples/scimas_mve/logs/app/simulation/analysis_timeseries.csv`
     - Trend chart: `examples/scimas_mve/logs/app/simulation/analysis_trend.html`
 
+# Docker Runtime (AIRS Full Dependencies)
+
+Build the dedicated AIRS runtime image once:
+
+```bash
+docker build -t scimas-airs-runtime:py311-v1 -f examples/scimas_mve/docker/Dockerfile.airs-runtime .
+```
+
+Quick verify:
+
+```bash
+docker run --rm scimas-airs-runtime:py311-v1 python -c "import datasets,numpy,pandas,sklearn,scipy,sktime,torch,torchmetrics,rouge_score; print('ok')"
+```
+
+`environment_config.yaml` is configured to use this image:
+`code_docker_image: "scimas-airs-runtime:py311-v1"`.
+
         
             

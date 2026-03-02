@@ -57,17 +57,112 @@ os.environ["MAS_PROJECT_ABS_PATH"] = project_path
 if "MAS_PROJECT_REL_PATH" not in os.environ:
     os.environ["MAS_PROJECT_REL_PATH"] = "examples.scimas_mve"
 if "MAS_LOG_LEVEL" not in os.environ:
-    _mode = (os.getenv("SCIMAS_LOG_MODE", "compact") or "compact").strip().lower()
-    os.environ["MAS_LOG_LEVEL"] = "WARNING" if _mode in {"compact", "minimal"} else "INFO"
+    # Default to INFO so monitor lines are not mislabeled as warnings.
+    os.environ["MAS_LOG_LEVEL"] = str(os.getenv("SCIMAS_LOG_LEVEL_DEFAULT", "INFO")).upper()
 
 from agentkernel_standalone.mas.builder import Builder
 from examples.scimas_mve.registry import RESOURCES_MAPS
 from agentkernel_standalone.toolkit.logger import get_logger
 
 from examples.scimas_mve.custom_controller import CustomController
+from examples.scimas_mve.visualization.trend_dashboard import generate_trend_dashboard
 
 logger = get_logger(__name__)
 VERBOSE_TICK_LOGS = os.getenv("SCIMAS_VERBOSE_TICK_LOGS", "0").lower() in {"1", "true", "yes"}
+RUNTIME_MONITOR = os.getenv("SCIMAS_RUNTIME_MONITOR", "1").lower() not in {"0", "false", "no"}
+RUNTIME_MONITOR_HEARTBEAT_S = float(max(2.0, float(os.getenv("SCIMAS_RUNTIME_HEARTBEAT_S", "10"))))
+try:
+    RUNTIME_MONITOR_TICK_SUMMARY_EVERY = max(1, int(os.getenv("SCIMAS_RUNTIME_TICK_SUMMARY_EVERY", "1")))
+except Exception:
+    RUNTIME_MONITOR_TICK_SUMMARY_EVERY = 1
+try:
+    DASHBOARD_REFRESH_EVERY_TICKS = max(1, int(os.getenv("SCIMAS_DASHBOARD_REFRESH_EVERY_TICKS", "1")))
+except Exception:
+    DASHBOARD_REFRESH_EVERY_TICKS = 1
+try:
+    DASHBOARD_REFRESH_MIN_S = max(1.0, float(os.getenv("SCIMAS_DASHBOARD_REFRESH_MIN_S", "5")))
+except Exception:
+    DASHBOARD_REFRESH_MIN_S = 5.0
+try:
+    DASHBOARD_REFRESH_TIMEOUT_S = max(1.0, float(os.getenv("SCIMAS_DASHBOARD_REFRESH_TIMEOUT_S", "30")))
+except Exception:
+    DASHBOARD_REFRESH_TIMEOUT_S = 30.0
+DASHBOARD_LIVE_ENABLE = os.getenv("SCIMAS_DASHBOARD_LIVE_ENABLE", "1").lower() not in {"0", "false", "no"}
+MONITOR_LOG_LEVEL = str(os.getenv("SCIMAS_MONITOR_LOG_LEVEL", "INFO")).strip().upper()
+_MONITOR_LOG_MAP = {
+    "DEBUG": logger.debug,
+    "INFO": logger.info,
+    "WARNING": logger.warning,
+    "ERROR": logger.error,
+}
+
+
+def _monitor(message: str) -> None:
+    if not RUNTIME_MONITOR:
+        return
+    log_fn = _MONITOR_LOG_MAP.get(MONITOR_LOG_LEVEL, logger.info)
+    log_fn(f"[MONITOR] {message}")
+
+
+async def _await_with_heartbeat(awaitable, *, label: str, heartbeat_s: float):
+    task = asyncio.create_task(awaitable)
+    started = time.time()
+    while True:
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=heartbeat_s)
+        except asyncio.TimeoutError:
+            elapsed = time.time() - started
+            _monitor(f"{label} running elapsed_s={elapsed:.1f}")
+
+
+async def _log_tick_runtime_snapshot(controller, *, ep_idx: int, tick_idx: int) -> None:
+    if not RUNTIME_MONITOR:
+        return
+    try:
+        metrics = await asyncio.wait_for(controller.run_environment("science", "get_taskboard_metrics"), timeout=3.0)
+    except Exception as e:
+        _monitor(f"ep={ep_idx + 1} tick={tick_idx + 1} snapshot_unavailable reason={e}")
+        return
+    summary = (metrics or {}).get("summary") or {}
+    events = (metrics or {}).get("event_counts") or {}
+    _monitor(
+        f"ep={ep_idx + 1} tick={tick_idx + 1} task={(metrics or {}).get('task_name')} "
+        f"tb_open={int(summary.get('open', 0) or 0)} tb_claimed={int(summary.get('claimed', 0) or 0)} "
+        f"tb_running={int(summary.get('running', 0) or 0)} "
+        f"tb_completed={int(summary.get('completed', 0) or 0)} "
+        f"ev_claim={int(events.get('claim', 0) or 0)} ev_complete={int(events.get('complete', 0) or 0)} "
+        f"ev_release={int(events.get('release', 0) or 0)} "
+        f"exp_active={int((metrics or {}).get('active_experiment_leases', 0) or 0)}/"
+        f"{int((metrics or {}).get('experiment_max_active_leases', 0) or 0)} "
+        f"top_release={(metrics or {}).get('top_release_reason') or '-'}"
+    )
+
+
+async def _maybe_refresh_live_dashboard(*, ep_idx: int, tick_idx: int, last_refresh_ts: float) -> float:
+    if not DASHBOARD_LIVE_ENABLE:
+        return last_refresh_ts
+    if (tick_idx + 1) % DASHBOARD_REFRESH_EVERY_TICKS != 0:
+        return last_refresh_ts
+
+    now = time.time()
+    if (now - last_refresh_ts) < DASHBOARD_REFRESH_MIN_S:
+        return last_refresh_ts
+
+    out_dir = _sim_dir(project_path)
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(generate_trend_dashboard, base_dir=project_path, out_dir=out_dir),
+            timeout=DASHBOARD_REFRESH_TIMEOUT_S,
+        )
+        rows = int((result or {}).get("task_rows", 0) or 0)
+        _monitor(
+            f"dashboard_refresh ep={ep_idx + 1} tick={tick_idx + 1} "
+            f"path={os.path.join(out_dir, 'trend_dashboard.html')} task_rows={rows}"
+        )
+        return now
+    except Exception as e:
+        _monitor(f"dashboard_refresh_failed ep={ep_idx + 1} tick={tick_idx + 1} reason={e}")
+        return last_refresh_ts
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -299,6 +394,7 @@ async def main():
 
         logger.info("Assembling all simulation components...")
         controller, system = await sim_builder.init()
+        _monitor("simulation_initialized")
 
         # --- Simulation Loop ---
         max_ticks = _as_int(getattr(sim_builder.config.simulation, "max_ticks", 10), default=10)
@@ -311,6 +407,16 @@ async def main():
         )
         num_episodes = _as_int(os.getenv("SCIMAS_NUM_EPISODES", num_episodes), default=num_episodes)
         run_manifest = _write_run_manifest(project_path, max_ticks=max_ticks, num_episodes=num_episodes)
+        if DASHBOARD_LIVE_ENABLE:
+            try:
+                out_dir = _sim_dir(project_path)
+                await asyncio.wait_for(
+                    asyncio.to_thread(generate_trend_dashboard, base_dir=project_path, out_dir=out_dir),
+                    timeout=DASHBOARD_REFRESH_TIMEOUT_S,
+                )
+                _monitor(f"dashboard_refresh_init path={os.path.join(out_dir, 'trend_dashboard.html')}")
+            except Exception as e:
+                _monitor(f"dashboard_refresh_init_failed reason={e}")
         logger.info(f"--- Starting Simulation Run: {num_episodes} episodes, {max_ticks} ticks/episode ---")
 
         if isinstance(controller, CustomController):
@@ -318,15 +424,25 @@ async def main():
 
         for ep in range(num_episodes):
             logger.info(f"=== Episode {ep + 1}/{num_episodes} start ===")
+            _monitor(f"episode_start index={ep + 1}/{num_episodes}")
             num_ticks_to_run = max_ticks
             total_duration = 0.0
+            dashboard_last_refresh_ts = 0.0
 
-            for _ in range(num_ticks_to_run):
+            for tick_idx in range(num_ticks_to_run):
                 tick_start_time = time.time()
 
                 # 程序主骨架：每个 tick 都调用 controller.step_agent() 和 system.run("messager", "dispatch_messages")
-                await controller.step_agent()
-                await system.run("messager", "dispatch_messages") 
+                await _await_with_heartbeat(
+                    controller.step_agent(),
+                    label=f"ep={ep + 1} tick={tick_idx + 1} controller.step_agent",
+                    heartbeat_s=RUNTIME_MONITOR_HEARTBEAT_S,
+                )
+                await _await_with_heartbeat(
+                    system.run("messager", "dispatch_messages"),
+                    label=f"ep={ep + 1} tick={tick_idx + 1} messager.dispatch_messages",
+                    heartbeat_s=RUNTIME_MONITOR_HEARTBEAT_S,
+                )
                 # 这会走 EasyCommunicationPlugin.send_message()，调用 system 的 messager.send_message 把 Message 放进系统消息队列（EasyCommunicationPlugin.py (line 41)、EasyCommunicationPlugin.py (line 53)）。
                 # system.run("messager","dispatch_messages") 负责把队列里的消息按 to_id 分发，最终触发接收方的 EasyPerceivePlugin.add_message() 把它存到 received_messages（EasyPerceivePlugin.py (line 63)）。
 
@@ -341,6 +457,15 @@ async def main():
                 await system.run("timer", "add_tick", duration_seconds=actual_tick_duration)
                 if VERBOSE_TICK_LOGS:
                     logger.info(f"--- Tick {current_tick} finished in {actual_tick_duration:.4f} seconds ---")
+                if RUNTIME_MONITOR and ((tick_idx + 1) % RUNTIME_MONITOR_TICK_SUMMARY_EVERY == 0):
+                    _monitor(
+                        f"tick_done ep={ep + 1} tick={tick_idx + 1}/{num_ticks_to_run} "
+                        f"sim_tick={current_tick} dt_s={actual_tick_duration:.3f}"
+                    )
+                    await _log_tick_runtime_snapshot(controller, ep_idx=ep, tick_idx=tick_idx)
+                dashboard_last_refresh_ts = await _maybe_refresh_live_dashboard(
+                    ep_idx=ep, tick_idx=tick_idx, last_refresh_ts=dashboard_last_refresh_ts
+                )
 
             if num_ticks_to_run > 0:
                 average_time_per_tick = total_duration / num_ticks_to_run
@@ -351,6 +476,7 @@ async def main():
             if isinstance(controller, CustomController):
                 final_info = await controller.finalize_episode(episode_index=ep)
                 logger.info(f"Episode {ep + 1} summary: {final_info}")
+                _monitor(f"episode_end index={ep + 1}/{num_episodes} summary_ready=1")
                 if ep < num_episodes - 1:
                     evolve_info = await controller.evolve_population()
                     top_donor = None

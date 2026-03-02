@@ -135,6 +135,12 @@ def analyze(project_root: str) -> Dict[str, Any]:
 
     fit_up = fit_last >= fit_first
     collab_up = collab_last >= collab_first
+    complete_per_claim = [float(row.get("taskboard_complete_per_claim", 0.0) or 0.0) for row in metrics_rows]
+    release_per_complete = [float(row.get("taskboard_release_per_complete", 0.0) or 0.0) for row in metrics_rows]
+    inner_failed_release = [
+        float(row.get("taskboard_release_inner_action_failed_experiment", 0.0) or 0.0) for row in metrics_rows
+    ]
+    top_release_reason = str(metrics_rows[-1].get("taskboard_top_release_reason") or "")
 
     summary = {
         "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -161,6 +167,12 @@ def analyze(project_root: str) -> Dict[str, Any]:
             "collaboration_ratio_upward": collab_up,
             "both_upward": fit_up and collab_up,
         },
+        "runtime_state": {
+            "task_complete_per_claim_last": complete_per_claim[-1] if complete_per_claim else 0.0,
+            "task_release_per_complete_last": release_per_complete[-1] if release_per_complete else 0.0,
+            "task_release_inner_failed_experiment_last": inner_failed_release[-1] if inner_failed_release else 0.0,
+            "taskboard_top_release_reason_last": top_release_reason,
+        },
     }
 
     summary_json_path = os.path.join(sim_dir, "analysis_summary.json")
@@ -182,6 +194,9 @@ def analyze(project_root: str) -> Dict[str, Any]:
         f.write(f"Collaboration delta/slope: {collab_last - collab_first:.6f} / {collab_slope:.6f}\n")
         f.write(f"Collaboration monotonic non-decreasing: {collab_monotonic}\n")
         f.write(f"Acceptance both upward: {fit_up and collab_up}\n")
+        f.write(f"Task complete/claim last: {(complete_per_claim[-1] if complete_per_claim else 0.0):.6f}\n")
+        f.write(f"Task release/complete last: {(release_per_complete[-1] if release_per_complete else 0.0):.6f}\n")
+        f.write(f"Top release reason last: {top_release_reason or 'n/a'}\n")
 
     with open(timeseries_csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
@@ -199,6 +214,10 @@ def analyze(project_root: str) -> Dict[str, Any]:
                 "publishable_rate",
                 "team_readiness",
                 "collaboration_ratio",
+                "taskboard_complete_per_claim",
+                "taskboard_release_per_complete",
+                "taskboard_release_inner_action_failed_experiment",
+                "taskboard_top_release_reason",
             ]
         )
         for row in metrics_rows:
@@ -216,6 +235,10 @@ def analyze(project_root: str) -> Dict[str, Any]:
                     float(row.get("publishable_rate", 0.0) or 0.0),
                     float(row.get("team_readiness", 0.0) or 0.0),
                     float(row.get("collaboration_ratio", 0.0) or 0.0),
+                    float(row.get("taskboard_complete_per_claim", 0.0) or 0.0),
+                    float(row.get("taskboard_release_per_complete", 0.0) or 0.0),
+                    float(row.get("taskboard_release_inner_action_failed_experiment", 0.0) or 0.0),
+                    str(row.get("taskboard_top_release_reason") or ""),
                 ]
             )
 

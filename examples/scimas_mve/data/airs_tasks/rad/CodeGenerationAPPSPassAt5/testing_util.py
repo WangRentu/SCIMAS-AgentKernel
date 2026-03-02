@@ -8,6 +8,8 @@ import json
 import sys
 import faulthandler
 import platform
+import types
+import uuid
 
 # used for debugging to time steps
 from datetime import datetime
@@ -21,7 +23,22 @@ from io import StringIO
 # used for testing the code that reads from input
 from unittest.mock import patch, mock_open
 
-from pyext import RuntimeModule
+class RuntimeModule:
+    """Lightweight drop-in replacement for pyext.RuntimeModule.
+
+    This implementation only supports `from_string`, which is the only API
+    used by this task's evaluator.
+    """
+
+    @staticmethod
+    def from_string(module_name: str, file_path: str, source: str):
+        del file_path  # kept for signature compatibility
+        safe_name = f"{module_name}_{uuid.uuid4().hex}"
+        module = types.ModuleType(safe_name)
+        module.__file__ = f"<{safe_name}>"
+        # Use the module dict as both globals/locals so definitions are visible.
+        exec(compile(source, module.__file__, "exec"), module.__dict__, module.__dict__)
+        return module
 
 from enum import Enum
 class CODE_TYPE(Enum):
