@@ -1,4 +1,6 @@
 import asyncio
+import csv
+import hashlib
 import json
 import math
 import os
@@ -216,6 +218,10 @@ class AIRSWorldPlugin(SciencePluginBase):
         self._all_agent_ids = self._load_agent_ids()
 
         self._task_log_path = os.path.join(self._project_root, "logs", "app", "environment", "taskboard.jsonl")
+        self._eval_failure_log_path = os.path.join(self._project_root, "logs", "app", "environment", "eval_failures.jsonl")
+        self._eval_cache_log_path = os.path.join(self._project_root, "logs", "app", "environment", "eval_cache.jsonl")
+        self._eval_cache_enable = os.getenv("SCIMAS_EVAL_CACHE_ENABLE", "1").lower() not in {"0", "false", "no"}
+        self._eval_cache: Dict[str, Dict[str, Any]] = {}
 
         self._tasks_catalog: List[Dict[str, Any]] = []
         self._current_task: Optional[Dict[str, Any]] = None
@@ -254,7 +260,10 @@ class AIRSWorldPlugin(SciencePluginBase):
 
     async def init(self) -> None:
         os.makedirs(os.path.dirname(self._task_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._eval_failure_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._eval_cache_log_path), exist_ok=True)
         os.makedirs(self.workspace_root, exist_ok=True)
+        self._load_eval_cache_sync()
         logger.info(
             f"AIRSWorldPlugin initialized: tasks_root={self.tasks_root}, shared_data_dir={self.shared_data_dir}, "
             f"catalog_size={len(self._tasks_catalog)}"
@@ -284,6 +293,207 @@ class AIRSWorldPlugin(SciencePluginBase):
             logger.error(f"[MONITOR] {message}")
         else:
             logger.info(f"[MONITOR] {message}")
+
+    def _append_jsonl_sync(self, path: str, record: Dict[str, Any]) -> None:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to append jsonl {path}: {e}")
+
+    def _classify_eval_error(self, text: str) -> str:
+        raw = str(text or "").lower()
+        if "module not found" in raw or "modulenotfounderror" in raw:
+            return "missing_dependency"
+        if "filenotfounderror" in raw or "no such file or directory" in raw:
+            return "missing_file"
+        if "syntaxerror" in raw:
+            return "syntax_error"
+        if "permission denied" in raw:
+            return "permission_error"
+        if "killed" in raw or "oom" in raw:
+            return "resource_killed"
+        if "submission" in raw and ("format" in raw or "schema" in raw):
+            return "submission_format_error"
+        return "runtime_error"
+
+    def _load_eval_cache_sync(self) -> None:
+        self._eval_cache = {}
+        if not self._eval_cache_enable:
+            return
+        path = Path(self._eval_cache_log_path)
+        if not path.exists():
+            return
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    key = str(obj.get("cache_key") or "").strip()
+                    payload = obj.get("payload")
+                    if key and isinstance(payload, dict):
+                        self._eval_cache[key] = payload
+        except Exception as e:
+            logger.warning(f"Failed to load eval cache {path}: {e}")
+
+    def _append_eval_cache_sync(self, cache_key: str, payload: Dict[str, Any]) -> None:
+        if not self._eval_cache_enable:
+            return
+        safe_payload = dict(payload or {})
+        self._eval_cache[str(cache_key)] = safe_payload
+        self._append_jsonl_sync(
+            self._eval_cache_log_path,
+            {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "episode_id": int(self._episode_id),
+                "cache_key": str(cache_key),
+                "payload": safe_payload,
+            },
+        )
+
+    def _file_sha256(self, path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _eval_cache_key(self, task: Dict[str, Any], submission_hash: str) -> str:
+        task_name = str((task or {}).get("task_name") or "")
+        return f"{task_name}|{submission_hash}"
+
+    def _expected_submission_rows(self) -> Optional[int]:
+        try:
+            from datasets import load_from_disk
+        except Exception:
+            return None
+        if not self._prepared_data_cache_dir:
+            return None
+        test_path = Path(self._prepared_data_cache_dir) / "test"
+        if not test_path.exists():
+            return None
+        try:
+            dset = load_from_disk(str(test_path))
+            return int(len(dset))
+        except Exception:
+            return None
+
+    def _required_submission_columns(self, task: Dict[str, Any]) -> List[str]:
+        info = (task or {}).get("logging_info") or {}
+        raw = info.get("scoring_column")
+        cols: List[str] = []
+        if isinstance(raw, list):
+            for item in raw:
+                name = str(item or "").strip()
+                if name and name not in cols:
+                    cols.append(name)
+        else:
+            name = str(raw or "").strip()
+            if name:
+                cols.append(name)
+        if not cols:
+            cols = ["prediction"]
+        return cols
+
+    def _preflight_submission_schema(self, task: Dict[str, Any], submission_path: str) -> Dict[str, Any]:
+        if not submission_path or not os.path.exists(submission_path):
+            return {
+                "ok": False,
+                "error_code": "submission_not_found",
+                "message": f"submission not found: {submission_path}",
+            }
+        required_cols = self._required_submission_columns(task)
+        rows = 0
+        null_rows = 0
+        try:
+            with open(submission_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                fieldnames = list(reader.fieldnames or [])
+                missing = [c for c in required_cols if c not in fieldnames]
+                if missing:
+                    return {
+                        "ok": False,
+                        "error_code": "missing_columns",
+                        "message": f"submission missing required columns: {missing}",
+                        "required_columns": required_cols,
+                        "present_columns": fieldnames,
+                    }
+                for row in reader:
+                    rows += 1
+                    for col in required_cols:
+                        val = row.get(col)
+                        if val is None or str(val).strip() == "":
+                            null_rows += 1
+                            break
+            if rows <= 0:
+                return {
+                    "ok": False,
+                    "error_code": "empty_submission",
+                    "message": "submission contains no data rows",
+                    "required_columns": required_cols,
+                }
+            expected_rows = self._expected_submission_rows()
+            if isinstance(expected_rows, int) and expected_rows > 0 and rows != expected_rows:
+                return {
+                    "ok": False,
+                    "error_code": "row_count_mismatch",
+                    "message": f"submission row count mismatch: got={rows}, expected={expected_rows}",
+                    "required_columns": required_cols,
+                    "row_count": rows,
+                    "expected_rows": expected_rows,
+                }
+            if null_rows > 0:
+                return {
+                    "ok": False,
+                    "error_code": "null_values_in_required_columns",
+                    "message": f"submission has null/empty values in required columns: {null_rows} rows",
+                    "required_columns": required_cols,
+                    "row_count": rows,
+                    "null_rows": null_rows,
+                }
+            return {
+                "ok": True,
+                "required_columns": required_cols,
+                "row_count": rows,
+                "null_rows": 0,
+                "expected_rows": expected_rows,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error_code": "submission_parse_error",
+                "message": f"failed to parse submission: {e}",
+                "required_columns": required_cols,
+            }
+
+    def _evaluate_dependency_precheck(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        metric = str(((task or {}).get("logging_info") or {}).get("metric") or "")
+        category = str(((task or {}).get("logging_info") or {}).get("category") or "")
+        task_name = str((task or {}).get("task_name") or "")
+        imports = ["import pandas", "import numpy"]
+        if self._is_timeseries_submission_task(task=task, metric=metric, category=category) or "timeseries" in task_name.lower():
+            imports.append("import sktime")
+        cmd = [self._python_cmd, "-c", "; ".join(imports)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        except Exception as e:
+            return {"ok": False, "error_code": "precheck_runtime_error", "message": str(e), "cmd": cmd}
+        if int(proc.returncode) != 0:
+            err = str(proc.stderr or proc.stdout or "").strip()
+            return {
+                "ok": False,
+                "error_code": "missing_dependency",
+                "message": err[-600:],
+                "cmd": cmd,
+                "returncode": int(proc.returncode),
+            }
+        return {"ok": True, "cmd": cmd}
 
     def _resolve_path(self, path: str, project_root: str) -> str:
         p = Path(path)
@@ -3434,9 +3644,31 @@ class AIRSWorldPlugin(SciencePluginBase):
 
         timeout_prepare = int(float(os.getenv("SCIMAS_AIRS_PREPARE_TIMEOUT_S", "180")))
         timeout_eval = int(float(os.getenv("SCIMAS_AIRS_EVAL_TIMEOUT_S", "180")))
+        submission_path = os.path.join(data_mount_dir, "submission.csv")
+        eval_meta = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "episode_id": int(self._episode_id),
+            "task_name": str(task.get("task_name") or ""),
+            "task_metric": str((task.get("logging_info") or {}).get("metric") or ""),
+            "agent_log_dir": str(agent_log_dir),
+            "data_mount_dir": str(data_mount_dir),
+            "submission_path": submission_path,
+            "submission_exists": bool(os.path.exists(submission_path)),
+        }
 
         rc, out2, err2 = self._run_script(eval_prepare_py, args, timeout_s=timeout_prepare)
         if rc != 0:
+            self._append_jsonl_sync(
+                self._eval_failure_log_path,
+                {
+                    **eval_meta,
+                    "stage": "evaluate_prepare",
+                    "rc": int(rc),
+                    "error_type": self._classify_eval_error(err2),
+                    "stdout_tail": str(out2 or "")[-1200:],
+                    "stderr_tail": str(err2 or "")[-1600:],
+                },
+            )
             raise RuntimeError(f"evaluate_prepare.py failed: {err2[-800:]}")
 
         with tempfile.TemporaryDirectory(prefix="airs_eval_") as td:
@@ -3453,6 +3685,17 @@ class AIRSWorldPlugin(SciencePluginBase):
             )
             if rc != 0:
                 err_text = f"{out3}\n{err3}"
+                self._append_jsonl_sync(
+                    self._eval_failure_log_path,
+                    {
+                        **eval_meta,
+                        "stage": "evaluate",
+                        "rc": int(rc),
+                        "error_type": self._classify_eval_error(err_text),
+                        "stdout_tail": str(out3 or "")[-1200:],
+                        "stderr_tail": str(err3 or "")[-1600:],
+                    },
+                )
                 # Some environments miss sktime required by official evaluator.
                 # Fallback to an internal MASE implementation for this specific task.
                 if self._is_timeseries_submission_task(
@@ -3632,6 +3875,16 @@ class AIRSWorldPlugin(SciencePluginBase):
                 "fallback_reason": "",
                 "error": f"hard_stop:{stop_reason}",
                 "eval_split": "dev",
+                "failure_stage": "prepare",
+                "exit_code": None,
+                "executor_diag": {
+                    "backend": self._code_executor_backend,
+                    "timeout_hit": False,
+                    "memory_hit": False,
+                    "killed": False,
+                    "image": self._code_docker_image,
+                    "command": "",
+                },
             }
         run_dir = Path(self._task_workspace()) / run_id
         data_mount = run_dir / "agent_data"
@@ -3662,6 +3915,16 @@ class AIRSWorldPlugin(SciencePluginBase):
         dev_eval = None
         executor_used = ""
         executor_fallback_used = False
+        failure_stage = "unknown"
+        exit_code = None
+        executor_diag: Dict[str, Any] = {
+            "backend": self._code_executor_backend,
+            "timeout_hit": False,
+            "memory_hit": False,
+            "killed": False,
+            "image": self._code_docker_image,
+            "command": "",
+        }
 
         try:
             if self._prepared_cache_ready():
@@ -3693,6 +3956,7 @@ class AIRSWorldPlugin(SciencePluginBase):
                 except Exception as e:
                     code_error = str(e)
                     fallback_reason = f"code_agent:{code_error}"
+                    failure_stage = "execute"
                     logger.info(f"AIRS code-agent fallback on {task.get('task_name')}/{run_id}: {code_error}")
 
             solver_error = None
@@ -3707,6 +3971,7 @@ class AIRSWorldPlugin(SciencePluginBase):
                 except Exception as e:
                     solver_error = str(e)
                     fallback_reason = solver_error
+                    failure_stage = "execute"
                     logger.info(f"AIRS solver fallback on {task.get('task_name')}/{run_id}: {solver_error}")
 
             if isinstance(solver_result, dict) and solver_result.get("submission_path"):
@@ -3726,6 +3991,14 @@ class AIRSWorldPlugin(SciencePluginBase):
                 dev_eval = solver_result.get("dev_eval")
                 executor_used = str(solver_result.get("executor_used") or "")
                 executor_fallback_used = bool(solver_result.get("executor_fallback_used", False))
+                exit_code = solver_result.get("exit_code")
+                failure_stage = str(solver_result.get("failure_stage") or "execute")
+                diag_raw = solver_result.get("executor_diag")
+                if isinstance(diag_raw, dict):
+                    executor_diag.update(diag_raw)
+                cmd_raw = solver_result.get("run_cmd")
+                if isinstance(cmd_raw, str) and cmd_raw.strip():
+                    executor_diag["command"] = cmd_raw.strip()[:300]
             else:
                 if not self._solver_fallback_template:
                     raise RuntimeError(f"solver_failed_no_fallback:{fallback_reason or 'unknown'}")
@@ -3736,6 +4009,7 @@ class AIRSWorldPlugin(SciencePluginBase):
                     strategy=strategy,
                 )
                 solver_mode = "rule_template_fallback"
+                failure_stage = "format"
 
             metric_name = str((task.get("logging_info") or {}).get("metric") or "")
             if isinstance(dev_score, (int, float)):
@@ -3750,10 +4024,19 @@ class AIRSWorldPlugin(SciencePluginBase):
         except Exception as e:
             ok = False
             error = str(e)
+            if failure_stage == "unknown":
+                failure_stage = "execute"
             logger.warning(f"AIRS run_experiment failed on {task.get('task_name')}/{run_id}: {e}")
 
         ended = datetime.utcnow()
         elapsed_s = max(0.0, (ended - started).total_seconds())
+        merged_err = f"{error or ''}\n{stderr_tail or ''}\n{stdout_tail or ''}".lower()
+        if "timed out" in merged_err or "timeout" in merged_err:
+            executor_diag["timeout_hit"] = True
+        if "out of memory" in merged_err or "oom" in merged_err:
+            executor_diag["memory_hit"] = True
+        if "killed" in merged_err:
+            executor_diag["killed"] = True
         run_record = {
             "run_id": run_id,
             "ts": started.isoformat() + "Z",
@@ -3784,6 +4067,9 @@ class AIRSWorldPlugin(SciencePluginBase):
             "fallback_reason": fallback_reason,
             "error": error,
             "eval_split": "dev",
+            "failure_stage": failure_stage,
+            "exit_code": exit_code if isinstance(exit_code, int) else None,
+            "executor_diag": executor_diag,
         }
         self._score_cache.append(run_record)
         return run_record
@@ -3792,10 +4078,66 @@ class AIRSWorldPlugin(SciencePluginBase):
         task = self._current_task
         if not task:
             return {"ok": False, "reason": "no_active_task"}
-        if not submission_path or not os.path.exists(submission_path):
-            return {"ok": False, "reason": "submission_not_found", "submission_path": submission_path}
-
         run_id = self._next_run_id()
+        if not submission_path or not os.path.exists(submission_path):
+            return {
+                "ok": False,
+                "reason": "submission_not_found",
+                "submission_path": submission_path,
+                "run_id": run_id,
+                "error_type": "format_error",
+                "failure_stage": "preflight_schema",
+            }
+
+        preflight = self._preflight_submission_schema(task=task, submission_path=submission_path)
+        if not bool(preflight.get("ok")):
+            payload = {
+                "ok": False,
+                "reason": f"format_error:{preflight.get('error_code')}",
+                "submission_path": submission_path,
+                "run_id": run_id,
+                "error_type": "format_error",
+                "failure_stage": "preflight_schema",
+                "preflight": preflight,
+                "cache_hit": False,
+            }
+            try:
+                sub_hash = self._file_sha256(submission_path)
+                cache_key = self._eval_cache_key(task=task, submission_hash=sub_hash)
+                payload["submission_hash"] = sub_hash
+                payload["cache_key"] = cache_key
+                self._append_eval_cache_sync(cache_key=cache_key, payload=payload)
+            except Exception:
+                pass
+            return payload
+
+        submission_hash = self._file_sha256(submission_path)
+        cache_key = self._eval_cache_key(task=task, submission_hash=submission_hash)
+        if self._eval_cache_enable and cache_key in self._eval_cache:
+            cached = dict(self._eval_cache.get(cache_key) or {})
+            cached["run_id"] = run_id
+            cached["cache_hit"] = True
+            cached["cache_key"] = cache_key
+            cached["submission_hash"] = submission_hash
+            return cached
+
+        dep_check = self._evaluate_dependency_precheck(task=task)
+        if not bool(dep_check.get("ok")):
+            payload = {
+                "ok": False,
+                "reason": f"system_error:{dep_check.get('error_code')}",
+                "submission_path": submission_path,
+                "run_id": run_id,
+                "error_type": "system_error",
+                "failure_stage": "environment_precheck",
+                "dependency_check": dep_check,
+                "cache_hit": False,
+                "cache_key": cache_key,
+                "submission_hash": submission_hash,
+            }
+            self._append_eval_cache_sync(cache_key=cache_key, payload=payload)
+            return payload
+
         run_dir = Path(self._task_workspace()) / f"eval_{run_id}"
         data_mount = run_dir / "agent_data"
         agent_log = run_dir / "agent_log"
@@ -3806,7 +4148,7 @@ class AIRSWorldPlugin(SciencePluginBase):
 
         try:
             eval_result = self._run_eval_pipeline(task=task, agent_log_dir=str(agent_log), data_mount_dir=str(data_mount))
-            return {
+            payload = {
                 "ok": True,
                 "run_id": run_id,
                 "task_name": task.get("task_name"),
@@ -3815,9 +4157,27 @@ class AIRSWorldPlugin(SciencePluginBase):
                 "raw_score": float(eval_result["raw_score"]),
                 "score_norm": float(eval_result["score_norm"]),
                 "stdout_tail": eval_result.get("stdout_tail"),
+                "cache_hit": False,
+                "cache_key": cache_key,
+                "submission_hash": submission_hash,
+                "preflight": preflight,
             }
+            self._append_eval_cache_sync(cache_key=cache_key, payload=payload)
+            return payload
         except Exception as e:
-            return {"ok": False, "reason": str(e), "run_id": run_id}
+            payload = {
+                "ok": False,
+                "reason": str(e),
+                "run_id": run_id,
+                "error_type": self._classify_eval_error(str(e)),
+                "failure_stage": "evaluate_submission",
+                "cache_hit": False,
+                "cache_key": cache_key,
+                "submission_hash": submission_hash,
+                "preflight": preflight,
+            }
+            self._append_eval_cache_sync(cache_key=cache_key, payload=payload)
+            return payload
 
     async def submit_paper(self, paper: Dict[str, Any]) -> Dict[str, Any]:
         self._paper_seq += 1

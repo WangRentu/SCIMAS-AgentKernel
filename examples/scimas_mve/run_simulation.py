@@ -8,6 +8,8 @@ import json
 import shutil
 import hashlib
 import subprocess
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional, Dict
 
@@ -228,6 +230,70 @@ def _sim_dir(project_root: str) -> str:
     return os.path.join(project_root, "logs", "app", "simulation")
 
 
+def _env_bool(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).lower() not in {"0", "false", "no"}
+
+
+def _prepare_fresh_run_logs(project_root: str) -> None:
+    # Default behavior: every simulation run starts from a clean log slate.
+    if not _env_bool("SCIMAS_RESET_LOGS_ON_START", "1"):
+        return
+    logs_root = os.path.join(project_root, "logs")
+    app_dir = os.path.join(logs_root, "app")
+    runs_dir = os.path.join(logs_root, "runs")
+    for target in (app_dir, runs_dir):
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+        except Exception as e:
+            logger.warning(f"Failed to reset logs directory {target}: {e}")
+    os.makedirs(app_dir, exist_ok=True)
+    os.makedirs(runs_dir, exist_ok=True)
+    logger.info(f"Fresh-run log reset applied under: {logs_root}")
+
+
+def _qdrant_reset_collection() -> None:
+    # Default behavior: clear RAG collection on each run to avoid cross-run accumulation.
+    if not _env_bool("SCIMAS_RESET_RAG_COLLECTION_ON_START", "1"):
+        return
+    if not _env_bool("SCIMAS_RAG_ENABLE", "1"):
+        return
+
+    qdrant_url = str(os.getenv("SCIMAS_RAG_QDRANT_URL", "http://127.0.0.1:6333") or "").strip().rstrip("/")
+    collection = str(os.getenv("SCIMAS_RAG_COLLECTION", "scimas_local_knowledge_v1") or "").strip()
+    api_key = str(os.getenv("SCIMAS_RAG_QDRANT_API_KEY", "") or "").strip()
+    if not qdrant_url or not collection:
+        logger.warning("Skip RAG collection reset: missing SCIMAS_RAG_QDRANT_URL or SCIMAS_RAG_COLLECTION.")
+        return
+
+    url = f"{qdrant_url}/collections/{collection}"
+    headers = {}
+    if api_key:
+        headers["api-key"] = api_key
+    req = urllib.request.Request(url=url, headers=headers, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info(
+                f"RAG collection reset: deleted {collection} at {qdrant_url} "
+                f"(status={getattr(resp, 'status', 200)})"
+            )
+    except urllib.error.HTTPError as e:
+        if int(getattr(e, "code", 0) or 0) == 404:
+            logger.info(f"RAG collection reset: collection {collection} not found, treated as clean.")
+        else:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = str(e)
+            logger.warning(
+                f"RAG collection reset failed: status={getattr(e, 'code', None)} "
+                f"url={url} detail={body[:300]}"
+            )
+    except Exception as e:
+        logger.warning(f"RAG collection reset failed: url={url} error={e}")
+
+
 def _prepare_sim_logs(project_root: str) -> None:
     if os.getenv("SCIMAS_CLEAN_SIM_LOGS", "0").lower() not in {"1", "true", "yes"}:
         return
@@ -273,7 +339,8 @@ def _prune_logs_to_core(project_root: str) -> None:
     log_mode = (os.getenv("SCIMAS_LOG_MODE", "compact") or "compact").strip().lower()
     if log_mode not in {"compact", "minimal"}:
         return
-    if os.getenv("SCIMAS_PRUNE_LOGS", "1").lower() in {"0", "false", "no"}:
+    # Keep full logs by default; prune only when explicitly enabled.
+    if os.getenv("SCIMAS_PRUNE_LOGS", "0").lower() in {"0", "false", "no"}:
         return
 
     logs_root = os.path.join(project_root, "logs")
@@ -386,6 +453,8 @@ async def main():
     run_manifest: Optional[Dict[str, Any]] = None
     try:
         logger.info(f"Project path set to: {project_path}")
+        _prepare_fresh_run_logs(project_path)
+        _qdrant_reset_collection()
         _prepare_sim_logs(project_path)
         _prepare_compact_logs(project_path)
 
@@ -510,7 +579,6 @@ async def main():
                 with open(manifest_path, "w", encoding="utf-8") as f:
                     json.dump(run_manifest, f, ensure_ascii=False, indent=2)
                     f.write("\n")
-                _prune_logs_to_core(project_path)
                 archived = _archive_run(project_path, run_manifest)
                 if archived:
                     logger.info(f"Archived run artifacts to: {archived}")
@@ -527,7 +595,6 @@ async def main():
         if system:
             result = await system.close()
             logger.info(f"System close result is {result}")
-        _prune_logs_to_core(project_path)
 
 
 if __name__ == "__main__":

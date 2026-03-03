@@ -3,62 +3,114 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SCIMAS Live ResearchOps</title>
+  <title>SCIMAS ResearchOps Console</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <div class="app">
     <header class="header">
-      <div class="left">
-        <div class="title">SCIMAS Live ResearchOps</div>
-        <span class="badge"><span id="health-dot" class="dot"></span><span id="health-text">health:-</span></span>
-        <span class="badge" id="alerts-badge">alerts:0</span>
-        <span class="badge" id="release-badge">top release:-</span>
+      <div class="header-left">
+        <div class="title">SCIMAS ResearchOps Console</div>
+        <span class="badge"><span id="health-dot" class="health-dot"></span><span id="health-text">health: -</span></span>
+        <span class="badge" id="alert-chip">alerts: 0</span>
+        <span class="badge" id="top-release-chip">top release: -</span>
+        <span class="badge" id="sim-clock-chip">clock: -</span>
+        <span class="badge" id="token-chip">token cost: -</span>
+        <span class="badge" id="gpu-chip">gpu: -</span>
       </div>
-      <div class="right">
-        <input id="run-search" class="input-mini" placeholder="Run/Episode Search" />
-        <select id="episode-select"></select>
-        <select id="mode-select"><option value="live">Live</option><option value="replay">Replay</option></select>
+      <div class="header-right">
+        <input id="run-search" type="text" class="mini-input" placeholder="Run/Episode Search" />
+        <select id="episode-select" class="mini-select"></select>
+        <select id="mode-select" class="mini-select">
+          <option value="live">Live</option>
+          <option value="replay">Replay</option>
+        </select>
         <input id="replay-slider" type="range" min="0" max="100" value="100" class="hidden" />
-        <button id="snapshot-btn">Snapshot</button>
-        <button id="export-btn">Export</button>
+        <button id="snapshot-btn" class="mini-btn">Snapshot</button>
+        <button id="export-btn" class="mini-btn">Export</button>
+        <button id="inspector-toggle" class="mini-btn">Hide Inspector</button>
       </div>
     </header>
 
-    <div class="body" id="body-layout">
+    <div class="layout" id="layout-root">
       <aside class="sidebar">
         <section class="panel">
-          <div class="panel-head">Filters</div>
+          <div class="panel-head">
+            <div class="panel-title">Filters</div>
+          </div>
           <div class="panel-body">
-            <input id="search-input" placeholder="task/agent/error..." />
+            <input id="search-input" type="text" class="full-input" placeholder="task/agent/error keyword" />
+            <div class="group-title">Task Types</div>
             <div class="chips" id="type-filters"></div>
+            <div class="group-title">Anomalies</div>
             <div class="chips" id="error-filters"></div>
           </div>
         </section>
+
         <section class="panel">
-          <div class="panel-head">Agents <span id="agent-count"></span></div>
+          <div class="panel-head">
+            <div class="panel-title">Agents</div>
+            <div class="muted" id="agent-count"></div>
+          </div>
           <div class="panel-body list" id="agent-list"></div>
         </section>
+
         <section class="panel">
-          <div class="panel-head">Alert Center</div>
+          <div class="panel-head">
+            <div class="panel-title">Alert Center</div>
+            <div class="muted" id="alert-count-mini"></div>
+          </div>
           <div class="panel-body list" id="alert-list"></div>
         </section>
       </aside>
 
+      <div class="col-splitter" id="splitter-left" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0">
+        <span class="splitter-grip-vertical"></span>
+      </div>
+
       <main class="main">
-        <section class="panel fill">
-          <div class="panel-head">Process Timeline</div>
-          <div class="panel-body fill"><div class="timeline" id="timeline"></div></div>
-        </section>
-        <section class="panel fill">
-          <div class="panel-head">Taskboard <span id="task-summary"></span></div>
+        <section class="panel timeline-panel">
+          <div class="panel-head">
+            <div class="panel-title">Process Timeline</div>
+            <div class="muted">read → hypothesize → experiment → review → write → replicate</div>
+          </div>
           <div class="panel-body fill">
-            <div class="stats" id="task-pills"></div>
+            <div class="timeline-shell">
+              <canvas id="flow-canvas"></canvas>
+              <div class="timeline" id="timeline"></div>
+            </div>
+          </div>
+        </section>
+
+        <div class="main-splitter" id="main-splitter" role="separator" aria-orientation="horizontal" aria-label="Resize timeline and taskboard" tabindex="0">
+          <span class="splitter-grip"></span>
+        </div>
+
+        <section class="panel taskboard-panel">
+          <div class="panel-head">
+            <div class="panel-title">Taskboard Live</div>
+            <div class="muted" id="task-summary"></div>
+          </div>
+          <div class="panel-body fill">
+            <div class="stats-row" id="task-pills"></div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>Task</th><th>Type</th><th>State</th><th>Owner</th><th>Lease/HB</th><th>Deps</th><th>C→S</th><th>S→C</th><th>Release</th><th>Run</th>
+                    <th>Task ID</th>
+                    <th>Type</th>
+                    <th>State</th>
+                    <th>Owner</th>
+                    <th>Lease/HB</th>
+                    <th>Deps</th>
+                    <th>C→S</th>
+                    <th>S→C</th>
+                    <th>Confidence</th>
+                    <th>Last Update</th>
+                    <th>Release Reason</th>
+                    <th>Artifacts</th>
+                    <th>Bridge</th>
+                    <th>Run</th>
                   </tr>
                 </thead>
                 <tbody id="task-tbody"></tbody>
@@ -68,20 +120,28 @@
         </section>
       </main>
 
-      <aside class="inspector">
+      <div class="col-splitter" id="splitter-right" role="separator" aria-orientation="vertical" aria-label="Resize inspector" tabindex="0">
+        <span class="splitter-grip-vertical"></span>
+      </div>
+
+      <aside class="inspector" id="inspector">
         <section class="panel">
           <div class="panel-head">
-            Inspector
-            <button id="inspector-toggle">Hide</button>
+            <div class="panel-title">Inspector</div>
+            <div class="muted" id="inspector-hint">select event/task/agent</div>
           </div>
-          <div class="panel-body" id="inspector-summary">No selection</div>
+          <div class="panel-body">
+            <div class="kv" id="inspector-summary"></div>
+          </div>
         </section>
         <section class="tabs" id="inspector-tabs"></section>
-        <section class="panel fill"><div class="panel-body fill" id="inspector-content">Select timeline/task row.</div></section>
+        <section class="panel fill">
+          <div class="panel-body fill inspector-content" id="inspector-content"></div>
+        </section>
       </aside>
     </div>
   </div>
+
   <script src="/app.js"></script>
 </body>
 </html>
-

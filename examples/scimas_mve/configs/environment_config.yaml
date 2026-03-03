@@ -21,11 +21,11 @@ components:
         view_ratio: 0.35
         task_sampling: "fixed_supported_list"
         strict_task_dependencies: true
-        active_worker_count: 4
+        active_worker_count: 1
         max_claims_per_agent: 1
         task_lease_ttl: 4
         task_lease_ttl_experiment: 20
-        experiment_max_active_leases: 4
+        experiment_max_active_leases: 1
         hard_budget_gate: true
         max_experiment_runs: 8
         max_episode_steps: 0

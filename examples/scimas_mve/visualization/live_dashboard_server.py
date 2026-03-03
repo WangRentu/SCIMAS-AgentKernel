@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +16,35 @@ from examples.scimas_mve.visualization.trend_dashboard import build_dashboard_pa
 
 def _json_bytes(data: Dict[str, Any]) -> bytes:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _collect_gpu_metrics() -> Dict[str, Any]:
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=utilization.gpu,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=1.2).strip()
+        if not out:
+            return {"available": False, "reason": "empty_nvidia_smi"}
+        line = out.splitlines()[0]
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 3:
+            return {"available": False, "reason": "bad_nvidia_smi_format"}
+        util = float(parts[0])
+        used = float(parts[1])
+        total = float(parts[2]) if float(parts[2]) > 0 else 0.0
+        ratio = (used / total) if total > 0 else 0.0
+        return {
+            "available": True,
+            "util_percent": util,
+            "memory_used_mb": used,
+            "memory_total_mb": total,
+            "memory_ratio": ratio,
+        }
+    except Exception:
+        return {"available": False, "reason": "nvidia_smi_unavailable"}
 
 
 class LiveDashboardServer(ThreadingHTTPServer):
@@ -39,6 +69,7 @@ class LiveDashboardServer(ThreadingHTTPServer):
         payload["server"] = {
             "seq": self.snapshot_seq,
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "gpu": _collect_gpu_metrics(),
         }
         body = _json_bytes(payload)
         sig = hashlib.sha1(body).hexdigest()
@@ -156,4 +187,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

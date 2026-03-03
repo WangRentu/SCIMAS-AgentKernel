@@ -1,9 +1,16 @@
 import asyncio
+import csv
+import hashlib
+import math
 import json
 import os
 import random
 import re
+import time
 import textwrap
+import urllib.error
+import urllib.request
+from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +18,14 @@ from agentkernel_standalone.mas.action.base.plugin_base import OtherActionsPlugi
 from agentkernel_standalone.toolkit.logger import get_logger
 from agentkernel_standalone.toolkit.utils.annotation import AgentCall, ServiceCall
 from agentkernel_standalone.types.schemas.action import ActionResult
+
+try:
+    from .rag_store import RagStore, RagStoreConfig
+    from .rag_retriever import RagRetriever
+except Exception:  # pragma: no cover
+    RagStore = None  # type: ignore
+    RagStoreConfig = None  # type: ignore
+    RagRetriever = None  # type: ignore
 
 logger = get_logger(__name__)
 
@@ -40,12 +55,20 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         }
 
         self._trace_path = os.path.join(base, "logs", "app", "action", "trace.jsonl")
+        self._code_loop_log_path = os.path.join(base, "logs", "app", "action", "code_loop.jsonl")
+        self._code_diagnosis_log_path = os.path.join(base, "logs", "app", "action", "code_diagnosis.jsonl")
+        self._precondition_gate_log_path = os.path.join(base, "logs", "app", "action", "precondition_gate.jsonl")
         self._research_log_dir = os.path.join(base, "logs", "app", "research")
         self._cards_log_path = os.path.join(self._research_log_dir, "evidence_cards.jsonl")
         self._papers_log_path = os.path.join(self._research_log_dir, "papers.jsonl")
 
         self._llm_log_dir = os.path.join(base, "logs", "app", "llm")
         self._llm_log_path = os.path.join(self._llm_log_dir, "llm_calls.jsonl")
+        self._audit_log_dir = os.path.join(base, "logs", "app", "audit")
+        self._llm_audit_jsonl_path = os.path.join(self._audit_log_dir, "llm_io.jsonl")
+        self._llm_audit_md_path = os.path.join(self._audit_log_dir, "llm_io.md")
+        self._rag_audit_jsonl_path = os.path.join(self._audit_log_dir, "rag_io.jsonl")
+        self._rag_audit_md_path = os.path.join(self._audit_log_dir, "rag_io.md")
         self._llm_timeout_s = float(os.getenv("SCIMAS_LLM_TIMEOUT_S", "15"))
         self._llm_enabled = os.getenv("SCIMAS_LLM_ENABLE", "1").lower() not in {"0", "false", "no"}
         self._llm_actions = {
@@ -61,11 +84,31 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             "false",
             "no",
         }
+        self._audit_io_enable = os.getenv("SCIMAS_AUDIT_IO_ENABLE", "1").lower() not in {"0", "false", "no"}
+        self._audit_markdown_enable = os.getenv("SCIMAS_AUDIT_MARKDOWN_ENABLE", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._audit_llm_max_chars = int(max(2000, int(os.getenv("SCIMAS_AUDIT_LLM_MAX_CHARS", "300000"))))
+        self._audit_rag_max_chars = int(max(2000, int(os.getenv("SCIMAS_AUDIT_RAG_MAX_CHARS", "300000"))))
+        self._audit_rag_max_rows = int(max(1, int(os.getenv("SCIMAS_AUDIT_RAG_MAX_ROWS", "20"))))
         self._llm_max_cards = int(os.getenv("SCIMAS_LLM_MAX_CARDS", "10"))
         self._llm_max_runs = int(os.getenv("SCIMAS_LLM_MAX_RUNS", "8"))
         self._code_loop_enabled = os.getenv("SCIMAS_CODE_AGENT_ENABLE", "1").lower() not in {"0", "false", "no"}
         self._code_debug_rounds = int(max(1, int(os.getenv("SCIMAS_CODE_DEBUG_ROUNDS", "4"))))
         self._code_optimize_after_success = os.getenv("SCIMAS_CODE_OPTIMIZE_AFTER_SUCCESS", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._code_diag_enable = os.getenv("SCIMAS_CODE_DIAG_ENABLE", "1").lower() not in {"0", "false", "no"}
+        self._code_template_fix_enable = os.getenv("SCIMAS_CODE_TEMPLATE_FIX_ENABLE", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._code_optimize_guard_enable = os.getenv("SCIMAS_CODE_OPTIMIZE_GUARD_ENABLE", "1").lower() not in {
             "0",
             "false",
             "no",
@@ -119,16 +162,146 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         self._review_revision_trigger_score = float(
             max(0.0, min(1.0, float(os.getenv("SCIMAS_REVIEW_REVISION_TRIGGER", "0.62"))))
         )
+        self._strict_review_mode = os.getenv("SCIMAS_STRICT_REVIEW", "1").lower() not in {"0", "false", "no"}
+        self._qgr_min_issue_count = int(max(1, int(os.getenv("SCIMAS_QGR_MIN_ISSUES", "2"))))
+        self._qgr_min_citations = int(max(1, int(os.getenv("SCIMAS_QGR_MIN_CITATIONS", "3"))))
+        self._qgr_relevance_threshold = float(max(0.0, min(1.0, float(os.getenv("SCIMAS_QGR_RELEVANCE_THRESHOLD", "0.75")))))
+        self._qgr_fact_support_threshold = float(max(0.0, min(1.0, float(os.getenv("SCIMAS_QGR_FACT_SUPPORT_THRESHOLD", "0.20")))))
+        self._qgr_base_reward = float(os.getenv("SCIMAS_QGR_BASE_REWARD", "0.2"))
+        self._qgr_quality_bonus = float(os.getenv("SCIMAS_QGR_QUALITY_BONUS", "0.5"))
+        self._qgr_predictive_bonus_reward = float(os.getenv("SCIMAS_QGR_PREDICTIVE_BONUS", "1.5"))
         self._review_flattery_penalty = float(max(0.0, float(os.getenv("SCIMAS_REVIEW_FLATTERY_PENALTY", "0.03"))))
         self._review_shallow_penalty = float(max(0.0, float(os.getenv("SCIMAS_REVIEW_SHALLOW_PENALTY", "0.02"))))
         self._review_self_review_penalty = float(max(0.0, float(os.getenv("SCIMAS_REVIEW_SELF_PENALTY", "0.02"))))
+        self._dense_reward_enable = os.getenv("SCIMAS_DENSE_REWARD_ENABLE", "1").lower() not in {"0", "false", "no"}
+        self._read_reward_alpha = float(max(0.0, float(os.getenv("SCIMAS_READ_REWARD_ALPHA", "0.35"))))
+        self._read_reward_base = float(max(0.0, float(os.getenv("SCIMAS_READ_REWARD_BASE", "0.20"))))
+        self._read_reward_max = float(max(self._read_reward_base, float(os.getenv("SCIMAS_READ_REWARD_MAX", "0.50"))))
+        self._read_method_bonus = float(max(0.0, float(os.getenv("SCIMAS_READ_METHOD_BONUS", "0.08"))))
+        self._read_dup_threshold = float(max(0.0, min(1.0, float(os.getenv("SCIMAS_READ_DUP_THRESHOLD", "0.90")))))
+        self._reward_tei_url = str(os.getenv("SCIMAS_REWARD_TEI_URL", "")).strip()
+        self._reward_qdrant_url = str(os.getenv("SCIMAS_REWARD_QDRANT_URL", "")).strip().rstrip("/")
+        self._reward_qdrant_collection = str(os.getenv("SCIMAS_REWARD_QDRANT_COLLECTION", "notes")).strip()
+        self._reward_qdrant_api_key = str(os.getenv("SCIMAS_REWARD_QDRANT_API_KEY", "")).strip()
+        self._hypothesis_schema_bonus = float(max(0.0, float(os.getenv("SCIMAS_HYPOTHESIS_SCHEMA_BONUS", "0.5"))))
+        self._hypothesis_resource_bonus = float(max(0.0, float(os.getenv("SCIMAS_HYPOTHESIS_RESOURCE_BONUS", "0.3"))))
+        self._experiment_success_reward = float(os.getenv("SCIMAS_EXPERIMENT_SUCCESS_REWARD", "1.0"))
+        self._experiment_oom_penalty = float(max(0.0, float(os.getenv("SCIMAS_EXPERIMENT_OOM_PENALTY", "0.8"))))
+        self._experiment_typeerror_penalty = float(max(0.0, float(os.getenv("SCIMAS_EXPERIMENT_TYPEERROR_PENALTY", "0.2"))))
+        self._experiment_first_pass_bonus = float(max(0.0, float(os.getenv("SCIMAS_EXPERIMENT_FIRST_PASS_BONUS", "0.25"))))
+        self._experiment_vram_reward_weight = float(max(0.0, float(os.getenv("SCIMAS_EXPERIMENT_VRAM_WEIGHT", "0.2"))))
+        self._write_eval_success_bonus = float(max(0.0, float(os.getenv("SCIMAS_WRITE_EVAL_SUCCESS_BONUS", "2.0"))))
+        self._write_format_pass_reward = float(max(0.0, float(os.getenv("SCIMAS_WRITE_FORMAT_PASS_REWARD", "0.3"))))
+        self._write_cache_repeat_penalty = float(max(0.0, float(os.getenv("SCIMAS_WRITE_CACHE_REPEAT_PENALTY", "0.05"))))
+        self._write_defer_on_system_error = os.getenv("SCIMAS_WRITE_DEFER_ON_SYSTEM_ERROR", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._replicate_high_support_reward = float(max(0.0, float(os.getenv("SCIMAS_REPLICATE_HIGH_SUPPORT_REWARD", "5.0"))))
+        self._replicate_support_threshold = float(max(0.0, min(1.0, float(os.getenv("SCIMAS_REPLICATE_SUPPORT_THRESHOLD", "0.8")))))
+        self._vdh_enable = os.getenv("SCIMAS_VDH_ENABLE", "1").lower() not in {"0", "false", "no"}
+        self._vdh_gate_policy = str(os.getenv("SCIMAS_VDH_GATE_POLICY", "hard_fail") or "hard_fail").strip().lower()
+        self._vdh_evidence_threshold = float(
+            max(0.0, min(1.0, float(os.getenv("SCIMAS_VDH_EVIDENCE_THRESHOLD", "0.60"))))
+        )
+        self._vdh_qdrant_enable = os.getenv("SCIMAS_VDH_QDRANT_ENABLE", "1").lower() not in {"0", "false", "no"}
+        self._vdh_qdrant_url = str(os.getenv("SCIMAS_VDH_QDRANT_URL", "")).strip().rstrip("/")
+        self._vdh_qdrant_collection = str(os.getenv("SCIMAS_VDH_QDRANT_COLLECTION", "schema_collection")).strip()
+        self._vdh_qdrant_api_key = str(os.getenv("SCIMAS_VDH_QDRANT_API_KEY", "")).strip()
+        self._vdh_tei_enable = os.getenv("SCIMAS_VDH_TEI_ENABLE", "1").lower() not in {"0", "false", "no"}
+        self._vdh_tei_url = str(os.getenv("SCIMAS_VDH_TEI_URL", "")).strip()
+        self._vdh_oom_ratio_threshold = float(
+            max(0.1, min(2.0, float(os.getenv("SCIMAS_VDH_OOM_RATIO_THRESHOLD", "0.90"))))
+        )
+        self._vdh_schema_pass_reward = float(max(0.0, float(os.getenv("SCIMAS_VDH_SCHEMA_PASS_REWARD", "0.5"))))
+        self._vdh_evidence_high_reward = float(max(0.0, float(os.getenv("SCIMAS_VDH_EVIDENCE_HIGH_REWARD", "0.8"))))
+        self._vdh_oom_penalty = float(max(0.0, float(os.getenv("SCIMAS_VDH_OOM_PENALTY", "1.0"))))
+        self._vdh_gate_penalty = float(max(0.0, float(os.getenv("SCIMAS_VDH_GATE_PENALTY", "0.2"))))
+        self._vdh_gate_log_path = os.path.join(base, "logs", "app", "action", "vdh_gate.jsonl")
+        self._review_gate_log_path = os.path.join(base, "logs", "app", "action", "review_gate.jsonl")
+        self._rag_index_log_path = os.path.join(base, "logs", "app", "action", "rag_index.jsonl")
+        self._rag_query_log_path = os.path.join(base, "logs", "app", "action", "rag_query.jsonl")
+        self._rag_usage_log_path = os.path.join(base, "logs", "app", "action", "rag_usage.jsonl")
+        self._rag_health_log_path = os.path.join(base, "logs", "app", "action", "rag_health.jsonl")
+        self._rag_alert_log_path = os.path.join(base, "logs", "app", "action", "rag_alert.jsonl")
+
+        self._rag_enable = os.getenv("SCIMAS_RAG_ENABLE", "1").lower() not in {"0", "false", "no"}
+        self._rag_qdrant_url = str(os.getenv("SCIMAS_RAG_QDRANT_URL", "http://127.0.0.1:6333")).strip().rstrip("/")
+        self._rag_qdrant_api_key = str(os.getenv("SCIMAS_RAG_QDRANT_API_KEY", "")).strip()
+        self._rag_collection = str(os.getenv("SCIMAS_RAG_COLLECTION", "scimas_local_knowledge_v1")).strip()
+        self._rag_embed_url = str(os.getenv("SCIMAS_RAG_EMBED_URL", "http://127.0.0.1:8001/v1/embeddings")).strip()
+        self._rag_embed_model = str(os.getenv("SCIMAS_RAG_EMBED_MODEL", "Qwen/Qwen3-Embedding-4B")).strip()
+        self._rag_topk = int(max(1, int(os.getenv("SCIMAS_RAG_TOPK", "8"))))
+        self._rag_max_context_chars = int(max(500, int(os.getenv("SCIMAS_RAG_MAX_CONTEXT_CHARS", "9000"))))
+        self._rag_chunk_chars = int(max(200, int(os.getenv("SCIMAS_RAG_CHUNK_CHARS", "1200"))))
+        self._rag_chunk_overlap = int(max(0, int(os.getenv("SCIMAS_RAG_CHUNK_OVERLAP", "180"))))
+        self._rag_batch_size = int(max(1, int(os.getenv("SCIMAS_RAG_BATCH_SIZE", "32"))))
+        self._rag_timeout_s = float(max(1.0, float(os.getenv("SCIMAS_RAG_TIMEOUT_S", "8"))))
+        self._rag_min_score = float(max(0.0, min(1.0, float(os.getenv("SCIMAS_RAG_MIN_SCORE", "0.25")))))
+        self._rag_index_on_read = os.getenv("SCIMAS_RAG_INDEX_ON_READ", "1").lower() not in {"0", "false", "no"}
+        self._rag_index_on_experiment = os.getenv("SCIMAS_RAG_INDEX_ON_EXPERIMENT", "1").lower() not in {"0", "false", "no"}
+        self._rag_index_on_write = os.getenv("SCIMAS_RAG_INDEX_ON_WRITE", "1").lower() not in {"0", "false", "no"}
+        self._rag_degraded_alert_threshold = int(max(1, int(os.getenv("SCIMAS_RAG_DEGRADED_STREAK_ALERT", "3"))))
+        self._rag_degraded_pause_ticks = int(max(1, int(os.getenv("SCIMAS_RAG_DEGRADED_PAUSE_TICKS", "12"))))
+        self._rag_store = None
+        self._rag_retriever = None
+        self._rag_bootstrap_episode: Optional[int] = None
+        self._rag_health_checked = False
+        self._rag_degraded_streak = 0
+        self._rag_degraded_last_status = ""
+        self._rag_degraded_pause_until_tick = 0
 
     async def init(self, model_router=None, controller=None):
         self.model = model_router
         self.controller = controller
         os.makedirs(os.path.dirname(self._trace_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._code_loop_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._code_diagnosis_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._precondition_gate_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._vdh_gate_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._review_gate_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._rag_index_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._rag_query_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._rag_usage_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._rag_health_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._rag_alert_log_path), exist_ok=True)
         os.makedirs(self._research_log_dir, exist_ok=True)
         os.makedirs(self._llm_log_dir, exist_ok=True)
+        os.makedirs(self._audit_log_dir, exist_ok=True)
+        self._init_rag_clients()
+        try:
+            world_spec = await self.controller.run_environment("science", "get_world_spec")
+        except Exception:
+            world_spec = {}
+        await self._rag_startup_health_check(world_spec=world_spec)
+        if self._audit_io_enable:
+            try:
+                tick = await self.controller.run_system("timer", "get_tick")
+            except Exception:
+                tick = None
+            session_record = {
+                "meta": {
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "tick": tick,
+                    "episode_id": (world_spec or {}).get("episode_id"),
+                    "task_name": (world_spec or {}).get("task_name"),
+                    "kind": "session_start",
+                },
+                "input": {
+                    "llm_enabled": bool(self._llm_enabled),
+                    "rag_enabled": bool(self._rag_enable),
+                    "llm_actions": dict(self._llm_actions),
+                },
+                "output": {
+                    "status": "ready",
+                    "audit_markdown": bool(self._audit_markdown_enable),
+                    "llm_audit_jsonl": self._llm_audit_jsonl_path,
+                    "rag_audit_jsonl": self._rag_audit_jsonl_path,
+                },
+            }
+            await self._append_jsonl(self._llm_audit_jsonl_path, session_record)
+            await self._append_jsonl(self._rag_audit_jsonl_path, session_record)
 
     async def _log_action(self, *args, **kwargs):
         return None
@@ -165,6 +338,56 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         except Exception as e:
             logger.error(f"Failed to write jsonl {path}: {e}")
 
+    def _clip_text_for_audit(self, text: Any, limit: int) -> Dict[str, Any]:
+        value = str(text or "")
+        truncated = len(value) > limit
+        return {
+            "text": value[:limit] if truncated else value,
+            "chars": len(value),
+            "truncated": bool(truncated),
+        }
+
+    def _safe_jsonable(self, value: Any) -> Any:
+        try:
+            return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        except Exception:
+            return str(value)
+
+    async def _append_markdown_audit(
+        self,
+        *,
+        path: str,
+        title: str,
+        meta: Dict[str, Any],
+        request_payload: Dict[str, Any],
+        response_payload: Dict[str, Any],
+    ) -> None:
+        if not self._audit_markdown_enable:
+            return
+        try:
+            lines: List[str] = []
+            lines.append(f"## {title}")
+            lines.append("")
+            lines.append("### Meta")
+            lines.append("```json")
+            lines.append(json.dumps(self._safe_jsonable(meta), ensure_ascii=False, indent=2))
+            lines.append("```")
+            lines.append("")
+            lines.append("### Input")
+            lines.append("```json")
+            lines.append(json.dumps(self._safe_jsonable(request_payload), ensure_ascii=False, indent=2))
+            lines.append("```")
+            lines.append("")
+            lines.append("### Output")
+            lines.append("```json")
+            lines.append(json.dumps(self._safe_jsonable(response_payload), ensure_ascii=False, indent=2))
+            lines.append("```")
+            lines.append("")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except Exception as e:
+            logger.error(f"Failed to write markdown audit {path}: {e}")
+
     async def _append_trace(self, agent_id: str, action: str, reward: float, detail: Dict[str, Any]):
         if not self._trace_enabled:
             return
@@ -198,6 +421,155 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.error(f"Failed to write trace: {e}")
+
+    async def _log_precondition_gate(
+        self,
+        *,
+        agent_id: str,
+        action: str,
+        phase: str,
+        failures: List[str],
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        tick = await self.controller.run_system("timer", "get_tick")
+        world_spec = await self.controller.run_environment("science", "get_world_spec")
+        await self._append_jsonl(
+            self._precondition_gate_log_path,
+            {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "tick": tick,
+                "episode_id": world_spec.get("episode_id"),
+                "task_name": world_spec.get("task_name"),
+                "agent_id": agent_id,
+                "action": action,
+                "phase": phase,
+                "failures": [str(x) for x in (failures or [])],
+                "summary": summary or {},
+            },
+        )
+
+    async def _log_vdh_gate(
+        self,
+        *,
+        agent_id: str,
+        vdh_report: Dict[str, Any],
+        reward_components: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        tick = await self.controller.run_system("timer", "get_tick")
+        world_spec = await self.controller.run_environment("science", "get_world_spec")
+        await self._append_jsonl(
+            self._vdh_gate_log_path,
+            {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "tick": tick,
+                "episode_id": world_spec.get("episode_id"),
+                "task_name": world_spec.get("task_name"),
+                "task_path": world_spec.get("task_path"),
+                "agent_id": agent_id,
+                "action": "hypothesize",
+                "vdh": vdh_report or {},
+                "reward_components": reward_components or {},
+            },
+        )
+
+    async def _log_review_gate(
+        self,
+        *,
+        agent_id: str,
+        paper_id: Optional[str],
+        run_id: Optional[str],
+        gate: Dict[str, Any],
+    ) -> None:
+        tick = await self.controller.run_system("timer", "get_tick")
+        world_spec = await self.controller.run_environment("science", "get_world_spec")
+        await self._append_jsonl(
+            self._review_gate_log_path,
+            {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "tick": tick,
+                "episode_id": world_spec.get("episode_id"),
+                "task_name": world_spec.get("task_name"),
+                "agent_id": agent_id,
+                "paper_id": paper_id,
+                "run_id": run_id,
+                "gate": gate or {},
+            },
+        )
+
+    async def _log_code_loop(
+        self,
+        *,
+        agent_id: str,
+        attempts: List[Dict[str, Any]],
+        best_dev_score_norm: Optional[float],
+    ) -> None:
+        tick = await self.controller.run_system("timer", "get_tick")
+        world_spec = await self.controller.run_environment("science", "get_world_spec")
+        compact_attempts: List[Dict[str, Any]] = []
+        for a in (attempts or []):
+            r = (a or {}).get("result") if isinstance((a or {}).get("result"), dict) else {}
+            compact_attempts.append(
+                {
+                    "round": a.get("round"),
+                    "phase": a.get("phase"),
+                    "llm_ok": bool(a.get("llm_ok", False)),
+                    "llm_reason": self._truncate(a.get("llm_reason"), 180),
+                    "run_id": r.get("run_id"),
+                    "ok": bool(r.get("ok", False)) if isinstance(r, dict) else False,
+                    "error": self._truncate((r or {}).get("error"), 220) if isinstance(r, dict) else "",
+                    "dev_score_norm": (r or {}).get("dev_score_norm") if isinstance(r, dict) else None,
+                    "score_norm": (r or {}).get("score_norm") if isinstance(r, dict) else None,
+                    "solver_mode": (r or {}).get("solver_mode") if isinstance(r, dict) else None,
+                    "error_class": ((a.get("diagnosis") or {}).get("error_class") if isinstance(a.get("diagnosis"), dict) else None),
+                    "error_codes": ((a.get("diagnosis") or {}).get("error_codes") if isinstance(a.get("diagnosis"), dict) else []),
+                    "template_rules": ((a.get("template_fix") or {}).get("rules_hit") if isinstance(a.get("template_fix"), dict) else []),
+                }
+            )
+        await self._append_jsonl(
+            self._code_loop_log_path,
+            {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "tick": tick,
+                "episode_id": world_spec.get("episode_id"),
+                "task_name": world_spec.get("task_name"),
+                "agent_id": agent_id,
+                "attempt_count": len(compact_attempts),
+                "best_dev_score_norm": best_dev_score_norm,
+                "attempts": compact_attempts,
+            },
+        )
+
+    async def _log_code_diagnosis(
+        self,
+        *,
+        agent_id: str,
+        phase: str,
+        run_id: Optional[str],
+        diagnosis: Dict[str, Any],
+        template_fix: Dict[str, Any],
+        decision: str,
+        score_norm: Optional[float] = None,
+        dev_score_norm: Optional[float] = None,
+    ) -> None:
+        tick = await self.controller.run_system("timer", "get_tick")
+        world_spec = await self.controller.run_environment("science", "get_world_spec")
+        await self._append_jsonl(
+            self._code_diagnosis_log_path,
+            {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "tick": tick,
+                "episode_id": world_spec.get("episode_id"),
+                "task_name": world_spec.get("task_name"),
+                "agent_id": agent_id,
+                "phase": phase,
+                "run_id": run_id,
+                "decision": decision,
+                "score_norm": score_norm,
+                "dev_score_norm": dev_score_norm,
+                "diagnosis": diagnosis or {},
+                "template_fix": template_fix or {},
+            },
+        )
 
     def _action_error(
         self,
@@ -249,12 +621,73 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             return
         await self._append_jsonl(self._llm_log_path, record)
 
+    async def _log_llm_audit(
+        self,
+        *,
+        ts: str,
+        tick: int,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        action_name: str,
+        prompt: str,
+        raw_response: Any,
+        parsed_data: Any,
+        ok: bool,
+        reason: str = "",
+    ) -> None:
+        if not self._audit_io_enable:
+            return
+        req = {
+            "prompt": self._clip_text_for_audit(prompt, self._audit_llm_max_chars),
+        }
+        raw_text = raw_response if isinstance(raw_response, str) else str(raw_response or "")
+        resp = {
+            "ok": bool(ok),
+            "reason": str(reason or ""),
+            "raw_response": self._clip_text_for_audit(raw_text, self._audit_llm_max_chars),
+            "parsed_json": self._safe_jsonable(parsed_data),
+        }
+        meta = {
+            "ts": ts,
+            "tick": tick,
+            "episode_id": world_spec.get("episode_id"),
+            "task_name": world_spec.get("task_name"),
+            "agent_id": agent_id,
+            "action": action_name,
+            "kind": "llm_chat_json",
+        }
+        record = {
+            "meta": meta,
+            "input": req,
+            "output": resp,
+        }
+        await self._append_jsonl(self._llm_audit_jsonl_path, record)
+        await self._append_markdown_audit(
+            path=self._llm_audit_md_path,
+            title=f"[{ts}] action={action_name} agent={agent_id} ok={bool(ok)}",
+            meta=meta,
+            request_payload=req,
+            response_payload=resp,
+        )
+
     async def _call_llm_json(self, *, agent_id: str, action_name: str, prompt: str) -> Dict[str, Any]:
         tick = await self.controller.run_system("timer", "get_tick")
         world_spec = await self.controller.run_environment("science", "get_world_spec")
         ts = datetime.utcnow().isoformat() + "Z"
 
         if not self._llm_ready(action_name):
+            await self._log_llm_audit(
+                ts=ts,
+                tick=tick,
+                world_spec=world_spec,
+                agent_id=agent_id,
+                action_name=action_name,
+                prompt=prompt,
+                raw_response="",
+                parsed_data={},
+                ok=False,
+                reason="llm_disabled_or_missing",
+            )
             return {"ok": False, "reason": "llm_disabled_or_missing"}
         try:
             raw = await asyncio.wait_for(self.model.chat(prompt), timeout=self._llm_timeout_s)
@@ -274,6 +707,17 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                     "response_preview": (raw if isinstance(raw, str) else str(raw))[:500],
                 }
             )
+            await self._log_llm_audit(
+                ts=ts,
+                tick=tick,
+                world_spec=world_spec,
+                agent_id=agent_id,
+                action_name=action_name,
+                prompt=prompt,
+                raw_response=raw,
+                parsed_data=parsed,
+                ok=True,
+            )
             return {"ok": True, "raw": raw, "data": parsed}
         except Exception as e:
             await self._log_llm_call(
@@ -289,6 +733,18 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                     "prompt_chars": len(prompt),
                     "prompt_preview": prompt[:500],
                 }
+            )
+            await self._log_llm_audit(
+                ts=ts,
+                tick=tick,
+                world_spec=world_spec,
+                agent_id=agent_id,
+                action_name=action_name,
+                prompt=prompt,
+                raw_response="",
+                parsed_data={},
+                ok=False,
+                reason=str(e),
             )
             return {"ok": False, "reason": str(e)}
 
@@ -336,6 +792,710 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         }
         await self._append_jsonl(self._papers_log_path, record)
 
+    def _init_rag_clients(self) -> None:
+        self._rag_store = None
+        self._rag_retriever = None
+        if not self._rag_enable:
+            return
+        if RagStoreConfig is None or RagStore is None or RagRetriever is None:
+            return
+        cfg = RagStoreConfig(
+            enable=bool(self._rag_enable),
+            qdrant_url=self._rag_qdrant_url,
+            qdrant_api_key=self._rag_qdrant_api_key,
+            collection=self._rag_collection,
+            embed_url=self._rag_embed_url,
+            embed_model=self._rag_embed_model,
+            timeout_s=float(self._rag_timeout_s),
+            chunk_chars=int(self._rag_chunk_chars),
+            chunk_overlap=int(self._rag_chunk_overlap),
+            batch_size=int(self._rag_batch_size),
+        )
+        self._rag_store = RagStore(cfg)
+        self._rag_retriever = RagRetriever(self._rag_store, max_context_chars=self._rag_max_context_chars)
+
+    async def _rag_startup_health_check(self, *, world_spec: Dict[str, Any]) -> None:
+        if self._rag_health_checked:
+            return
+        self._rag_health_checked = True
+
+        ts = datetime.utcnow().isoformat() + "Z"
+        request_payload = {
+            "rag_enable": bool(self._rag_enable),
+            "qdrant_url": self._rag_qdrant_url,
+            "embed_url": self._rag_embed_url,
+            "collection": self._rag_collection,
+            "embed_model": self._rag_embed_model,
+            "timeout_s": float(self._rag_timeout_s),
+        }
+
+        if not self._rag_enable:
+            response_payload = {"ok": False, "status": "disabled", "reason": "SCIMAS_RAG_ENABLE=0"}
+        elif self._rag_store is None:
+            response_payload = {"ok": False, "status": "degraded:init_failed", "reason": "rag_clients_unavailable"}
+        else:
+            try:
+                response_payload = await self._rag_store.health_check()
+            except Exception as e:
+                response_payload = {"ok": False, "status": "degraded:health_check_exception", "error": str(e)}
+
+        await self._append_jsonl(
+            self._rag_health_log_path,
+            {
+                "ts": ts,
+                "episode_id": (world_spec or {}).get("episode_id"),
+                "task_name": (world_spec or {}).get("task_name"),
+                "request": request_payload,
+                "result": response_payload,
+            },
+        )
+
+        if self._audit_io_enable:
+            await self._log_rag_audit(
+                world_spec=world_spec or {},
+                agent_id="system",
+                action="system",
+                operation="health_check",
+                run_id=None,
+                paper_id=None,
+                request_payload=request_payload,
+                response_payload=response_payload,
+            )
+
+        if bool(response_payload.get("ok")):
+            logger.info(
+                f"RAG health check OK: qdrant={self._rag_qdrant_url} "
+                f"embed={self._rag_embed_url} collection={self._rag_collection}"
+            )
+        else:
+            logger.warning(
+                f"RAG health check degraded: status={response_payload.get('status')} "
+                f"qdrant={self._rag_qdrant_url} embed={self._rag_embed_url}"
+            )
+
+    async def _rag_track_runtime_health(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        action: str,
+        status: str,
+        source: str,
+    ) -> None:
+        st = str(status or "").strip().lower()
+        degraded = st.startswith("degraded:")
+        if not degraded:
+            if self._rag_degraded_streak > 0 or self._rag_degraded_pause_until_tick > 0:
+                self._rag_degraded_streak = 0
+                self._rag_degraded_last_status = st
+                self._rag_degraded_pause_until_tick = 0
+            return
+
+        self._rag_degraded_streak += 1
+        self._rag_degraded_last_status = st
+
+        try:
+            tick = int(await self.controller.run_system("timer", "get_tick") or 0)
+        except Exception:
+            tick = 0
+        if self._rag_degraded_streak < self._rag_degraded_alert_threshold:
+            return
+        if tick > 0 and tick < self._rag_degraded_pause_until_tick:
+            return
+
+        self._rag_degraded_pause_until_tick = max(
+            self._rag_degraded_pause_until_tick,
+            tick + self._rag_degraded_pause_ticks,
+        )
+        alert_record = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "episode_id": (world_spec or {}).get("episode_id"),
+            "task_name": (world_spec or {}).get("task_name"),
+            "agent_id": agent_id,
+            "action": action,
+            "source": source,
+            "rag_status": st,
+            "degraded_streak": int(self._rag_degraded_streak),
+            "threshold": int(self._rag_degraded_alert_threshold),
+            "pause_until_tick": int(self._rag_degraded_pause_until_tick),
+            "reason": "rag_degraded_streak_threshold_reached",
+        }
+        await self._append_jsonl(self._rag_alert_log_path, alert_record)
+        logger.error(
+            f"RAG HARD ALERT: status={st} streak={self._rag_degraded_streak} "
+            f"threshold={self._rag_degraded_alert_threshold} "
+            f"pause_retrieve_until_tick={self._rag_degraded_pause_until_tick}"
+        )
+
+    async def _rag_retrieve_recovery_paused(self) -> bool:
+        until = int(self._rag_degraded_pause_until_tick or 0)
+        if until <= 0:
+            return False
+        try:
+            tick = int(await self.controller.run_system("timer", "get_tick") or 0)
+        except Exception:
+            tick = 0
+        if tick <= 0:
+            return True
+        return tick < until
+
+    def _rag_hash(self, text: str) -> str:
+        return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
+
+    def _rag_doc_base(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        source_type: str,
+        source_id: str,
+        action: str,
+        tags: Optional[List[str]] = None,
+        quality: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "episode_id": world_spec.get("episode_id"),
+            "task_name": world_spec.get("task_name"),
+            "agent_id": agent_id,
+            "source_type": source_type,
+            "source_id": source_id,
+            "action": action,
+            "tags": list(tags or []),
+            "quality": quality,
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "version": "v1",
+        }
+
+    def _rag_docs_from_note(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        note: Dict[str, Any],
+        action: str,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(note, dict):
+            return []
+        text = self._note_to_text(note).strip()
+        if not text:
+            return []
+        source_id = f"note:{self._rag_hash(text)[:16]}"
+        d = self._rag_doc_base(
+            world_spec=world_spec,
+            agent_id=agent_id,
+            source_type="note",
+            source_id=source_id,
+            action=action,
+            tags=self._safe_text_list(note.get("hints"), limit=6, item_limit=80),
+            quality=0.5,
+        )
+        d["text"] = text
+        return [d]
+
+    def _rag_docs_from_method_card(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        method_card: Dict[str, Any],
+        action: str,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(method_card, dict):
+            return []
+        docs: List[Dict[str, Any]] = []
+        topic = str(method_card.get("topic") or method_card.get("task_name") or "method").strip() or "method"
+        baselines = method_card.get("recommended_baselines") if isinstance(method_card.get("recommended_baselines"), list) else []
+        if baselines:
+            for idx, b in enumerate(baselines[:8], start=1):
+                if not isinstance(b, dict):
+                    continue
+                text = " | ".join(
+                    [
+                        f"name={self._truncate(b.get('name'), 120)}",
+                        f"use_when={self._truncate(b.get('use_when'), 180)}",
+                        "key_steps=" + "; ".join(self._safe_text_list(b.get("key_steps"), limit=5, item_limit=120)),
+                        "pitfalls=" + "; ".join(self._safe_text_list(b.get("pitfalls"), limit=4, item_limit=120)),
+                    ]
+                ).strip(" |")
+                if not text:
+                    continue
+                d = self._rag_doc_base(
+                    world_spec=world_spec,
+                    agent_id=agent_id,
+                    source_type="method_card",
+                    source_id=f"method:{topic}:{idx}",
+                    action=action,
+                    tags=[topic, str(method_card.get("metric") or "")],
+                    quality=0.8,
+                )
+                d["text"] = text
+                docs.append(d)
+        else:
+            text = self._truncate(json.dumps(method_card, ensure_ascii=False), 4000)
+            if text:
+                d = self._rag_doc_base(
+                    world_spec=world_spec,
+                    agent_id=agent_id,
+                    source_type="method_card",
+                    source_id=f"method:{topic}",
+                    action=action,
+                    tags=[topic],
+                    quality=0.7,
+                )
+                d["text"] = text
+                docs.append(d)
+        return docs
+
+    def _rag_docs_from_data_card(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        data_card: Dict[str, Any],
+        action: str,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(data_card, dict):
+            return []
+        summary = self._compact_data_card(data_card)
+        text = self._truncate(json.dumps(summary, ensure_ascii=False), 8000)
+        if not text:
+            return []
+        d = self._rag_doc_base(
+            world_spec=world_spec,
+            agent_id=agent_id,
+            source_type="data_card",
+            source_id=f"data_card:{self._rag_hash(text)[:16]}",
+            action=action,
+            tags=[str(summary.get("target_column") or "target")],
+            quality=0.85,
+        )
+        d["text"] = text
+        return [d]
+
+    def _rag_docs_from_observation(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        observation: Dict[str, Any],
+        action: str,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(observation, dict):
+            return []
+        run_id = str(observation.get("run_id") or "").strip()
+        source_id = run_id or f"obs:{self._rag_hash(json.dumps(observation, ensure_ascii=False))[:16]}"
+        obs_blob = {
+            "run_id": observation.get("run_id"),
+            "ok": observation.get("ok"),
+            "metric_name": observation.get("metric_name"),
+            "score_norm": observation.get("score_norm"),
+            "dev_score_norm": observation.get("dev_score_norm"),
+            "strategy": observation.get("strategy"),
+            "error": self._truncate(observation.get("error"), 300),
+            "stderr_tail": self._truncate(observation.get("stderr_tail"), 600),
+        }
+        docs: List[Dict[str, Any]] = []
+        d_obs = self._rag_doc_base(
+            world_spec=world_spec,
+            agent_id=agent_id,
+            source_type="observation",
+            source_id=source_id,
+            action=action,
+            tags=[str(observation.get("metric_name") or ""), str(observation.get("solver_mode") or "")],
+            quality=0.75 if bool(observation.get("ok")) else 0.55,
+        )
+        d_obs["text"] = self._truncate(json.dumps(obs_blob, ensure_ascii=False), 2000)
+        docs.append(d_obs)
+
+        error_text = str(observation.get("error") or "")
+        if error_text or observation.get("stderr_tail"):
+            d_diag = self._rag_doc_base(
+                world_spec=world_spec,
+                agent_id=agent_id,
+                source_type="diagnosis",
+                source_id=source_id,
+                action=action,
+                tags=["failure" if not bool(observation.get("ok")) else "success"],
+                quality=0.65,
+            )
+            d_diag["text"] = self._truncate(
+                f"error={error_text}\nstderr={observation.get('stderr_tail')}\nstrategy={observation.get('strategy')}",
+                2400,
+            )
+            docs.append(d_diag)
+        return docs
+
+    def _rag_docs_from_paper(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        paper: Dict[str, Any],
+        paper_id: Optional[str],
+        action: str,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(paper, dict):
+            return []
+        source_id = str(paper_id or paper.get("paper_id") or f"paper:{self._rag_hash(json.dumps(paper, ensure_ascii=False))[:16]}")
+        docs: List[Dict[str, Any]] = []
+        summary = {
+            "title": paper.get("title"),
+            "abstract": paper.get("abstract"),
+            "key_claims": paper.get("key_claims"),
+            "limitations": paper.get("limitations"),
+            "evidence_map": paper.get("evidence_map"),
+            "observation_refs": paper.get("observation_refs"),
+        }
+        d = self._rag_doc_base(
+            world_spec=world_spec,
+            agent_id=agent_id,
+            source_type="paper",
+            source_id=source_id,
+            action=action,
+            tags=self._safe_text_list(paper.get("citations"), limit=6, item_limit=40),
+            quality=0.8,
+        )
+        d["text"] = self._truncate(json.dumps(summary, ensure_ascii=False), 6000)
+        docs.append(d)
+        return docs
+
+    async def _rag_log_query(
+        self,
+        *,
+        agent_id: str,
+        action: str,
+        run_id: Optional[str],
+        paper_id: Optional[str],
+        query_text: str,
+        topk: int,
+        result: Dict[str, Any],
+        latency_ms: float,
+    ) -> None:
+        world_spec = await self.controller.run_environment("science", "get_world_spec")
+        await self._append_jsonl(
+            self._rag_query_log_path,
+            {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "episode_id": world_spec.get("episode_id"),
+                "task_name": world_spec.get("task_name"),
+                "agent_id": agent_id,
+                "action": action,
+                "run_id": run_id,
+                "paper_id": paper_id,
+                "query_text_hash": self._rag_hash(query_text),
+                "topk": int(topk),
+                "latency_ms": float(round(latency_ms, 2)),
+                "rag_status": result.get("status"),
+                "fallback_reason": result.get("fallback_reason"),
+                "result_count": len(result.get("all_results") or []),
+                "selected_count": len(result.get("selected") or []),
+            },
+        )
+
+    async def _log_rag_audit(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        action: str,
+        operation: str,
+        run_id: Optional[str],
+        paper_id: Optional[str],
+        request_payload: Dict[str, Any],
+        response_payload: Dict[str, Any],
+    ) -> None:
+        if not self._audit_io_enable:
+            return
+        ts = datetime.utcnow().isoformat() + "Z"
+        meta = {
+            "ts": ts,
+            "episode_id": world_spec.get("episode_id"),
+            "task_name": world_spec.get("task_name"),
+            "agent_id": agent_id,
+            "action": action,
+            "operation": operation,
+            "run_id": run_id,
+            "paper_id": paper_id,
+            "kind": "rag_io",
+        }
+        record = {
+            "meta": meta,
+            "input": self._safe_jsonable(request_payload),
+            "output": self._safe_jsonable(response_payload),
+        }
+        await self._append_jsonl(self._rag_audit_jsonl_path, record)
+        await self._append_markdown_audit(
+            path=self._rag_audit_md_path,
+            title=f"[{ts}] action={action} op={operation} agent={agent_id}",
+            meta=meta,
+            request_payload=request_payload,
+            response_payload=response_payload,
+        )
+
+    async def _rag_log_usage(
+        self,
+        *,
+        agent_id: str,
+        action: str,
+        run_id: Optional[str],
+        paper_id: Optional[str],
+        result: Dict[str, Any],
+    ) -> None:
+        world_spec = await self.controller.run_environment("science", "get_world_spec")
+        await self._append_jsonl(
+            self._rag_usage_log_path,
+            {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "episode_id": world_spec.get("episode_id"),
+                "task_name": world_spec.get("task_name"),
+                "agent_id": agent_id,
+                "action": action,
+                "run_id": run_id,
+                "paper_id": paper_id,
+                "rag_status": result.get("status"),
+                "used_refs": result.get("refs") or [],
+                "used_count": len(result.get("refs") or []),
+            },
+        )
+
+    async def _rag_index_documents(
+        self,
+        *,
+        agent_id: str,
+        action: str,
+        docs: List[Dict[str, Any]],
+        run_id: Optional[str] = None,
+        paper_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        world_spec = await self.controller.run_environment("science", "get_world_spec")
+        if not self._rag_enable or self._rag_store is None:
+            payload = {"ok": False, "status": "disabled", "indexed_points": 0}
+        else:
+            payload = await self._rag_store.upsert_documents(docs)
+        await self._append_jsonl(
+            self._rag_index_log_path,
+            {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "episode_id": world_spec.get("episode_id"),
+                "task_name": world_spec.get("task_name"),
+                "agent_id": agent_id,
+                "action": action,
+                "run_id": run_id,
+                "paper_id": paper_id,
+                "doc_count": len(docs or []),
+                "indexed_points": int((payload or {}).get("indexed_points", 0) or 0),
+                "rag_status": (payload or {}).get("status"),
+                "ok": bool((payload or {}).get("ok", False)),
+            },
+        )
+        sample_docs = []
+        for doc in (docs or [])[: self._audit_rag_max_rows]:
+            sample_docs.append(
+                {
+                    "source_type": doc.get("source_type"),
+                    "source_id": doc.get("source_id"),
+                    "tags": list(doc.get("tags") or []),
+                    "quality": doc.get("quality"),
+                    "text": self._clip_text_for_audit(doc.get("text"), self._audit_rag_max_chars),
+                }
+            )
+        await self._log_rag_audit(
+            world_spec=world_spec,
+            agent_id=agent_id,
+            action=action,
+            operation="index",
+            run_id=run_id,
+            paper_id=paper_id,
+            request_payload={
+                "collection": self._rag_collection,
+                "doc_count": len(docs or []),
+                "docs_sample": sample_docs,
+            },
+            response_payload={
+                "ok": bool((payload or {}).get("ok", False)),
+                "status": (payload or {}).get("status"),
+                "indexed_points": int((payload or {}).get("indexed_points", 0) or 0),
+                "documents": int((payload or {}).get("documents", 0) or 0),
+                "error": (payload or {}).get("error"),
+            },
+        )
+        await self._rag_track_runtime_health(
+            world_spec=world_spec,
+            agent_id=agent_id,
+            action=action,
+            status=str((payload or {}).get("status") or ""),
+            source="index",
+        )
+        return payload
+
+    def _rag_local_docs(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        notes: List[Dict[str, Any]],
+        observations: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]],
+        method_card: Optional[Dict[str, Any]],
+        paper: Optional[Dict[str, Any]] = None,
+        paper_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        docs: List[Dict[str, Any]] = []
+        if isinstance(data_card, dict):
+            docs.extend(self._rag_docs_from_data_card(world_spec=world_spec, agent_id=agent_id, data_card=data_card, action="local"))
+        if isinstance(method_card, dict):
+            docs.extend(self._rag_docs_from_method_card(world_spec=world_spec, agent_id=agent_id, method_card=method_card, action="local"))
+        for note in (notes or [])[-12:]:
+            if isinstance(note, dict):
+                docs.extend(self._rag_docs_from_note(world_spec=world_spec, agent_id=agent_id, note=note, action="local"))
+        for obs in (observations or [])[-12:]:
+            if isinstance(obs, dict):
+                docs.extend(self._rag_docs_from_observation(world_spec=world_spec, agent_id=agent_id, observation=obs, action="local"))
+        if isinstance(paper, dict):
+            docs.extend(self._rag_docs_from_paper(world_spec=world_spec, agent_id=agent_id, paper=paper, paper_id=paper_id, action="local"))
+        return docs
+
+    async def _rag_retrieve_context(
+        self,
+        *,
+        agent_id: str,
+        action: str,
+        run_id: Optional[str],
+        paper_id: Optional[str],
+        query_text: str,
+        quotas: Dict[str, int],
+        notes: List[Dict[str, Any]],
+        observations: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]],
+        method_card: Optional[Dict[str, Any]],
+        paper: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        world_spec = await self.controller.run_environment("science", "get_world_spec")
+        local_docs = self._rag_local_docs(
+            world_spec=world_spec,
+            agent_id=agent_id,
+            notes=notes,
+            observations=observations,
+            data_card=data_card,
+            method_card=method_card,
+            paper=paper,
+            paper_id=paper_id,
+        )
+        t0 = time.perf_counter()
+        if self._rag_retriever is None:
+            result = {
+                "status": "disabled",
+                "fallback_reason": "retriever_unavailable",
+                "all_results": [],
+                "selected": [],
+                "context": "",
+                "refs": [],
+            }
+        else:
+            result = await self._rag_retriever.retrieve(
+                action=action,
+                query_text=query_text,
+                topk=self._rag_topk,
+                min_score=self._rag_min_score,
+                quotas=quotas,
+                local_docs=local_docs,
+            )
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        await self._rag_log_query(
+            agent_id=agent_id,
+            action=action,
+            run_id=run_id,
+            paper_id=paper_id,
+            query_text=query_text,
+            topk=self._rag_topk,
+            result=result,
+            latency_ms=latency_ms,
+        )
+        await self._rag_log_usage(
+            agent_id=agent_id,
+            action=action,
+            run_id=run_id,
+            paper_id=paper_id,
+            result=result,
+        )
+        selected_rows = []
+        for row in (result.get("selected") or [])[: self._audit_rag_max_rows]:
+            selected_rows.append(
+                {
+                    "source_type": row.get("source_type"),
+                    "source_id": row.get("source_id"),
+                    "score": row.get("score"),
+                    "tags": list(row.get("tags") or []),
+                    "text": self._clip_text_for_audit(row.get("text"), self._audit_rag_max_chars),
+                }
+            )
+        await self._log_rag_audit(
+            world_spec=world_spec,
+            agent_id=agent_id,
+            action=action,
+            operation="query",
+            run_id=run_id,
+            paper_id=paper_id,
+            request_payload={
+                "query_text": self._clip_text_for_audit(query_text, self._audit_rag_max_chars),
+                "topk": int(self._rag_topk),
+                "min_score": float(self._rag_min_score),
+                "quotas": dict(quotas or {}),
+                "local_docs_count": len(local_docs or []),
+            },
+            response_payload={
+                "status": result.get("status"),
+                "fallback_reason": result.get("fallback_reason"),
+                "result_count": len(result.get("all_results") or []),
+                "selected_count": len(result.get("selected") or []),
+                "refs": list(result.get("refs") or []),
+                "context": self._clip_text_for_audit(result.get("context"), self._audit_rag_max_chars),
+                "selected_rows": selected_rows,
+            },
+        )
+        await self._rag_track_runtime_health(
+            world_spec=world_spec,
+            agent_id=agent_id,
+            action=action,
+            status=str(result.get("status") or ""),
+            source="query",
+        )
+        return result
+
+    async def _rag_bootstrap_episode_knowledge(
+        self,
+        *,
+        agent_id: str,
+        world_spec: Dict[str, Any],
+        data_card: Optional[Dict[str, Any]],
+        method_card: Optional[Dict[str, Any]],
+    ) -> None:
+        ep = int(world_spec.get("episode_id") or 0)
+        if ep <= 0 or self._rag_bootstrap_episode == ep:
+            return
+        docs: List[Dict[str, Any]] = []
+        if isinstance(data_card, dict):
+            docs.extend(self._rag_docs_from_data_card(world_spec=world_spec, agent_id=agent_id, data_card=data_card, action="bootstrap"))
+        if isinstance(method_card, dict):
+            docs.extend(
+                self._rag_docs_from_method_card(world_spec=world_spec, agent_id=agent_id, method_card=method_card, action="bootstrap")
+            )
+        if docs:
+            await self._rag_index_documents(agent_id=agent_id, action="bootstrap", docs=docs)
+        self._rag_bootstrap_episode = ep
+
+    def _format_rag_prompt_block(self, *, result: Dict[str, Any]) -> Dict[str, Any]:
+        refs = list(result.get("refs") or [])
+        context = str(result.get("context") or "").strip()
+        if not context:
+            context = "(no high-confidence retrieval results)"
+        return {
+            "context": context,
+            "refs": refs,
+            "status": str(result.get("status") or "empty"),
+            "usage_constraint": "Prioritize retrieved evidence. Do not fabricate citations or run references.",
+        }
+
     def _truncate(self, text: Any, limit: int = 280) -> str:
         value = str(text or "")
         if len(value) <= limit:
@@ -375,6 +1535,684 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             if text:
                 out.append(self._truncate(text, item_limit))
         return out
+
+    def _text_tokens(self, text: str) -> List[str]:
+        return [tok for tok in re.split(r"[^a-z0-9_]+", (text or "").lower()) if len(tok) >= 2]
+
+    def _counter_cosine(self, a: Counter, b: Counter) -> float:
+        if not a or not b:
+            return 0.0
+        dot = 0.0
+        for k, v in a.items():
+            dot += float(v) * float(b.get(k, 0.0))
+        if dot <= 0:
+            return 0.0
+        na = math.sqrt(sum(float(v) * float(v) for v in a.values()))
+        nb = math.sqrt(sum(float(v) * float(v) for v in b.values()))
+        if na <= 0.0 or nb <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (na * nb)))
+
+    def _note_to_text(self, note: Dict[str, Any]) -> str:
+        parts: List[str] = [str(note.get("topic") or "")]
+        for hint in (note.get("hints") or [])[:6]:
+            parts.append(str(hint))
+        for card in (note.get("cards") or [])[:8]:
+            if not isinstance(card, dict):
+                continue
+            parts.append(str(card.get("title") or ""))
+            parts.append(str(card.get("text") or ""))
+        return "\n".join(parts)
+
+    def _has_method_signal(self, text: str) -> bool:
+        s = (text or "").lower()
+        keywords = (
+            "baseline",
+            "method",
+            "ablation",
+            "protocol",
+            "pitfall",
+            "mase",
+            "timeseriessplit",
+            "submission",
+            "evaluation",
+            "scoring_column",
+        )
+        return any(k in s for k in keywords)
+
+    async def _tei_embed(self, text: str) -> Optional[List[float]]:
+        if not self._reward_tei_url:
+            return None
+        payload = json.dumps({"inputs": text}).encode("utf-8")
+        req = urllib.request.Request(
+            self._reward_tei_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        def _send() -> Optional[List[float]]:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            if isinstance(data, list) and data and isinstance(data[0], (int, float)):
+                return [float(x) for x in data]
+            if isinstance(data, list) and data and isinstance(data[0], list):
+                return [float(x) for x in data[0]]
+            return None
+        try:
+            return await asyncio.to_thread(_send)
+        except Exception:
+            return None
+
+    async def _qdrant_max_similarity(self, vector: List[float]) -> Optional[float]:
+        if not self._reward_qdrant_url or not self._reward_qdrant_collection or not vector:
+            return None
+        url = f"{self._reward_qdrant_url}/collections/{self._reward_qdrant_collection}/points/search"
+        headers = {"Content-Type": "application/json"}
+        if self._reward_qdrant_api_key:
+            headers["api-key"] = self._reward_qdrant_api_key
+        payload = {
+            "vector": vector,
+            "limit": 1,
+            "with_payload": False,
+            "with_vector": False,
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        def _send() -> Optional[float]:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            result = data.get("result")
+            if isinstance(result, list) and result:
+                score = (result[0] or {}).get("score")
+                if isinstance(score, (int, float)):
+                    return float(score)
+            return None
+        try:
+            return await asyncio.to_thread(_send)
+        except Exception:
+            return None
+
+    async def _compute_read_reward(
+        self,
+        *,
+        existing_notes: List[Dict[str, Any]],
+        new_note: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        new_text = self._note_to_text(new_note)
+        new_counter = Counter(self._text_tokens(new_text))
+        local_max_sim = 0.0
+        for note in (existing_notes or [])[-24:]:
+            if not isinstance(note, dict):
+                continue
+            sim = self._counter_cosine(new_counter, Counter(self._text_tokens(self._note_to_text(note))))
+            if sim > local_max_sim:
+                local_max_sim = sim
+
+        remote_max_sim = None
+        if self._dense_reward_enable and self._reward_tei_url and self._reward_qdrant_url:
+            vec = await self._tei_embed(new_text)
+            if isinstance(vec, list) and vec:
+                remote_max_sim = await self._qdrant_max_similarity(vec)
+
+        max_sim = max(local_max_sim, float(remote_max_sim or 0.0))
+        novelty = max(0.0, 1.0 - max_sim)
+        method_bonus = self._read_method_bonus if self._has_method_signal(new_text) else 0.0
+        if max_sim >= self._read_dup_threshold:
+            reward = 0.0
+        else:
+            reward = self._read_reward_base + (self._read_reward_alpha * novelty) + method_bonus
+            reward = max(0.0, min(self._read_reward_max, reward))
+        return {
+            "reward": float(reward),
+            "novelty": float(novelty),
+            "local_similarity": float(local_max_sim),
+            "qdrant_similarity": float(remote_max_sim) if isinstance(remote_max_sim, (int, float)) else None,
+            "method_bonus": float(method_bonus),
+            "duplicate": bool(max_sim >= self._read_dup_threshold),
+        }
+
+    def _hypothesis_feasibility(self, world_spec: Dict[str, Any], plan_spec: Dict[str, Any]) -> Dict[str, Any]:
+        plan_text = json.dumps(plan_spec or {}, ensure_ascii=False).lower()
+        schema_markers = (
+            "scoring_column",
+            "task_manifest",
+            "list",
+            "target_column_hint",
+            "submission csv",
+        )
+        schema_safe = sum(1 for m in schema_markers if m in plan_text) >= 2
+        resource_markers = ("sample", "batch", "chunk", "window", "stream")
+        resource_by_text = any(m in plan_text for m in resource_markers)
+        solver_spec = (plan_spec or {}).get("solver_spec") if isinstance((plan_spec or {}).get("solver_spec"), dict) else {}
+        preprocess = solver_spec.get("preprocess") if isinstance(solver_spec.get("preprocess"), dict) else {}
+        max_features = preprocess.get("max_features")
+        resource_by_config = isinstance(max_features, (int, float)) and float(max_features) <= 50000
+        schema_bonus = self._hypothesis_schema_bonus if schema_safe else 0.0
+        resource_bonus = self._hypothesis_resource_bonus if (resource_by_text or resource_by_config) else 0.0
+        feasibility = schema_bonus + resource_bonus
+        reward = max(-0.02, min(0.08, 0.10 * feasibility - 0.01))
+        return {
+            "feasibility_score": float(feasibility),
+            "schema_safe": bool(schema_safe),
+            "resource_safe": bool(resource_by_text or resource_by_config),
+            "schema_bonus": float(schema_bonus),
+            "resource_bonus": float(resource_bonus),
+            "reward": float(reward),
+            "code_memory_mb": world_spec.get("code_memory_mb"),
+        }
+
+    async def _vdh_qdrant_schema_constraints(self, world_spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self._vdh_qdrant_enable or not self._vdh_qdrant_url or not self._vdh_qdrant_collection:
+            return None
+        task_name = str(world_spec.get("task_name") or "").strip()
+        if not task_name:
+            return None
+        url = f"{self._vdh_qdrant_url}/collections/{self._vdh_qdrant_collection}/points/scroll"
+        headers = {"Content-Type": "application/json"}
+        if self._vdh_qdrant_api_key:
+            headers["api-key"] = self._vdh_qdrant_api_key
+        payload = {
+            "with_payload": True,
+            "with_vector": False,
+            "limit": 1,
+            "filter": {
+                "must": [
+                    {
+                        "key": "task_name",
+                        "match": {"value": task_name},
+                    }
+                ]
+            },
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
+        def _send() -> Optional[Dict[str, Any]]:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            result = data.get("result")
+            points = result.get("points") if isinstance(result, dict) else result
+            if isinstance(points, list) and points:
+                payload_obj = (points[0] or {}).get("payload")
+                if isinstance(payload_obj, dict):
+                    return payload_obj
+            return None
+
+        try:
+            return await asyncio.to_thread(_send)
+        except Exception:
+            return None
+
+    def _vdh_constraints_from_manifest_file(self, world_spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        task_path = str(world_spec.get("task_path") or "").strip()
+        if not task_path:
+            return None
+        candidates = [
+            os.path.join(task_path, ".task_manifest.json"),
+            os.path.join(task_path, "task_manifest.json"),
+            os.path.join(task_path, "metadata.yaml"),
+            os.path.join(task_path, "metadata.yml"),
+        ]
+        for path in candidates:
+            if not os.path.exists(path):
+                continue
+            try:
+                if path.endswith(".json"):
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                else:
+                    import yaml  # local import to keep optional dependency bounded
+
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = yaml.safe_load(f) or {}
+                if not isinstance(data, dict):
+                    continue
+                return data
+            except Exception:
+                continue
+        return None
+
+    def _vdh_normalize_constraints(
+        self,
+        *,
+        source: str,
+        raw: Optional[Dict[str, Any]],
+        world_spec: Dict[str, Any],
+        notes: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        warnings: List[str] = []
+        raw = raw if isinstance(raw, dict) else {}
+        scoring = raw.get("scoring_column")
+        if not isinstance(scoring, list):
+            info = raw.get("logging_info") if isinstance(raw.get("logging_info"), dict) else {}
+            scoring = info.get("scoring_column")
+        if not isinstance(scoring, list):
+            scoring = []
+        scoring_is_list = bool(isinstance(scoring, list) and len(scoring) > 0)
+
+        target_hint = ""
+        if isinstance(raw.get("target_column"), str):
+            target_hint = str(raw.get("target_column"))
+        elif isinstance(raw.get("label_column"), str):
+            target_hint = str(raw.get("label_column"))
+        elif isinstance(raw.get("submission"), dict) and isinstance((raw.get("submission") or {}).get("target"), str):
+            target_hint = str((raw.get("submission") or {}).get("target"))
+        elif scoring_is_list:
+            target_hint = str(scoring[0])
+        metric = str(raw.get("metric") or world_spec.get("metric") or "").strip()
+        submission_requirements = []
+        if isinstance(raw.get("submission_requirements"), list):
+            submission_requirements = [str(x) for x in raw.get("submission_requirements")[:8]]
+        if not submission_requirements and isinstance(raw.get("submission"), dict):
+            submission_requirements = [self._truncate(json.dumps(raw.get("submission"), ensure_ascii=False), 280)]
+        if not scoring_is_list and notes:
+            notes_text = " ".join(self._note_to_text(n) for n in notes[-6:] if isinstance(n, dict)).lower()
+            if "scoring_column" in notes_text and "list" in notes_text:
+                scoring_is_list = True
+                warnings.append("inferred_scoring_column_list_from_notes")
+        if not target_hint:
+            target_hint = "target"
+            warnings.append("target_column_hint_fallback")
+        return {
+            "ok": True,
+            "source": source,
+            "constraints": {
+                "scoring_column_is_list": bool(scoring_is_list),
+                "target_column_hint": target_hint,
+                "metric": metric,
+                "submission_requirements": submission_requirements,
+            },
+            "warnings": warnings,
+        }
+
+    async def _vdh_metadata_alignment(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        notes: Optional[List[Dict[str, Any]]],
+        plan_spec: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        source = "fallback"
+        raw = None
+        if self._vdh_qdrant_enable:
+            raw = await self._vdh_qdrant_schema_constraints(world_spec)
+            if isinstance(raw, dict):
+                source = "qdrant"
+        if not isinstance(raw, dict):
+            raw = self._vdh_constraints_from_manifest_file(world_spec)
+            if isinstance(raw, dict):
+                source = "manifest"
+        normalized = self._vdh_normalize_constraints(source=source, raw=raw, world_spec=world_spec, notes=notes)
+
+        constraints = normalized.get("constraints") if isinstance(normalized.get("constraints"), dict) else {}
+        scoring_is_list = bool(constraints.get("scoring_column_is_list", False))
+        plan_text = json.dumps(plan_spec or {}, ensure_ascii=False).lower()
+        target_cols = (plan_spec or {}).get("target_cols")
+        solver_spec = (plan_spec or {}).get("solver_spec") if isinstance((plan_spec or {}).get("solver_spec"), dict) else {}
+        solver_target_cols = solver_spec.get("target_cols")
+        handles_list = False
+        if isinstance(target_cols, list) and target_cols:
+            handles_list = True
+        if isinstance(solver_target_cols, list) and solver_target_cols:
+            handles_list = True
+        markers = (
+            "scoring_column[0]",
+            "scoring_column'][0]",
+            "manifest['scoring_column'][0]",
+            "manifest[\"scoring_column\"][0]",
+            "target_cols",
+        )
+        if any(m in plan_text for m in markers):
+            handles_list = True
+        errors: List[str] = []
+        if scoring_is_list and not handles_list:
+            errors.append("scoring_column_is_list_but_plan_not_handled")
+        normalized["ok"] = len(errors) == 0
+        normalized["errors"] = errors
+        normalized["plan_handles_scoring_list"] = bool(handles_list)
+        return normalized
+
+    def _vdh_plan_validator(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        plan_spec: Dict[str, Any],
+        data_card: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        errors: List[str] = []
+        solver_spec = (plan_spec or {}).get("solver_spec")
+        if not isinstance(solver_spec, dict):
+            errors.append("solver_spec must be object")
+            solver_spec = {}
+        for key in ("input_columns", "target_cols"):
+            if key in plan_spec and not isinstance(plan_spec.get(key), list):
+                errors.append(f"{key} must be list")
+            if key in solver_spec and not isinstance(solver_spec.get(key), list):
+                errors.append(f"solver_spec.{key} must be list")
+
+        batch_size = plan_spec.get("batch_size", solver_spec.get("batch_size", 32))
+        if not isinstance(batch_size, (int, float)) or float(batch_size) <= 0:
+            errors.append("batch_size must be positive number")
+            batch_size = 32
+        sample_ratio = plan_spec.get("sample_ratio", solver_spec.get("sample_ratio"))
+        if sample_ratio is not None:
+            if not isinstance(sample_ratio, (int, float)) or not (0 < float(sample_ratio) <= 1.0):
+                errors.append("sample_ratio must be in (0,1]")
+        max_features = None
+        preprocess = solver_spec.get("preprocess") if isinstance(solver_spec.get("preprocess"), dict) else {}
+        if "max_features" in preprocess:
+            max_features = preprocess.get("max_features")
+            if not isinstance(max_features, (int, float)) or float(max_features) <= 0:
+                errors.append("preprocess.max_features must be positive number")
+
+        model_family = str(solver_spec.get("model_family") or plan_spec.get("model_family") or "").strip().lower()
+        model_param_defaults = {
+            "tfidf_logreg": 6_000_000,
+            "linear_svc": 5_000_000,
+            "tfidf_ridge": 4_000_000,
+            "naive_series": 500_000,
+        }
+        model_params = plan_spec.get("model_params", solver_spec.get("model_params"))
+        if not isinstance(model_params, (int, float)):
+            model_params = model_param_defaults.get(model_family, 3_000_000)
+        seq_len = plan_spec.get("sequence_length", solver_spec.get("sequence_length", 128))
+        if not isinstance(seq_len, (int, float)) or float(seq_len) <= 0:
+            seq_len = 128
+
+        split_stats = (data_card or {}).get("split_stats") if isinstance((data_card or {}).get("split_stats"), dict) else {}
+        approx_rows = 0
+        for info in split_stats.values():
+            if isinstance(info, dict) and isinstance(info.get("rows"), (int, float)):
+                approx_rows += int(info.get("rows"))
+        if approx_rows <= 0:
+            approx_rows = 145_000
+        effective_rows = int(approx_rows * float(sample_ratio if isinstance(sample_ratio, (int, float)) else 1.0))
+        estimated_mb = (
+            512.0
+            + float(batch_size) * (8.0 + 0.02 * float(seq_len))
+            + (float(model_params) / 1_000_000.0) * 18.0
+            + (float(effective_rows) / 1000.0) * 0.04
+        )
+        if not isinstance(sample_ratio, (int, float)) and approx_rows >= 100_000:
+            estimated_mb += 1400.0
+
+        limit_mb = world_spec.get("code_memory_mb")
+        if not isinstance(limit_mb, (int, float)) or float(limit_mb) <= 0:
+            limit_mb = 8192.0
+        ratio = float(estimated_mb) / float(limit_mb)
+        risk = "low"
+        if ratio >= self._vdh_oom_ratio_threshold:
+            risk = "high"
+            errors.append("potential_oom")
+        elif ratio >= 0.7:
+            risk = "medium"
+
+        return {
+            "ok": len(errors) == 0,
+            "errors": errors,
+            "resource_estimate": {
+                "estimated_mb": round(float(estimated_mb), 2),
+                "limit_mb": round(float(limit_mb), 2),
+                "ratio": round(float(ratio), 4),
+                "risk": risk,
+                "rows": int(approx_rows),
+                "effective_rows": int(effective_rows),
+            },
+        }
+
+    async def _vdh_embed_text(self, text: str) -> Optional[List[float]]:
+        endpoint = self._vdh_tei_url or self._reward_tei_url
+        if not self._vdh_tei_enable or not endpoint:
+            return None
+        payload = json.dumps({"inputs": text}).encode("utf-8")
+        req = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        def _send() -> Optional[List[float]]:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            if isinstance(data, list) and data and isinstance(data[0], (int, float)):
+                return [float(x) for x in data]
+            if isinstance(data, list) and data and isinstance(data[0], list):
+                return [float(x) for x in data[0]]
+            return None
+
+        try:
+            return await asyncio.to_thread(_send)
+        except Exception:
+            return None
+
+    def _vector_cosine(self, a: Optional[List[float]], b: Optional[List[float]]) -> float:
+        if not isinstance(a, list) or not isinstance(b, list) or not a or not b:
+            return 0.0
+        n = min(len(a), len(b))
+        if n <= 0:
+            return 0.0
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for i in range(n):
+            x = float(a[i])
+            y = float(b[i])
+            dot += x * y
+            na += x * x
+            nb += y * y
+        if na <= 0 or nb <= 0:
+            return 0.0
+        return max(0.0, min(1.0, dot / ((na ** 0.5) * (nb ** 0.5))))
+
+    async def _vdh_evidence_coverage(
+        self,
+        *,
+        hypothesis: List[str],
+        plan_spec: Dict[str, Any],
+        notes: List[Dict[str, Any]],
+        observations: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        hypo_parts: List[str] = []
+        for tag in (hypothesis or [])[:10]:
+            hypo_parts.append(str(tag))
+        for key in ("strategy", "rationale", "risk", "schema_assumptions", "memory_safety", "evidence_refs"):
+            val = (plan_spec or {}).get(key)
+            if isinstance(val, str):
+                hypo_parts.append(val)
+            elif isinstance(val, list):
+                hypo_parts.extend([str(x) for x in val[:8]])
+            elif isinstance(val, dict):
+                hypo_parts.append(json.dumps(val, ensure_ascii=False))
+        hypothesis_text = "\n".join([x for x in hypo_parts if str(x).strip()]).strip()
+
+        evidence_chunks: List[str] = []
+        for note in (notes or [])[-12:]:
+            if isinstance(note, dict):
+                evidence_chunks.append(self._note_to_text(note))
+        for obs in (observations or [])[-10:]:
+            if not isinstance(obs, dict):
+                continue
+            blob = {
+                "strategy": obs.get("strategy"),
+                "ok": obs.get("ok"),
+                "error": obs.get("error"),
+                "dev_score_norm": obs.get("dev_score_norm"),
+                "score_norm": obs.get("score_norm"),
+            }
+            evidence_chunks.append(json.dumps(blob, ensure_ascii=False))
+        evidence_text = "\n".join([x for x in evidence_chunks if x.strip()])
+
+        h_counter = Counter(self._text_tokens(hypothesis_text))
+        e_counter = Counter(self._text_tokens(evidence_text))
+        token_overlap = self._counter_cosine(h_counter, e_counter)
+        keyword_cov = 0.0
+        h_tokens = set(h_counter.keys())
+        if h_tokens:
+            keyword_cov = len(h_tokens & set(e_counter.keys())) / max(1, len(h_tokens))
+        fallback_score = max(0.0, min(1.0, 0.5 * token_overlap + 0.5 * keyword_cov))
+
+        vector_score = None
+        h_vec = await self._vdh_embed_text(hypothesis_text) if hypothesis_text else None
+        if isinstance(h_vec, list) and h_vec:
+            sims: List[float] = []
+            for chunk in evidence_chunks[-8:]:
+                e_vec = await self._vdh_embed_text(chunk)
+                if isinstance(e_vec, list) and e_vec:
+                    sims.append(self._vector_cosine(h_vec, e_vec))
+            if sims:
+                vector_score = max(sims)
+
+        if isinstance(vector_score, (int, float)):
+            coverage_score = max(0.0, min(1.0, 0.6 * float(vector_score) + 0.4 * fallback_score))
+            source = "tei+token"
+        else:
+            coverage_score = fallback_score
+            source = "token_fallback"
+
+        return {
+            "ok": bool(coverage_score >= self._vdh_evidence_threshold),
+            "coverage_score": float(round(coverage_score, 4)),
+            "threshold": float(self._vdh_evidence_threshold),
+            "source": source,
+            "token_overlap": float(round(token_overlap, 4)),
+            "keyword_coverage": float(round(keyword_cov, 4)),
+            "vector_similarity": float(round(float(vector_score), 4)) if isinstance(vector_score, (int, float)) else None,
+            "errors": [] if coverage_score >= self._vdh_evidence_threshold else ["evidence_coverage_below_threshold"],
+        }
+
+    async def _evaluate_vdh_gates(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        hypothesis: List[str],
+        plan_spec: Dict[str, Any],
+        notes: List[Dict[str, Any]],
+        observations: List[Dict[str, Any]],
+        data_card: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        gate_a = await self._vdh_metadata_alignment(world_spec=world_spec, notes=notes, plan_spec=plan_spec)
+        gate_b = self._vdh_plan_validator(world_spec=world_spec, plan_spec=plan_spec, data_card=data_card)
+        gate_c = await self._vdh_evidence_coverage(
+            hypothesis=hypothesis,
+            plan_spec=plan_spec,
+            notes=notes,
+            observations=observations,
+        )
+        errors: List[str] = []
+        for gate_name, gate_obj in (("gate_a", gate_a), ("gate_b", gate_b), ("gate_c", gate_c)):
+            if not bool((gate_obj or {}).get("ok", False)):
+                for e in (gate_obj or {}).get("errors", []) or [f"{gate_name}_failed"]:
+                    errors.append(f"{gate_name}:{e}")
+        return {
+            "gate_a": gate_a,
+            "gate_b": gate_b,
+            "gate_c": gate_c,
+            "final_ok": len(errors) == 0,
+            "failures": errors,
+            "policy": self._vdh_gate_policy,
+        }
+
+    async def _enqueue_vdh_recovery_tasks(self, *, vdh_report: Dict[str, Any]) -> Dict[str, Any]:
+        failures = [str(x) for x in (vdh_report or {}).get("failures", [])]
+        required: List[Dict[str, Any]] = []
+        if any("gate_a" in f for f in failures):
+            required.append({"task_type": "read", "payload": {"topic": "task_requirements"}})
+        if any("gate_c" in f for f in failures):
+            required.append({"task_type": "retrieve_literature", "payload": {"topic": "task_baselines"}})
+            required.append({"task_type": "read", "payload": {"topic": "task_requirements"}})
+        if any("potential_oom" in f or "gate_b" in f for f in failures):
+            required.append({"task_type": "read", "payload": {"topic": "memory_safety"}})
+
+        open_list = await self.controller.run_environment("science", "task_list", status="open")
+        claimed_list = await self.controller.run_environment("science", "task_list", status="claimed")
+        known_types = set()
+        for listing in (open_list, claimed_list):
+            tasks = (listing or {}).get("tasks", []) if isinstance(listing, dict) else []
+            for task in tasks:
+                known_types.add(str((task or {}).get("task_type") or ""))
+
+        created: List[str] = []
+        skipped: List[Dict[str, Any]] = []
+        dedup_types: set[str] = set()
+        for item in required:
+            task_type = str(item.get("task_type") or "")
+            if not task_type or task_type in dedup_types:
+                continue
+            if task_type == "retrieve_literature":
+                paused = await self._rag_retrieve_recovery_paused()
+                if paused:
+                    skipped.append(
+                        {
+                            "task_type": task_type,
+                            "reason": "rag_degraded_pause_active",
+                            "pause_until_tick": int(self._rag_degraded_pause_until_tick or 0),
+                        }
+                    )
+                    continue
+            dedup_types.add(task_type)
+            if task_type in known_types:
+                continue
+            created_task = await self.controller.run_environment(
+                "science",
+                "task_create",
+                task_type=task_type,
+                payload=dict(item.get("payload") or {}),
+                priority=9,
+            )
+            if isinstance(created_task, dict) and created_task.get("ok"):
+                tid = str((created_task.get("task") or {}).get("task_id") or "")
+                if tid:
+                    created.append(tid)
+                known_types.add(task_type)
+        return {"created_task_ids": created, "requested": required, "skipped": skipped}
+
+    def _experiment_error_flags(self, result: Dict[str, Any]) -> Dict[str, bool]:
+        err = str((result or {}).get("error") or "")
+        stderr = str((result or {}).get("stderr_tail") or "")
+        merged = (err + "\n" + stderr).lower()
+        return {
+            "oom": ("killed" in merged) or ("out of memory" in merged) or ("oom" in merged),
+            "typeerror": "typeerror" in merged,
+        }
+
+    def _is_first_pass_success(self, *, code_attempts: Any, ok: bool) -> bool:
+        if not ok:
+            return False
+        if not isinstance(code_attempts, list) or not code_attempts:
+            return False
+        first = code_attempts[0] if isinstance(code_attempts[0], dict) else {}
+        first_result = first.get("result") if isinstance(first.get("result"), dict) else {}
+        first_ok = bool(first_result.get("ok", False))
+        failed_before_success = any(
+            isinstance(a, dict)
+            and isinstance(a.get("result"), dict)
+            and not bool((a.get("result") or {}).get("ok", False))
+            for a in code_attempts[:1]
+        )
+        return bool(first_ok and not failed_before_success)
+
+    def _estimate_vram_efficiency(self, *, result: Dict[str, Any], world_spec: Dict[str, Any]) -> Optional[float]:
+        limit_mb = world_spec.get("code_memory_mb")
+        peak_mb = (result or {}).get("peak_memory_mb")
+        if not isinstance(limit_mb, (int, float)) or float(limit_mb) <= 0:
+            return None
+        if not isinstance(peak_mb, (int, float)):
+            return None
+        eff = (float(limit_mb) - float(peak_mb)) / float(limit_mb)
+        return max(0.0, min(1.0, eff))
 
     def _compact_data_card(self, data_card: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not isinstance(data_card, dict):
@@ -922,6 +2760,256 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             "needs_revision": needs_revision,
         }
 
+    async def _qdrant_search_similarity(self, *, vector: List[float], collection: str) -> Optional[float]:
+        if not self._vdh_qdrant_url or not collection or not vector:
+            return None
+        url = f"{self._vdh_qdrant_url}/collections/{collection}/points/search"
+        headers = {"Content-Type": "application/json"}
+        if self._vdh_qdrant_api_key:
+            headers["api-key"] = self._vdh_qdrant_api_key
+        payload = {
+            "vector": vector,
+            "limit": 1,
+            "with_payload": False,
+            "with_vector": False,
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
+        def _send() -> Optional[float]:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            result = data.get("result")
+            if isinstance(result, list) and result:
+                score = (result[0] or {}).get("score")
+                if isinstance(score, (int, float)):
+                    return float(score)
+            return None
+
+        try:
+            return await asyncio.to_thread(_send)
+        except Exception:
+            return None
+
+    async def _qgr_relevance_score(
+        self,
+        *,
+        review_note: Dict[str, Any],
+        context_text: str,
+    ) -> Dict[str, Any]:
+        review_text = " ".join(
+            [
+                str(review_note.get("summary") or ""),
+                " ".join(str((i or {}).get("claim") or "") for i in (review_note.get("issues") or []) if isinstance(i, dict)),
+                " ".join(self._safe_text_list(review_note.get("revision_actions"), limit=10, item_limit=220)),
+            ]
+        ).strip()
+        token_score = self._counter_cosine(
+            Counter(self._text_tokens(review_text)),
+            Counter(self._text_tokens(context_text)),
+        )
+        vector_score = None
+        if self._vdh_tei_enable and (self._vdh_tei_url or self._reward_tei_url):
+            rv = await self._vdh_embed_text(review_text)
+            cv = await self._vdh_embed_text(context_text)
+            vector_score = self._vector_cosine(rv, cv)
+        if isinstance(vector_score, (int, float)):
+            score = 0.7 * float(vector_score) + 0.3 * float(token_score)
+            source = "tei+token"
+        else:
+            score = float(token_score)
+            source = "token_fallback"
+        return {
+            "score": max(0.0, min(1.0, score)),
+            "source": source,
+            "token_score": float(token_score),
+            "vector_score": float(vector_score) if isinstance(vector_score, (int, float)) else None,
+        }
+
+    async def _qgr_fact_check(self, issues: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not self._vdh_qdrant_enable or not self._vdh_qdrant_url:
+            return {"hallucinated_count": 0, "checked": 0, "source": "disabled"}
+        checked = 0
+        hallucinated = 0
+        details: List[Dict[str, Any]] = []
+        for issue in (issues or [])[:8]:
+            if not isinstance(issue, dict):
+                continue
+            issue_type = str(issue.get("type") or "").lower()
+            claim = str(issue.get("claim") or "")
+            if not claim.strip():
+                continue
+            if not any(k in issue_type for k in ("schema", "format", "type", "data", "replication")):
+                continue
+            checked += 1
+            vec = await self._vdh_embed_text(claim)
+            if not isinstance(vec, list) or not vec:
+                details.append(
+                    {
+                        "issue_id": issue.get("id"),
+                        "issue_type": issue.get("type"),
+                        "support_score": None,
+                        "supported": True,
+                        "skipped": "embedding_unavailable",
+                    }
+                )
+                continue
+            score = await self._qdrant_search_similarity(vector=vec or [], collection=self._vdh_qdrant_collection)
+            score_val = float(score) if isinstance(score, (int, float)) else 0.0
+            supported = score_val >= self._qgr_fact_support_threshold
+            if not supported:
+                hallucinated += 1
+            details.append(
+                {
+                    "issue_id": issue.get("id"),
+                    "issue_type": issue.get("type"),
+                    "support_score": score_val,
+                    "supported": supported,
+                }
+            )
+        return {
+            "hallucinated_count": hallucinated,
+            "checked": checked,
+            "details": details,
+            "source": "qdrant_schema_collection",
+        }
+
+    async def _qgr_validate_review(
+        self,
+        *,
+        review_note: Dict[str, Any],
+        issues: List[Dict[str, Any]],
+        context_text: str,
+    ) -> Dict[str, Any]:
+        citation_set = set()
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            for ref in (issue.get("evidence_refs") or []):
+                ref_s = str(ref)
+                if ref_s:
+                    citation_set.add(ref_s)
+        min_issue_ok = len(issues) >= self._qgr_min_issue_count
+        min_citation_ok = len(citation_set) >= self._qgr_min_citations
+        relevance = await self._qgr_relevance_score(review_note=review_note, context_text=context_text)
+        relevance_ok = float(relevance.get("score", 0.0) or 0.0) >= self._qgr_relevance_threshold
+        fact_check = await self._qgr_fact_check(issues)
+        fact_ok = int(fact_check.get("hallucinated_count", 0) or 0) == 0
+        valid = bool(min_issue_ok and min_citation_ok and relevance_ok and fact_ok)
+        return {
+            "valid": valid,
+            "thresholds": {
+                "min_issues": self._qgr_min_issue_count,
+                "min_citations": self._qgr_min_citations,
+                "min_relevance": self._qgr_relevance_threshold,
+            },
+            "metrics": {
+                "issue_count": len(issues),
+                "citation_count": len(citation_set),
+                "relevance_score": float(relevance.get("score", 0.0) or 0.0),
+                "relevance_source": relevance.get("source"),
+                "hallucinated_count": int(fact_check.get("hallucinated_count", 0) or 0),
+                "fact_checked_count": int(fact_check.get("checked", 0) or 0),
+            },
+            "checks": {
+                "issue_count_ok": min_issue_ok,
+                "citation_count_ok": min_citation_ok,
+                "relevance_ok": relevance_ok,
+                "fact_ok": fact_ok,
+            },
+            "fact_check": fact_check,
+        }
+
+    def _qgr_predictive_bonus(
+        self,
+        *,
+        issues: List[Dict[str, Any]],
+        run_history: List[Dict[str, Any]],
+        target_run_id: Optional[str],
+    ) -> Dict[str, Any]:
+        target = None
+        if target_run_id:
+            for run in reversed(run_history or []):
+                if str(run.get("run_id") or "") == str(target_run_id):
+                    target = run
+                    break
+        if target is None and run_history:
+            target = run_history[-1]
+        merged = ""
+        if isinstance(target, dict):
+            merged = "\n".join(
+                [
+                    str(target.get("error") or ""),
+                    str(target.get("stderr_tail") or ""),
+                    str(target.get("fallback_reason") or ""),
+                ]
+            ).lower()
+        matched = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            claim = str(issue.get("claim") or "").lower()
+            issue_type = str(issue.get("type") or "").lower()
+            if ("oom" in claim or "memory" in claim or "oom" in issue_type) and ("killed" in merged or "out of memory" in merged):
+                matched.append(str(issue.get("id") or ""))
+            if ("schema" in claim or "format" in claim or "type" in claim) and (
+                "typeerror" in merged or "unhashable" in merged or "submission" in merged
+            ):
+                matched.append(str(issue.get("id") or ""))
+        matched = [m for m in matched if m]
+        return {
+            "matched_issue_ids": sorted(set(matched)),
+            "bonus": float(self._qgr_predictive_bonus_reward if matched else 0.0),
+        }
+
+    async def _spawn_qgr_followup_tasks(
+        self,
+        *,
+        paper_id: Optional[str],
+        run_id: Optional[str],
+        score: float,
+        issues: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        created: List[str] = []
+        if score >= 0.6 or not issues:
+            return {"created": created, "reason": "score_ok_or_no_issues"}
+        if paper_id:
+            try:
+                write_res = await self.controller.run_environment(
+                    "science",
+                    "task_create",
+                    task_type="write",
+                    payload={"paper_id": paper_id, "revision_reason": "qgr_low_score"},
+                    priority=9,
+                )
+                if isinstance(write_res, dict) and write_res.get("ok"):
+                    tid = ((write_res.get("task") or {}).get("task_id"))
+                    if tid:
+                        created.append(str(tid))
+            except Exception:
+                pass
+        if run_id:
+            try:
+                exp_res = await self.controller.run_environment(
+                    "science",
+                    "task_create",
+                    task_type="experiment",
+                    payload={"from_run_id": run_id, "revision_reason": "qgr_low_score"},
+                    priority=8,
+                )
+                if isinstance(exp_res, dict) and exp_res.get("ok"):
+                    tid = ((exp_res.get("task") or {}).get("task_id"))
+                    if tid:
+                        created.append(str(tid))
+            except Exception:
+                pass
+        return {"created": created, "reason": "low_score_spawned"}
+
     async def _spawn_review_validation_tasks(
         self,
         *,
@@ -1088,6 +3176,9 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         recent_runs: List[Dict[str, Any]],
         data_card: Optional[Dict[str, Any]] = None,
         method_card: Optional[Dict[str, Any]] = None,
+        rag_context: str = "",
+        rag_refs: Optional[List[str]] = None,
+        rag_status: str = "",
     ) -> str:
         cards_short = [
             {
@@ -1132,6 +3223,15 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             Method card (task-type baselines and pitfalls):
             {json.dumps(method_card_short, ensure_ascii=False)}
 
+            RAG_CONTEXT (status={rag_status or 'n/a'}):
+            {rag_context or "(none)"}
+
+            RAG_EVIDENCE_REFERENCES:
+            {json.dumps(list(rag_refs or [])[:32], ensure_ascii=False)}
+
+            RAG_USAGE_CONSTRAINT:
+            Prioritize retrieved evidence. Do not fabricate citations or run references.
+
             Recent experimental traces:
             {json.dumps(runs_short, ensure_ascii=False)}
 
@@ -1140,11 +3240,16 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             2) Include reproducibility safeguards and expected failure modes.
             3) Favor incremental, testable, falsifiable hypotheses.
             4) Keep strategy executable within limited budget.
+            5) CRITICAL: if task manifest uses list scoring_column, plan must handle manifest['scoring_column'][0].
+            6) CRITICAL: include memory-safe strategy for large datasets (sampling/batching required).
 
             Return ONLY JSON with concise but technical content:
             {{
               "hypothesis_tags": ["..."],
               "strategy": "...",
+              "schema_assumptions": ["..."],
+              "memory_safety": ["..."],
+              "evidence_refs": ["..."],
               "solver_spec": {{
                 "model_family": "tfidf_logreg|linear_svc|tfidf_ridge",
                 "seed": 42,
@@ -1175,6 +3280,9 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         method_card: Optional[Dict[str, Any]],
         exp_count: int,
         budget: int,
+        rag_context: str = "",
+        rag_refs: Optional[List[str]] = None,
+        rag_status: str = "",
     ) -> str:
         notes_short = []
         for n in notes[-4:]:
@@ -1228,6 +3336,15 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             Method card:
             {json.dumps(method_card_short, ensure_ascii=False)}
 
+            RAG_CONTEXT (status={rag_status or 'n/a'}):
+            {rag_context or "(none)"}
+
+            RAG_EVIDENCE_REFERENCES:
+            {json.dumps(list(rag_refs or [])[:32], ensure_ascii=False)}
+
+            RAG_USAGE_CONSTRAINT:
+            Prioritize retrieved evidence. Do not fabricate citations or run references.
+
             Previous run outcomes:
             {json.dumps(obs_short, ensure_ascii=False)}
 
@@ -1264,6 +3381,9 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         observation_refs: List[str],
         notes: List[Dict[str, Any]],
         observations: List[Dict[str, Any]],
+        rag_context: str = "",
+        rag_refs: Optional[List[str]] = None,
+        rag_status: str = "",
     ) -> str:
         evidence_short = []
         for n in notes[-4:]:
@@ -1312,6 +3432,15 @@ class ResearchActionsPlugin(OtherActionsPlugin):
 
             Evidence snippets:
             {json.dumps(evidence_short[:10], ensure_ascii=False)}
+
+            RAG_CONTEXT (status={rag_status or 'n/a'}):
+            {rag_context or "(none)"}
+
+            RAG_EVIDENCE_REFERENCES:
+            {json.dumps(list(rag_refs or [])[:32], ensure_ascii=False)}
+
+            RAG_USAGE_CONSTRAINT:
+            Prioritize retrieved evidence. Do not fabricate citations or run references.
 
             Experiment history:
             {json.dumps(obs_short, ensure_ascii=False)}
@@ -1467,6 +3596,248 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             plan["notes"] = self._truncate(payload.get("notes"), 500)
         return plan
 
+    def _classify_experiment_failure(
+        self,
+        *,
+        result: Dict[str, Any],
+        code_plan: Optional[Dict[str, Any]],
+        world_spec: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        error = str((result or {}).get("error") or "")
+        stderr_tail = str((result or {}).get("stderr_tail") or "")
+        stdout_tail = str((result or {}).get("stdout_tail") or "")
+        merged = "\n".join([error, stderr_tail, stdout_tail]).lower()
+        fallback_reason = str((result or {}).get("fallback_reason") or "").lower()
+
+        error_class = "unknown"
+        error_codes: List[str] = []
+        severity = "medium"
+        retryable = True
+        root_cause = "unknown_failure"
+        repair_hints: List[str] = []
+
+        if "hard_stop:" in merged:
+            error_class = "runtime"
+            error_codes.append("hard_stop")
+            severity = "fatal"
+            retryable = False
+            root_cause = "episode_budget_or_step_hard_stop"
+            repair_hints.append("wait_for_new_episode_or_reduce_compute_cost")
+        elif "timed out" in merged or "timeout" in merged:
+            error_class = "timeout"
+            error_codes.append("execution_timeout")
+            severity = "high"
+            root_cause = "run_timeout"
+            repair_hints.extend(["reduce_data_scale", "reduce_model_complexity", "add_fast_path"])
+        elif "killed" in merged or "out of memory" in merged or "oom" in merged:
+            error_class = "oom"
+            error_codes.append("process_killed_or_oom")
+            severity = "high"
+            root_cause = "memory_pressure"
+            repair_hints.extend(["enable_sampling", "reduce_batch_size", "reduce_feature_count"])
+        elif "no such file or directory" in merged or "filenotfounderror" in merged:
+            error_class = "io"
+            severity = "medium"
+            root_cause = "input_or_output_path_missing"
+            if "./data/train.csv" in merged:
+                error_codes.append("missing_train_csv")
+                repair_hints.append("prefer_load_from_disk_train_with_csv_fallback")
+            if "submission.csv" in merged:
+                error_codes.append("missing_submission_csv")
+                repair_hints.append("ensure_outputs_submission_csv_written")
+            if not error_codes:
+                error_codes.append("missing_path")
+                repair_hints.append("check_manifest_and_runtime_paths")
+        elif "modulenotfounderror" in merged or "no module named" in merged:
+            error_class = "dependency"
+            severity = "medium"
+            root_cause = "missing_runtime_dependency"
+            m = re.search(r"no module named ['\"]([^'\"]+)['\"]", merged)
+            if m:
+                error_codes.append(f"module_missing_{m.group(1)}")
+            else:
+                error_codes.append("module_missing_unknown")
+            repair_hints.append("avoid_optional_dependency_or_use_stdlib_fallback")
+        elif "column object has no attribute tolist" in merged:
+            error_class = "schema"
+            error_codes.append("column_tolist_misuse")
+            root_cause = "dataset_column_type_mismatch"
+            repair_hints.append("convert_column_with_list_or_numpy_array")
+        elif "unhashable type: 'list'" in merged or "unhashable type: \"list\"" in merged:
+            error_class = "schema"
+            error_codes.append("unhashable_list_schema")
+            root_cause = "list_used_in_hash_context"
+            repair_hints.append("avoid_value_counts_on_list_column")
+        elif "scoring_column" in merged and ("list" in merged or "[0]" in merged):
+            error_class = "schema"
+            error_codes.append("scoring_column_list_misuse")
+            root_cause = "scoring_column_list_not_indexed"
+            repair_hints.append("read_manifest_and_use_scoring_column_index0")
+        elif "evaluate.py failed" in merged or "submission" in merged and "format" in merged:
+            error_class = "format"
+            error_codes.append("submission_format_invalid")
+            root_cause = "submission_schema_mismatch"
+            repair_hints.append("align_submission_columns_with_manifest")
+        elif "syntaxerror" in merged or "typeerror" in merged or "valueerror" in merged:
+            error_class = "runtime"
+            error_codes.append("python_runtime_exception")
+            root_cause = "python_exception"
+            repair_hints.append("fix_exception_using_traceback_line")
+
+        if "code_agent:" in fallback_reason and not error_codes:
+            error_codes.append("code_agent_fallback")
+
+        return {
+            "error_class": error_class,
+            "error_codes": error_codes or ["unknown_failure"],
+            "severity": severity,
+            "retryable": bool(retryable),
+            "root_cause": root_cause,
+            "evidence": {
+                "error": self._truncate(error, 800),
+                "stderr_tail": self._truncate(stderr_tail, self._code_error_tail_chars),
+                "stdout_tail": self._truncate(stdout_tail, self._code_error_tail_chars),
+                "run_meta": {
+                    "task_name": world_spec.get("task_name"),
+                    "metric": world_spec.get("metric"),
+                    "code_memory_mb": world_spec.get("code_memory_mb"),
+                    "solver_mode": (result or {}).get("solver_mode"),
+                    "fallback_reason": (result or {}).get("fallback_reason"),
+                },
+            },
+            "repair_hints": repair_hints[:8],
+            "code_plan_brief": {
+                "has_files": bool((code_plan or {}).get("files")),
+                "run_cmd": self._truncate((code_plan or {}).get("run_cmd"), 240),
+            },
+        }
+
+    def _apply_failure_template_fixes(
+        self,
+        *,
+        code_plan: Dict[str, Any],
+        diagnosis: Dict[str, Any],
+        world_spec: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not self._code_template_fix_enable:
+            return {"applied": False, "rules_hit": [], "mutated_files": [], "summary": "template_fix_disabled", "code_plan": code_plan}
+        plan = json.loads(json.dumps(code_plan or {}))
+        files = plan.get("files")
+        if not isinstance(files, list):
+            return {"applied": False, "rules_hit": [], "mutated_files": [], "summary": "no_files", "code_plan": plan}
+
+        rules_hit: List[str] = []
+        mutated_files: List[str] = []
+        error_codes = {str(x) for x in (diagnosis or {}).get("error_codes", [])}
+        error_class = str((diagnosis or {}).get("error_class") or "")
+
+        for file_obj in files:
+            if not isinstance(file_obj, dict):
+                continue
+            path = str(file_obj.get("path") or "")
+            content = file_obj.get("content")
+            if not isinstance(content, str):
+                continue
+            updated = content
+
+            if "missing_train_csv" in error_codes or error_class == "io":
+                if "./data/train.csv" in updated and "load_from_disk('./data/train')" not in updated:
+                    updated = updated.replace(
+                        "pd.read_csv('./data/train.csv')",
+                        "load_from_disk('./data/train').to_pandas() if os.path.exists('./data/train') else pd.read_csv('./data/train.csv')",
+                    )
+                    rules_hit.append("io_train_csv_to_load_from_disk")
+
+            if "scoring_column_list_misuse" in error_codes:
+                if "scoring_column" in updated and "[0]" not in updated:
+                    updated = updated.replace("manifest.get('scoring_column')", "(manifest.get('scoring_column') or ['prediction'])[0]")
+                    rules_hit.append("schema_scoring_column_index0")
+
+            if "column_tolist_misuse" in error_codes and ".tolist()" in updated:
+                updated = updated.replace(".tolist()", " if hasattr(train_data['target'], '__iter__') else []")
+                rules_hit.append("schema_column_tolist_guard")
+
+            if error_class == "oom":
+                if "max_features" in updated and "50000" in updated:
+                    updated = updated.replace("50000", "15000")
+                    rules_hit.append("oom_reduce_max_features")
+                if "sample_ratio" not in updated:
+                    updated += "\n\n# template fix: OOM guard\nsample_ratio = 0.1\n"
+                    rules_hit.append("oom_add_sample_ratio")
+
+            if error_class == "format":
+                if "outputs/submission.csv" not in updated:
+                    updated += "\n\n# template fix: enforce submission path\nsubmission_path = os.path.join('./outputs', 'submission.csv')\n"
+                    rules_hit.append("format_force_submission_path")
+
+            if updated != content:
+                file_obj["content"] = updated[: self._code_max_file_chars]
+                mutated_files.append(path or "unknown_path")
+
+        applied = bool(mutated_files)
+        return {
+            "applied": applied,
+            "rules_hit": sorted(set(rules_hit)),
+            "mutated_files": mutated_files,
+            "summary": "template_fix_applied" if applied else "no_rule_matched",
+            "code_plan": plan,
+            "task_name": world_spec.get("task_name"),
+        }
+
+    def _build_repair_context(
+        self,
+        *,
+        diagnosis: Dict[str, Any],
+        template_fix: Dict[str, Any],
+        prev_plan: Optional[Dict[str, Any]],
+    ) -> str:
+        payload = {
+            "diagnosis": {
+                "error_class": diagnosis.get("error_class"),
+                "error_codes": diagnosis.get("error_codes"),
+                "severity": diagnosis.get("severity"),
+                "retryable": diagnosis.get("retryable"),
+                "root_cause": diagnosis.get("root_cause"),
+                "repair_hints": diagnosis.get("repair_hints"),
+                "evidence": diagnosis.get("evidence"),
+            },
+            "template_fix": {
+                "applied": template_fix.get("applied"),
+                "rules_hit": template_fix.get("rules_hit"),
+                "mutated_files": template_fix.get("mutated_files"),
+                "summary": template_fix.get("summary"),
+            },
+            "previous_plan_brief": {
+                "run_cmd": (prev_plan or {}).get("run_cmd"),
+                "file_count": len((prev_plan or {}).get("files") or []),
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _should_enter_optimize(self, attempts: List[Dict[str, Any]]) -> bool:
+        if not self._code_optimize_guard_enable:
+            return True
+        if not isinstance(attempts, list) or len(attempts) < 2:
+            return False
+        successes = [
+            a for a in attempts
+            if isinstance(a, dict)
+            and isinstance(a.get("result"), dict)
+            and bool((a.get("result") or {}).get("ok", False))
+        ]
+        if len(successes) < 1:
+            return False
+        last_two = attempts[-2:]
+        for item in last_two:
+            if not isinstance(item, dict) or not isinstance(item.get("result"), dict):
+                return False
+            r = item.get("result") or {}
+            if not bool(r.get("ok", False)):
+                return False
+            if not isinstance(r.get("dev_score_norm"), (int, float)) and not isinstance(r.get("score_norm"), (int, float)):
+                return False
+        return True
+
     def _build_code_experiment_prompt(
         self,
         *,
@@ -1484,7 +3855,12 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         max_rounds: int,
         previous_plan: Optional[Dict[str, Any]] = None,
         failure_context: Optional[str] = None,
+        failure_diagnosis: Optional[Dict[str, Any]] = None,
+        template_fix: Optional[Dict[str, Any]] = None,
         best_dev_score_norm: Optional[float] = None,
+        rag_context: str = "",
+        rag_refs: Optional[List[str]] = None,
+        rag_status: str = "",
     ) -> str:
         notes_short = []
         for n in notes[-4:]:
@@ -1561,6 +3937,21 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             Failure context (if any):
             {failure_context or "N/A"}
 
+            Diagnosis JSON (for repair/optimize):
+            {json.dumps(failure_diagnosis or {}, ensure_ascii=False)}
+
+            TemplateFix summary:
+            {json.dumps(template_fix or {}, ensure_ascii=False)}
+
+            RAG_CONTEXT (status={rag_status or 'n/a'}):
+            {rag_context or "(none)"}
+
+            RAG_EVIDENCE_REFERENCES:
+            {json.dumps(list(rag_refs or [])[:32], ensure_ascii=False)}
+
+            RAG_USAGE_CONSTRAINT:
+            Prioritize retrieved evidence. Do not fabricate citations or run references.
+
             Sandbox contract:
             1) You must write file-level code updates.
             2) Code must run via one command.
@@ -1575,6 +3966,8 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                - first try `datasets.load_from_disk('./data/train')`
                - fallback to `pd.read_csv('./data/train.csv')` only if CSV exists.
             8) Read `.task_manifest.json` to get metric/category/scoring_column and format submission accordingly.
+            9) Do NOT repeat previously failed error_codes if provided in Diagnosis JSON.
+            10) Keep valid existing logic unless a rule in TemplateFix explicitly changes it.
 
             Return ONLY JSON:
             {{
@@ -1583,7 +3976,9 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 {{"path": "src/main.py", "content": "FULL PYTHON CODE"}},
                 {{"path": "src/feature_engineering.py", "content": "OPTIONAL"}}
               ],
-              "notes": "brief explanation of this iteration"
+              "notes": "brief explanation of this iteration",
+              "fixed_error_codes": ["..."],
+              "risk_left": ["..."]
             }}
             """
         ).strip()
@@ -1614,6 +4009,8 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         best_plan: Dict[str, Any] = {}
         previous_plan: Dict[str, Any] = {}
         failure_context = ""
+        last_diagnosis: Dict[str, Any] = {}
+        last_template_fix: Dict[str, Any] = {}
         no_improve_rounds = 0
 
         max_rounds = min(self._code_debug_rounds, max(1, int(budget or self._code_debug_rounds)))
@@ -1628,6 +4025,39 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 phase = "optimize"
                 if not self._code_optimize_after_success:
                     break
+                if not self._should_enter_optimize(attempts):
+                    phase = "repair"
+
+            recent_errors = [
+                self._truncate((a.get("result") or {}).get("error"), 180)
+                for a in attempts[-5:]
+                if isinstance(a, dict)
+                and isinstance(a.get("result"), dict)
+                and str(((a.get("result") or {}).get("error") or "")).strip()
+            ]
+            rag_query = " | ".join(
+                [
+                    f"task={world_spec.get('task_name')}",
+                    f"phase={phase}",
+                    f"strategy={plan_spec.get('strategy')}",
+                    f"round={idx + 1}/{max_rounds}",
+                    f"failure_codes={json.dumps((last_diagnosis or {}).get('error_codes', []), ensure_ascii=False)}",
+                    f"recent_errors={json.dumps(recent_errors, ensure_ascii=False)}",
+                ]
+            )
+            rag_result = await self._rag_retrieve_context(
+                agent_id=agent_id,
+                action="experiment",
+                run_id=str((best_result or {}).get("run_id") or ""),
+                paper_id=None,
+                query_text=rag_query,
+                quotas={"observation": 5, "diagnosis": 5, "method_card": 2, "data_card": 1, "note": 1},
+                notes=notes,
+                observations=prior_observations + [a.get("result") or {} for a in attempts],
+                data_card=data_card,
+                method_card=method_card,
+            )
+            rag_block = self._format_rag_prompt_block(result=rag_result)
 
             prompt = self._build_code_experiment_prompt(
                 world_spec=world_spec,
@@ -1644,7 +4074,12 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 max_rounds=max_rounds,
                 previous_plan=previous_plan,
                 failure_context=failure_context,
+                failure_diagnosis=last_diagnosis,
+                template_fix=last_template_fix,
                 best_dev_score_norm=best_score if best_score >= 0.0 else None,
+                rag_context=rag_block.get("context", ""),
+                rag_refs=rag_block.get("refs", []),
+                rag_status=rag_block.get("status", ""),
             )
             llm_result = await self._call_llm_json(agent_id=agent_id, action_name="experiment", prompt=prompt)
             if not llm_result.get("ok") or not isinstance(llm_result.get("data"), dict):
@@ -1659,6 +4094,8 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 break
 
             code_plan = self._normalize_code_plan(llm_result.get("data") or {})
+            llm_fixed_error_codes = self._safe_text_list((llm_result.get("data") or {}).get("fixed_error_codes"), limit=10, item_limit=120)
+            llm_risk_left = self._safe_text_list((llm_result.get("data") or {}).get("risk_left"), limit=10, item_limit=120)
             previous_plan = code_plan
             if not bool(code_plan.get("files")):
                 attempts.append(
@@ -1667,9 +4104,29 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                         "phase": phase,
                         "llm_ok": True,
                         "llm_reason": "code_plan_files_empty",
+                        "diagnosis": {"error_class": "runtime", "error_codes": ["code_plan_files_empty"]},
                     }
                 )
                 failure_context = "LLM returned empty files list; provide full runnable files."
+                last_diagnosis = {
+                    "error_class": "runtime",
+                    "error_codes": ["code_plan_files_empty"],
+                    "severity": "medium",
+                    "retryable": True,
+                    "root_cause": "llm_output_invalid",
+                    "repair_hints": ["return_non_empty_files"],
+                    "evidence": {"error": "code_plan_files_empty"},
+                }
+                last_template_fix = {"applied": False, "rules_hit": [], "mutated_files": [], "summary": "no_file_to_fix"}
+                if self._code_diag_enable:
+                    await self._log_code_diagnosis(
+                        agent_id=agent_id,
+                        phase=phase,
+                        run_id=None,
+                        diagnosis=last_diagnosis,
+                        template_fix=last_template_fix,
+                        decision="repair",
+                    )
                 continue
 
             current_tick = int(await self.controller.run_system("timer", "get_tick"))
@@ -1692,18 +4149,49 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                     "phase": phase,
                     "llm_ok": True,
                     "code_plan": code_plan,
+                    "llm_fixed_error_codes": llm_fixed_error_codes,
+                    "llm_risk_left": llm_risk_left,
                     "result": result,
                 }
             )
 
             ok = bool((result or {}).get("ok", False))
             if not ok:
-                err_parts = [
-                    str((result or {}).get("error") or ""),
-                    str((result or {}).get("stderr_tail") or ""),
-                    str((result or {}).get("stdout_tail") or ""),
-                ]
-                failure_context = self._truncate("\n".join([x for x in err_parts if x]).strip(), self._code_error_tail_chars)
+                diagnosis = self._classify_experiment_failure(result=result or {}, code_plan=code_plan, world_spec=world_spec)
+                template_fix = self._apply_failure_template_fixes(
+                    code_plan=code_plan,
+                    diagnosis=diagnosis,
+                    world_spec=world_spec,
+                )
+                if isinstance(template_fix.get("code_plan"), dict):
+                    previous_plan = template_fix.get("code_plan") or previous_plan
+                failure_context = self._build_repair_context(
+                    diagnosis=diagnosis,
+                    template_fix=template_fix,
+                    prev_plan=previous_plan,
+                )
+                last_diagnosis = diagnosis
+                last_template_fix = template_fix
+                attempts[-1]["diagnosis"] = diagnosis
+                attempts[-1]["template_fix"] = {
+                    "applied": template_fix.get("applied"),
+                    "rules_hit": template_fix.get("rules_hit"),
+                    "mutated_files": template_fix.get("mutated_files"),
+                    "summary": template_fix.get("summary"),
+                }
+                if self._code_diag_enable:
+                    await self._log_code_diagnosis(
+                        agent_id=agent_id,
+                        phase=phase,
+                        run_id=str((result or {}).get("run_id") or ""),
+                        diagnosis=diagnosis,
+                        template_fix=template_fix,
+                        decision="repair",
+                        score_norm=(result or {}).get("score_norm"),
+                        dev_score_norm=(result or {}).get("dev_score_norm"),
+                    )
+                if not bool(diagnosis.get("retryable", True)):
+                    break
                 continue
 
             score = (result or {}).get("dev_score_norm")
@@ -1718,11 +4206,37 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             else:
                 no_improve_rounds += 1
 
+            if self._code_diag_enable:
+                await self._log_code_diagnosis(
+                    agent_id=agent_id,
+                    phase=phase,
+                    run_id=str((result or {}).get("run_id") or ""),
+                    diagnosis={
+                        "error_class": "none",
+                        "error_codes": [],
+                        "severity": "low",
+                        "retryable": True,
+                        "root_cause": "success",
+                        "repair_hints": [],
+                        "evidence": {},
+                    },
+                    template_fix={"applied": False, "rules_hit": [], "mutated_files": [], "summary": "success"},
+                    decision="optimize" if self._should_enter_optimize(attempts) else "repair",
+                    score_norm=(result or {}).get("score_norm"),
+                    dev_score_norm=(result or {}).get("dev_score_norm"),
+                )
+
             if has_success and no_improve_rounds >= self._code_optimize_patience:
                 break
 
         if not attempts:
             return None
+
+        await self._log_code_loop(
+            agent_id=agent_id,
+            attempts=attempts,
+            best_dev_score_norm=(best_score if best_score >= 0.0 else None),
+        )
 
         final_result = best_result
         final_plan = best_plan
@@ -2025,6 +4539,8 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             required_task_types.append("read")
         if any(str(f).startswith("need_hypothesis>=") for f in failures):
             required_task_types.append("hypothesize")
+        if "need_plan_spec" in failures:
+            required_task_types.append("hypothesize")
 
         for task_type in required_task_types:
             if task_type in known_types:
@@ -2059,6 +4575,57 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         if len(observations or []) < self._write_min_observations:
             failures.append(f"need_observations>={self._write_min_observations}")
         return failures
+
+    def _local_submission_format_check(self, submission_path: str) -> Dict[str, Any]:
+        if not submission_path or not os.path.exists(submission_path):
+            return {
+                "ok": False,
+                "error_code": "submission_not_found",
+                "message": f"submission missing: {submission_path}",
+            }
+        rows = 0
+        try:
+            with open(submission_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                fieldnames = list(reader.fieldnames or [])
+                if not fieldnames:
+                    return {
+                        "ok": False,
+                        "error_code": "missing_header",
+                        "message": "submission.csv missing header row",
+                    }
+                for _ in reader:
+                    rows += 1
+            if rows <= 0:
+                return {
+                    "ok": False,
+                    "error_code": "empty_submission",
+                    "message": "submission.csv has no data rows",
+                    "columns": fieldnames,
+                }
+            try:
+                digest = hashlib.sha256()
+                with open(submission_path, "rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                file_hash = digest.hexdigest()
+            except Exception:
+                file_hash = ""
+            return {
+                "ok": True,
+                "columns": fieldnames,
+                "row_count": rows,
+                "submission_hash": file_hash,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error_code": "csv_parse_error",
+                "message": f"failed to parse submission.csv: {e}",
+            }
 
     def _build_citation_owner_map(
         self,
@@ -2277,8 +4844,44 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 refresh=bool(payload.get("refresh")),
             )
         if task_action == "hypothesize":
-            return await self.hypothesize(agent_id=agent_id)
+            result = await self.hypothesize(agent_id=agent_id)
+            if isinstance(result, ActionResult) and result.is_successful():
+                data = result.data if isinstance(result.data, dict) else {}
+                plan_spec = data.get("plan_spec")
+                if not isinstance(plan_spec, dict):
+                    return ActionResult.error(
+                        method_name="hypothesize",
+                        message="hypothesize returned invalid plan_spec format.",
+                        data={
+                            "ok": False,
+                            "precondition_failed": True,
+                            "reason": "invalid_plan_spec_format",
+                            "reward": 0.0,
+                            "effective_action": "hypothesize",
+                            "reward_components": {"learning_reward": 0.0, "hypothesize_reward": 0.0},
+                        },
+                    )
+            return result
         if task_action == "experiment":
+            if self._vdh_enable and self._vdh_gate_policy == "hard_fail":
+                last_vdh = await self._get_state(agent_id, "last_vdh_report")
+                if isinstance(last_vdh, dict) and last_vdh and not bool(last_vdh.get("final_ok", True)):
+                    return ActionResult.error(
+                        method_name="experiment",
+                        message="Experiment blocked by VDH gate failure.",
+                        data={
+                            "ok": False,
+                            "precondition_failed": True,
+                            "reason": "vdh_gate_failed",
+                            "vdh": last_vdh,
+                            "reward": 0.0,
+                            "effective_action": "experiment",
+                            "reward_components": {
+                                "learning_reward": 0.0,
+                                "experiment_reward": 0.0,
+                            },
+                        },
+                    )
             return await self.experiment(agent_id=agent_id, config=payload.get("config"))
         if task_action == "replicate":
             return await self.replicate(agent_id=agent_id, paper_id=payload.get("paper_id"))
@@ -2318,23 +4921,42 @@ class ResearchActionsPlugin(OtherActionsPlugin):
 
     @AgentCall
     async def read(self, agent_id: str, topic: Optional[str] = None) -> ActionResult:
+        existing_notes = await self._get_state(agent_id, "notes") or []
         literature = await self.controller.run_environment("science", "read_literature", agent_id=agent_id, topic=topic)
-        notes = await self._get_state(agent_id, "notes") or []
+        notes = existing_notes
         notes.append(literature)
         await self._set_state(agent_id, "notes", notes)
         await self._log_evidence_cards(agent_id, literature, source="read")
+        if self._rag_index_on_read:
+            world_spec = await self.controller.run_environment("science", "get_world_spec")
+            rag_docs = self._rag_docs_from_note(
+                world_spec=world_spec,
+                agent_id=agent_id,
+                note=literature if isinstance(literature, dict) else {},
+                action="read",
+            )
+            if rag_docs:
+                await self._rag_index_documents(agent_id=agent_id, action="read", docs=rag_docs)
+        read_reward_info = await self._compute_read_reward(existing_notes=existing_notes, new_note=literature)
+        read_reward = float(read_reward_info.get("reward", 0.0) or 0.0)
 
         ar = ActionResult.success(
             method_name="read",
             message="Task cards retrieved.",
             data={
                 "note": literature,
-                "reward": 0.0,
+                "reward": read_reward,
                 "effective_action": "read",
-                "reward_components": {"learning_reward": 0.0, "read_reward": 0.0},
+                "reward_components": {
+                    "learning_reward": float(read_reward),
+                    "read_reward": float(read_reward),
+                    "read_novelty": float(read_reward_info.get("novelty", 0.0) or 0.0),
+                    "read_method_bonus": float(read_reward_info.get("method_bonus", 0.0) or 0.0),
+                },
+                "read_reward_info": read_reward_info,
             },
         )
-        await self._append_trace(agent_id, "read", 0.0, ar.data or {})
+        await self._append_trace(agent_id, "read", read_reward, ar.data or {})
         return ar
 
     @AgentCall
@@ -2460,6 +5082,24 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             notes.append(method_note)
             await self._set_state(agent_id, "notes", notes)
             await self._log_evidence_cards(agent_id, method_note, source="retrieve_literature")
+            if self._rag_index_on_read:
+                world_spec = await self.controller.run_environment("science", "get_world_spec")
+                rag_docs = self._rag_docs_from_method_card(
+                    world_spec=world_spec,
+                    agent_id=agent_id,
+                    method_card=method_card if isinstance(method_card, dict) else {},
+                    action="retrieve_literature",
+                )
+                rag_docs.extend(
+                    self._rag_docs_from_note(
+                        world_spec=world_spec,
+                        agent_id=agent_id,
+                        note=method_note,
+                        action="retrieve_literature",
+                    )
+                )
+                if rag_docs:
+                    await self._rag_index_documents(agent_id=agent_id, action="retrieve_literature", docs=rag_docs)
 
         ar = ActionResult.success(
             method_name="retrieve_literature",
@@ -2487,11 +5127,45 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         data_card = await self._get_state(agent_id, "data_card")
         method_card = await self._get_state(agent_id, "method_card")
         world_spec = await self.controller.run_environment("science", "get_world_spec")
+        await self._rag_bootstrap_episode_knowledge(
+            agent_id=agent_id,
+            world_spec=world_spec,
+            data_card=data_card if isinstance(data_card, dict) else None,
+            method_card=method_card if isinstance(method_card, dict) else None,
+        )
         existing_plan = await self._get_state(agent_id, "plan_spec") or {}
         plan_spec = self._merge_solver_plan(self._default_solver_plan(world_spec), existing_plan if isinstance(existing_plan, dict) else {})
         inferred = ["metric_alignment", "format_safety"]
+        rag_block = {"context": "", "refs": [], "status": "disabled"}
 
         if hypothesis is None and self._llm_ready("hypothesize"):
+            recent_failure_modes = [
+                self._truncate((o or {}).get("error"), 180)
+                for o in observations[-5:]
+                if isinstance(o, dict) and not bool((o or {}).get("ok", False)) and str((o or {}).get("error") or "").strip()
+            ]
+            rag_query = " | ".join(
+                [
+                    f"task={world_spec.get('task_name')}",
+                    f"metric={world_spec.get('metric')}",
+                    f"current_strategy={plan_spec.get('strategy')}",
+                    f"existing_hypothesis={json.dumps(hypothesis or [], ensure_ascii=False)}",
+                    f"failure_modes={json.dumps(recent_failure_modes[:4], ensure_ascii=False)}",
+                ]
+            )
+            rag_result = await self._rag_retrieve_context(
+                agent_id=agent_id,
+                action="hypothesize",
+                run_id=None,
+                paper_id=None,
+                query_text=rag_query,
+                quotas={"data_card": 2, "method_card": 3, "observation": 2, "diagnosis": 2, "note": 1},
+                notes=notes,
+                observations=observations,
+                data_card=data_card if isinstance(data_card, dict) else None,
+                method_card=method_card if isinstance(method_card, dict) else None,
+            )
+            rag_block = self._format_rag_prompt_block(result=rag_result)
             cards = []
             for n in notes[-4:]:
                 cards.extend((n or {}).get("cards", [])[:3])
@@ -2501,6 +5175,9 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 recent_runs=observations,
                 data_card=data_card,
                 method_card=method_card,
+                rag_context=rag_block.get("context", ""),
+                rag_refs=rag_block.get("refs", []),
+                rag_status=rag_block.get("status", ""),
             )
             llm_result = await self._call_llm_json(agent_id=agent_id, action_name="hypothesize", prompt=prompt)
             if llm_result.get("ok") and isinstance(llm_result.get("data"), dict):
@@ -2517,6 +5194,86 @@ class ResearchActionsPlugin(OtherActionsPlugin):
 
         await self._set_state(agent_id, "hypothesis", hypothesis)
         await self._set_state(agent_id, "plan_spec", plan_spec)
+        feasibility = self._hypothesis_feasibility(world_spec=world_spec, plan_spec=plan_spec)
+        vdh_report: Dict[str, Any] = {
+            "final_ok": True,
+            "policy": self._vdh_gate_policy,
+            "gate_a": {"ok": True, "source": "disabled", "constraints": {}, "warnings": []},
+            "gate_b": {"ok": True, "errors": [], "resource_estimate": {}},
+            "gate_c": {
+                "ok": True,
+                "coverage_score": 1.0,
+                "threshold": self._vdh_evidence_threshold,
+                "source": "disabled",
+                "errors": [],
+            },
+            "failures": [],
+        }
+        if self._vdh_enable:
+            vdh_report = await self._evaluate_vdh_gates(
+                world_spec=world_spec,
+                hypothesis=hypothesis,
+                plan_spec=plan_spec,
+                notes=notes,
+                observations=observations,
+                data_card=data_card if isinstance(data_card, dict) else None,
+            )
+        await self._set_state(agent_id, "last_vdh_report", vdh_report)
+
+        gate_a_ok = bool(((vdh_report.get("gate_a") or {}).get("ok", False)))
+        coverage_score = float(((vdh_report.get("gate_c") or {}).get("coverage_score", 0.0) or 0.0))
+        gate_b_errors = list(((vdh_report.get("gate_b") or {}).get("errors") or []))
+        potential_oom = any(str(e) == "potential_oom" for e in gate_b_errors)
+        final_ok = bool(vdh_report.get("final_ok", True))
+
+        vdh_schema_pass_reward = self._vdh_schema_pass_reward if gate_a_ok else 0.0
+        if coverage_score > 0.8:
+            vdh_evidence_coverage_reward = self._vdh_evidence_high_reward * min(1.0, coverage_score)
+        else:
+            vdh_evidence_coverage_reward = 0.0
+        vdh_oom_penalty = -self._vdh_oom_penalty if potential_oom else 0.0
+        vdh_gate_penalty = -self._vdh_gate_penalty if (self._vdh_enable and not final_ok) else 0.0
+
+        if self._vdh_enable:
+            hypo_reward = vdh_schema_pass_reward + vdh_evidence_coverage_reward + vdh_oom_penalty + vdh_gate_penalty
+        else:
+            hypo_reward = float(feasibility.get("reward", 0.0) or 0.0)
+        hypo_reward = float(max(-1.2, min(1.2, hypo_reward)))
+
+        reward_components = {
+            "learning_reward": float(hypo_reward),
+            "hypothesize_reward": float(hypo_reward),
+            "hypothesis_feasibility_score": float(feasibility.get("feasibility_score", 0.0) or 0.0),
+            "hypothesis_schema_bonus": float(feasibility.get("schema_bonus", 0.0) or 0.0),
+            "hypothesis_resource_bonus": float(feasibility.get("resource_bonus", 0.0) or 0.0),
+            "vdh_schema_pass_reward": float(vdh_schema_pass_reward),
+            "vdh_evidence_coverage_reward": float(vdh_evidence_coverage_reward),
+            "vdh_oom_penalty": float(vdh_oom_penalty),
+            "vdh_gate_penalty": float(vdh_gate_penalty),
+        }
+        await self._log_vdh_gate(agent_id=agent_id, vdh_report=vdh_report, reward_components=reward_components)
+
+        if self._vdh_enable and self._vdh_gate_policy == "hard_fail" and not final_ok:
+            recovery = await self._enqueue_vdh_recovery_tasks(vdh_report=vdh_report)
+            ar = ActionResult.error(
+                method_name="hypothesize",
+                message="VDH gate failed; hypothesis rejected and recovery tasks queued.",
+                data={
+                    "ok": False,
+                    "precondition_failed": True,
+                    "reason": "vdh_gate_failed",
+                    "hypothesis": hypothesis,
+                    "plan_spec": plan_spec,
+                    "vdh": vdh_report,
+                    "recovery_tasks": recovery,
+                    "reward": hypo_reward,
+                    "effective_action": "hypothesize",
+                    "reward_components": reward_components,
+                    "feasibility": feasibility,
+                },
+            )
+            await self._append_trace(agent_id, "hypothesize", hypo_reward, ar.data or {})
+            return ar
 
         ar = ActionResult.success(
             method_name="hypothesize",
@@ -2524,12 +5281,16 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             data={
                 "hypothesis": hypothesis,
                 "plan_spec": plan_spec,
-                "reward": 0.0,
+                "vdh": vdh_report,
+                "reward": hypo_reward,
                 "effective_action": "hypothesize",
-                "reward_components": {"learning_reward": 0.0, "hypothesize_reward": 0.0},
+                "reward_components": reward_components,
+                "feasibility": feasibility,
+                "rag_status": rag_block.get("status"),
+                "rag_refs": rag_block.get("refs", []),
             },
         )
-        await self._append_trace(agent_id, "hypothesize", 0.0, ar.data or {})
+        await self._append_trace(agent_id, "hypothesize", hypo_reward, ar.data or {})
         return ar
 
     @AgentCall
@@ -2556,7 +5317,25 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             data_card=data_card if isinstance(data_card, dict) else None,
             method_card=method_card if isinstance(method_card, dict) else None,
         )
+        plan_spec_missing = (
+            not isinstance(plan_spec, dict)
+            or not str((plan_spec or {}).get("strategy") or "").strip()
+            or not isinstance((plan_spec or {}).get("solver_spec"), dict)
+        )
+        if plan_spec_missing:
+            precondition_failures.append("need_plan_spec")
         if precondition_failures:
+            await self._log_precondition_gate(
+                agent_id=agent_id,
+                action="experiment",
+                phase="initial",
+                failures=precondition_failures,
+                summary={
+                    "hypothesis_count": len(hypothesis or []),
+                    "notes_count": len(notes or []),
+                    "observation_count": len(prior_observations or []),
+                },
+            )
             hydrate_summary = await self._hydrate_experiment_prerequisites(
                 agent_id=agent_id,
                 hypothesis=hypothesis,
@@ -2566,7 +5345,25 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 failures=precondition_failures,
             )
             precondition_failures = list(hydrate_summary.get("remaining_failures") or [])
+            await self._log_precondition_gate(
+                agent_id=agent_id,
+                action="experiment",
+                phase="post_hydrate",
+                failures=precondition_failures,
+                summary=hydrate_summary if isinstance(hydrate_summary, dict) else {},
+            )
             if precondition_failures:
+                if "need_plan_spec" in precondition_failures:
+                    try:
+                        await self.controller.run_environment(
+                            "science",
+                            "task_create",
+                            task_type="hypothesize",
+                            payload={"reason": "missing_plan_spec"},
+                            priority=9,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to create hypothesize recovery task: {e}")
                 recovery = await self._enqueue_prereq_recovery_tasks(failures=precondition_failures)
                 ar = ActionResult.success(
                     method_name="experiment",
@@ -2622,6 +5419,28 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             code_attempts = code_loop_payload.get("code_attempts")
         else:
             if self._llm_ready("experiment"):
+                rag_query = " | ".join(
+                    [
+                        f"task={world_spec.get('task_name')}",
+                        f"metric={world_spec.get('metric')}",
+                        f"strategy={plan_spec.get('strategy')}",
+                        f"solver_spec={json.dumps(solver_spec or {}, ensure_ascii=False)}",
+                        f"recent_errors={json.dumps([self._truncate((o or {}).get('error'), 160) for o in prior_observations[-6:]], ensure_ascii=False)}",
+                    ]
+                )
+                rag_result = await self._rag_retrieve_context(
+                    agent_id=agent_id,
+                    action="experiment",
+                    run_id=None,
+                    paper_id=None,
+                    query_text=rag_query,
+                    quotas={"observation": 5, "diagnosis": 5, "method_card": 2, "data_card": 1, "note": 1},
+                    notes=notes,
+                    observations=prior_observations,
+                    data_card=data_card if isinstance(data_card, dict) else None,
+                    method_card=method_card if isinstance(method_card, dict) else None,
+                )
+                rag_block = self._format_rag_prompt_block(result=rag_result)
                 prompt = self._build_experiment_prompt(
                     world_spec=world_spec,
                     hypothesis=hypothesis,
@@ -2632,6 +5451,9 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                     method_card=method_card if isinstance(method_card, dict) else None,
                     exp_count=exp_count,
                     budget=budget,
+                    rag_context=rag_block.get("context", ""),
+                    rag_refs=rag_block.get("refs", []),
+                    rag_status=rag_block.get("status", ""),
                 )
                 llm_result = await self._call_llm_json(agent_id=agent_id, action_name="experiment", prompt=prompt)
                 if llm_result.get("ok") and isinstance(llm_result.get("data"), dict):
@@ -2696,6 +5518,20 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         await self._set_state(agent_id, "observations", observations)
         await self._set_state(agent_id, "run_history", observations)
         await self._set_state(agent_id, "exp_count", exp_count)
+        if self._rag_index_on_experiment:
+            rag_obs_docs = self._rag_docs_from_observation(
+                world_spec=world_spec,
+                agent_id=agent_id,
+                observation=observation,
+                action="experiment",
+            )
+            if rag_obs_docs:
+                await self._rag_index_documents(
+                    agent_id=agent_id,
+                    action="experiment",
+                    docs=rag_obs_docs,
+                    run_id=str(observation.get("run_id") or ""),
+                )
 
         score_norm = float((result or {}).get("score_norm", 0.0) or 0.0)
         dev_score_norm = (result or {}).get("dev_score_norm")
@@ -2706,8 +5542,23 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         )
         improvement = dev_score_norm - prev_best_dev
         reward = max(-0.06, min(0.12, 0.05 * dev_score_norm + 0.08 * improvement - 0.03 * cost))
+        flags = self._experiment_error_flags(result or {})
+        first_pass = self._is_first_pass_success(code_attempts=code_attempts, ok=bool((result or {}).get("ok", False))
+)
+        vram_eff = self._estimate_vram_efficiency(result=result or {}, world_spec=world_spec)
+        if bool((result or {}).get("ok", False)):
+            reward += self._experiment_success_reward
+            if first_pass:
+                reward += self._experiment_first_pass_bonus
+            if isinstance(vram_eff, (int, float)):
+                reward += self._experiment_vram_reward_weight * float(vram_eff)
+        if flags.get("oom", False):
+            reward -= self._experiment_oom_penalty
+        if flags.get("typeerror", False):
+            reward -= self._experiment_typeerror_penalty
         if not bool((result or {}).get("ok", False)):
-            reward = -0.02
+            reward = min(reward, -0.02)
+        reward = max(-1.0, min(2.0, float(reward)))
 
         # Keep an experiment -> review loop on taskboard for iterative refinement.
         if bool((result or {}).get("ok", False)):
@@ -2739,9 +5590,21 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                     "experiment_score_norm": float(score_norm),
                     "experiment_dev_score_norm": float(dev_score_norm),
                     "experiment_improvement": float(improvement),
+                    "experiment_first_pass_bonus": float(self._experiment_first_pass_bonus if first_pass else 0.0),
+                    "experiment_vram_efficiency": float(vram_eff) if isinstance(vram_eff, (int, float)) else 0.0,
+                    "experiment_oom_penalty": float(-self._experiment_oom_penalty if flags.get("oom", False) else 0.0),
+                    "experiment_typeerror_penalty": float(
+                        -self._experiment_typeerror_penalty if flags.get("typeerror", False) else 0.0
+                    ),
                 },
                 "run_config": run_config,
                 "llm_experiment_plan": llm_experiment_plan,
+                "engineering_diagnostics": {
+                    "first_pass_success": bool(first_pass),
+                    "oom_flag": bool(flags.get("oom", False)),
+                    "typeerror_flag": bool(flags.get("typeerror", False)),
+                    "vram_efficiency": float(vram_eff) if isinstance(vram_eff, (int, float)) else None,
+                },
             },
         )
         await self._append_trace(agent_id, "experiment", reward, ar.data or {})
@@ -2804,12 +5667,61 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             reverse=True,
         )[0]
         best_run_for_write = dict(best_run)
+        local_preflight = self._local_submission_format_check(str(best_run_for_write.get("submission_path") or ""))
+        if not bool(local_preflight.get("ok")):
+            ar = self._action_error(
+                "write",
+                "Write preflight failed before environment evaluation.",
+                effective_action="write",
+                detail={
+                    "precondition_failed": True,
+                    "reason": "local_format_check_failed",
+                    "local_preflight": local_preflight,
+                    "best_run_id": best_run_for_write.get("run_id"),
+                },
+            )
+            await self._append_trace(agent_id, "write", 0.0, ar.data or {})
+            return ar
+
         official_eval = await self.controller.run_environment(
             "science",
             "evaluate_submission",
             submission_path=best_run_for_write.get("submission_path"),
         )
         if not isinstance(official_eval, dict) or not bool(official_eval.get("ok")):
+            eval_reason = str((official_eval or {}).get("reason") or "")
+            eval_error_type = str((official_eval or {}).get("error_type") or "")
+            cache_hit = bool((official_eval or {}).get("cache_hit"))
+            cache_repeat_penalty = self._write_cache_repeat_penalty if cache_hit else 0.0
+            write_reward = -float(cache_repeat_penalty)
+            reward_components = {
+                "terminal_quality_reward": float(write_reward),
+                "learning_reward": float(write_reward),
+                "paper_write_reward": float(write_reward),
+                "write_eval_success_bonus": 0.0,
+                "write_format_pass_reward": 0.0,
+                "write_cache_repeat_penalty": float(-cache_repeat_penalty),
+            }
+            if self._write_defer_on_system_error and (
+                eval_error_type == "system_error" or eval_reason.startswith("system_error:")
+            ):
+                ar = ActionResult.success(
+                    method_name="write",
+                    message="Write deferred: evaluation environment precheck failed.",
+                    data={
+                        "ok": False,
+                        "deferred": True,
+                        "reason": "evaluation_system_error",
+                        "best_run_id": best_run_for_write.get("run_id"),
+                        "evaluate_submission": official_eval,
+                        "local_preflight": local_preflight,
+                        "reward": float(write_reward),
+                        "effective_action": "write",
+                        "reward_components": reward_components,
+                    },
+                )
+                await self._append_trace(agent_id, "write", write_reward, ar.data or {})
+                return ar
             ar = self._action_error(
                 "write",
                 "Final write requires successful test evaluation but evaluate_submission failed.",
@@ -2818,10 +5730,13 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                     "precondition_failed": True,
                     "reason": "evaluate_submission_failed",
                     "evaluate_submission": official_eval,
+                    "local_preflight": local_preflight,
                     "best_run_id": best_run_for_write.get("run_id"),
+                    "reward": float(write_reward),
+                    "reward_components": reward_components,
                 },
             )
-            await self._append_trace(agent_id, "write", 0.0, ar.data or {})
+            await self._append_trace(agent_id, "write", write_reward, ar.data or {})
             return ar
 
         best_run_for_write["metric_name"] = official_eval.get("metric_name") or best_run_for_write.get("metric_name")
@@ -2843,6 +5758,30 @@ class ResearchActionsPlugin(OtherActionsPlugin):
 
         llm_write_spec: Optional[Dict[str, Any]] = None
         if self._llm_ready("write"):
+            write_data_card = await self._get_state(agent_id, "data_card")
+            write_method_card = await self._get_state(agent_id, "method_card")
+            rag_query = " | ".join(
+                [
+                    f"task={world_spec.get('task_name')}",
+                    f"metric={metric_name}",
+                    f"best_run={json.dumps({'run_id': best_run_for_write.get('run_id'), 'score_norm': best_run_for_write.get('score_norm'), 'strategy': best_run_for_write.get('strategy')}, ensure_ascii=False)}",
+                    f"paper_claims_seed={json.dumps(hypothesis[:6], ensure_ascii=False)}",
+                ]
+            )
+            rag_result = await self._rag_retrieve_context(
+                agent_id=agent_id,
+                action="write",
+                run_id=str(best_run_for_write.get("run_id") or ""),
+                paper_id=None,
+                query_text=rag_query,
+                quotas={"observation": 3, "data_card": 2, "method_card": 2, "paper": 1, "review": 1, "note": 1},
+                notes=notes,
+                observations=observations,
+                data_card=write_data_card if isinstance(write_data_card, dict) else None,
+                method_card=write_method_card if isinstance(write_method_card, dict) else None,
+                paper=None,
+            )
+            rag_block = self._format_rag_prompt_block(result=rag_result)
             prompt = self._build_write_prompt(
                 world_spec=world_spec,
                 best_run=best_run_for_write,
@@ -2852,6 +5791,9 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 observation_refs=obs_refs_for_prompt,
                 notes=notes,
                 observations=observations,
+                rag_context=rag_block.get("context", ""),
+                rag_refs=rag_block.get("refs", []),
+                rag_status=rag_block.get("status", ""),
             )
             llm_result = await self._call_llm_json(agent_id=agent_id, action_name="write", prompt=prompt)
             if llm_result.get("ok") and isinstance(llm_result.get("data"), dict):
@@ -2879,6 +5821,10 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         paper_id = (submit_info or {}).get("paper_id")
         metrics = await self.controller.run_environment("science", "evaluate_paper", paper=paper, paper_id=paper_id)
         reward = float(metrics.get("fitness", 0.0) or 0.0)
+        eval_success_bonus = self._write_eval_success_bonus if bool(official_eval.get("ok", False)) else 0.0
+        format_pass_reward = self._write_format_pass_reward if bool((official_eval.get("preflight") or {}).get("ok", True)) else 0.0
+        cache_repeat_penalty = self._write_cache_repeat_penalty if (bool(official_eval.get("cache_hit")) and not bool(official_eval.get("ok"))) else 0.0
+        reward += float(eval_success_bonus) + float(format_pass_reward) - float(cache_repeat_penalty)
 
         contribution_credit = self._compute_contribution_credit(
             agent_id=agent_id,
@@ -2911,6 +5857,22 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             logger.warning(f"Failed to create follow-up tasks for {paper_id}: {e}")
 
         await self._log_paper_result(agent_id, paper_id, paper, metrics, source="write")
+        if self._rag_index_on_write:
+            rag_paper_docs = self._rag_docs_from_paper(
+                world_spec=world_spec,
+                agent_id=agent_id,
+                paper=paper,
+                paper_id=paper_id,
+                action="write",
+            )
+            if rag_paper_docs:
+                await self._rag_index_documents(
+                    agent_id=agent_id,
+                    action="write",
+                    docs=rag_paper_docs,
+                    run_id=str(best_run_for_write.get("run_id") or ""),
+                    paper_id=str(paper_id or ""),
+                )
         ar = ActionResult.success(
             method_name="write",
             message="AIRS submission written and evaluated.",
@@ -2927,6 +5889,9 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                     "terminal_quality_reward": float(reward),
                     "learning_reward": float(reward),
                     "paper_write_reward": float(reward),
+                    "write_eval_success_bonus": float(eval_success_bonus),
+                    "write_format_pass_reward": float(format_pass_reward),
+                    "write_cache_repeat_penalty": float(-cache_repeat_penalty),
                 },
             },
         )
@@ -2941,6 +5906,25 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         run_id: Optional[str] = None,
         submission: Optional[Dict[str, Any]] = None,
     ) -> ActionResult:
+        if self._strict_review_mode and not paper_id and not run_id:
+            ar = ActionResult.success(
+                method_name="review",
+                message="Review deferred: no paper_id or run_id available in strict mode.",
+                data={
+                    "ok": False,
+                    "review_deferred": True,
+                    "reason": "no_artifact_to_review",
+                    "reward": 0.0,
+                    "effective_action": "review",
+                    "reward_components": {
+                        "review_reward": 0.0,
+                        "learning_reward": 0.0,
+                    },
+                },
+            )
+            await self._append_trace(agent_id, "review", 0.0, ar.data or {})
+            return ar
+
         if paper_id:
             paper = await self.controller.run_environment("science", "get_paper", paper_id=paper_id)
             if paper:
@@ -2982,13 +5966,67 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                     replication_ok=bool(metrics.get("replication_ok", False)),
                 )
                 review_score = float(critique_quality.get("critique_score", 0.0) or 0.0)
-                reward = max(-0.08, min(0.12, 0.12 * review_score - 0.03))
+                paper_context = json.dumps(
+                    {
+                        "paper": {
+                            "title": (paper or {}).get("title"),
+                            "abstract": (paper or {}).get("abstract"),
+                            "citations": (paper or {}).get("citations"),
+                            "observation_refs": (paper or {}).get("observation_refs"),
+                        },
+                        "metrics": metrics,
+                    },
+                    ensure_ascii=False,
+                )
+                qgr_gate = await self._qgr_validate_review(
+                    review_note=review_note,
+                    issues=issues,
+                    context_text=paper_context,
+                )
+                await self._log_review_gate(agent_id=agent_id, paper_id=paper_id, run_id=None, gate=qgr_gate)
+                if not bool(qgr_gate.get("valid", False)):
+                    ar = self._action_error(
+                        "review",
+                        "QGR gate rejected review: quality below threshold.",
+                        effective_action="review",
+                        detail={
+                            "precondition_failed": True,
+                            "reason": "review_quality_below_threshold",
+                            "paper_id": paper_id,
+                            "qgr_gate": qgr_gate,
+                            "review_note": review_note,
+                        },
+                    )
+                    await self._append_trace(agent_id, "review", 0.0, ar.data or {})
+                    return ar
+
+                reward = float(self._qgr_base_reward)
+                quality_bonus = 0.0
+                if int((qgr_gate.get("metrics") or {}).get("citation_count", 0) or 0) >= self._qgr_min_citations:
+                    quality_bonus = float(self._qgr_quality_bonus)
+                    reward += quality_bonus
+                local_runs = await self._get_state(agent_id, "observations") or []
+                pred = self._qgr_predictive_bonus(
+                    issues=issues,
+                    run_history=local_runs,
+                    target_run_id=((paper or {}).get("claimed_results") or {}).get("run_id") if isinstance((paper or {}).get("claimed_results"), dict) else None,
+                )
+                predictive_bonus = float(pred.get("bonus", 0.0) or 0.0)
+                reward += predictive_bonus
+                reward += max(-0.08, min(0.10, 0.10 * review_score - 0.02))
+                reward = max(-0.3, min(2.5, reward))
 
                 validation_tasks = await self._spawn_review_validation_tasks(
                     paper_id=str(paper_id),
                     reviewer_id=agent_id,
                     review_note=review_note,
                     critique_quality=critique_quality,
+                )
+                followup_tasks = await self._spawn_qgr_followup_tasks(
+                    paper_id=str(paper_id),
+                    run_id=((paper or {}).get("claimed_results") or {}).get("run_id") if isinstance((paper or {}).get("claimed_results"), dict) else None,
+                    score=review_score,
+                    issues=issues,
                 )
 
                 if bool(metrics.get("replication_ok", False)) and int(critique_quality.get("issue_count", 0) or 0) <= 1:
@@ -3023,10 +6061,16 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                             "learning_reward": float(reward),
                             "review_critique_score": float(review_score),
                             "review_flattery_penalty": float(critique_quality.get("flattery_penalty", 0.0) or 0.0),
+                            "qgr_base_reward": float(self._qgr_base_reward),
+                            "qgr_quality_bonus": float(quality_bonus),
+                            "qgr_predictive_bonus": float(predictive_bonus),
                         },
                         "review_note": review_note,
                         "critique_quality": critique_quality,
+                        "qgr_gate": qgr_gate,
+                        "predictive_match": pred,
                         "validation_tasks": validation_tasks,
+                        "followup_tasks": followup_tasks,
                         "llm_used": llm_review_note is not None,
                         "self_review": self_review,
                     },
@@ -3040,6 +6084,22 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                     f"Paper {paper_id} not found.",
                     effective_action="review",
                     detail={"precondition_failed": True, "paper_id": paper_id, "reason": "paper_not_found"},
+                )
+                await self._append_trace(agent_id, "review", 0.0, ar.data or {})
+                return ar
+            if self._strict_review_mode:
+                ar = ActionResult.success(
+                    method_name="review",
+                    message=f"Review deferred: paper {paper_id} not found.",
+                    data={
+                        "ok": False,
+                        "review_deferred": True,
+                        "reason": "paper_not_found",
+                        "paper_id": paper_id,
+                        "reward": 0.0,
+                        "effective_action": "review",
+                        "reward_components": {"review_reward": 0.0, "learning_reward": 0.0},
+                    },
                 )
                 await self._append_trace(agent_id, "review", 0.0, ar.data or {})
                 return ar
@@ -3110,6 +6170,29 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 logger.warning(f"Failed to enqueue iterative experiment task: {e}")
 
             reward = 0.02
+            run_context = json.dumps({"latest": latest, "next_plan": next_plan}, ensure_ascii=False)
+            qgr_gate = await self._qgr_validate_review(
+                review_note=review_note,
+                issues=self._normalize_review_issues(review_note),
+                context_text=run_context,
+            )
+            await self._log_review_gate(agent_id=agent_id, paper_id=None, run_id=str(latest.get("run_id") or run_id or ""), gate=qgr_gate)
+            if not bool(qgr_gate.get("valid", False)):
+                ar = self._action_error(
+                    "review",
+                    "QGR gate rejected run-level review.",
+                    effective_action="review",
+                    detail={
+                        "precondition_failed": True,
+                        "reason": "review_quality_below_threshold",
+                        "run_id": latest.get("run_id") or run_id,
+                        "qgr_gate": qgr_gate,
+                        "review_note": review_note,
+                    },
+                )
+                await self._append_trace(agent_id, "review", 0.0, ar.data or {})
+                return ar
+
             ar = ActionResult.success(
                 method_name="review",
                 message="Run-level review completed and next experiment queued.",
@@ -3126,9 +6209,26 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                         "learning_reward": float(reward),
                         "review_iterative_planning_reward": float(reward),
                     },
+                    "qgr_gate": qgr_gate,
                 },
             )
             await self._append_trace(agent_id, "review", reward, ar.data or {})
+            return ar
+
+        if self._strict_review_mode:
+            ar = ActionResult.success(
+                method_name="review",
+                message="Review skipped in strict mode: no valid artifact context.",
+                data={
+                    "ok": False,
+                    "review_deferred": True,
+                    "reason": "strict_mode_no_valid_artifact",
+                    "reward": 0.0,
+                    "effective_action": "review",
+                    "reward_components": {"review_reward": 0.0, "learning_reward": 0.0},
+                },
+            )
+            await self._append_trace(agent_id, "review", 0.0, ar.data or {})
             return ar
 
         if submission is None:
@@ -3448,6 +6548,7 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         replication_signal = 0.0
         contradiction_bonus = 0.0
         confirmation_bonus = 0.0
+        support_ratio = 0.0
         if bool((replication_submit or {}).get("ok")):
             support = (replication_submit or {}).get("support") or {}
             support_ratio = self._clamp01(support.get("support_ratio", 0.0))
@@ -3456,6 +6557,8 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             confirmation_bonus = max(0.0, support_ratio - 0.5) / 0.5
             # Reward informative replication in both directions; detecting failure gets slightly higher credit.
             reward = 0.01 + 0.02 * replication_signal + 0.02 * contradiction_bonus + 0.01 * confirmation_bonus
+            if support_ratio >= self._replicate_support_threshold:
+                reward = max(float(reward), float(self._replicate_high_support_reward))
             paper_obj = await self.controller.run_environment("science", "get_paper", paper_id=target_paper_id)
             if paper_obj:
                 paper_metrics_after = await self.controller.run_environment(
@@ -3497,6 +6600,10 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                     "replication_signal": float(replication_signal),
                     "replication_contradiction_bonus": float(contradiction_bonus),
                     "replication_confirmation_bonus": float(confirmation_bonus),
+                    "replication_support_ratio": float(support_ratio),
+                    "replication_high_support_reward": float(
+                        self._replicate_high_support_reward if support_ratio >= self._replicate_support_threshold else 0.0
+                    ),
                 },
             },
         )
