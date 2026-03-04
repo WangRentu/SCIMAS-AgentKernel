@@ -253,45 +253,75 @@ def _prepare_fresh_run_logs(project_root: str) -> None:
 
 
 def _qdrant_reset_collection() -> None:
-    # Default behavior: clear RAG collection on each run to avoid cross-run accumulation.
+    # Default behavior: clear RAG collections on each run to avoid cross-run accumulation.
     if not _env_bool("SCIMAS_RESET_RAG_COLLECTION_ON_START", "1"):
         return
     if not _env_bool("SCIMAS_RAG_ENABLE", "1"):
         return
 
     qdrant_url = str(os.getenv("SCIMAS_RAG_QDRANT_URL", "http://127.0.0.1:6333") or "").strip().rstrip("/")
-    collection = str(os.getenv("SCIMAS_RAG_COLLECTION", "scimas_local_knowledge_v1") or "").strip()
     api_key = str(os.getenv("SCIMAS_RAG_QDRANT_API_KEY", "") or "").strip()
-    if not qdrant_url or not collection:
-        logger.warning("Skip RAG collection reset: missing SCIMAS_RAG_QDRANT_URL or SCIMAS_RAG_COLLECTION.")
+    reset_list_raw = str(os.getenv("SCIMAS_RAG_RESET_COLLECTIONS", "") or "").strip()
+    if reset_list_raw:
+        collections = [x.strip() for x in reset_list_raw.split(",") if x.strip()]
+    else:
+        collections = [
+            str(os.getenv("SCIMAS_RAG_COLLECTION", "scimas_local_knowledge_v1") or "").strip(),
+            str(os.getenv("SCIMAS_RAG_COLLECTION_LITERATURE", "literature_chunks") or "").strip(),
+            str(os.getenv("SCIMAS_RAG_COLLECTION_RUN_MEMORY", "run_memory") or "").strip(),
+        ]
+    deduped: list[str] = []
+    seen = set()
+    for name in collections:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        deduped.append(name)
+    if not qdrant_url or not deduped:
+        logger.warning(
+            "Skip RAG collection reset: missing SCIMAS_RAG_QDRANT_URL or effective collection list "
+            "(SCIMAS_RAG_RESET_COLLECTIONS / SCIMAS_RAG_COLLECTION*)."
+        )
         return
 
-    url = f"{qdrant_url}/collections/{collection}"
     headers = {}
     if api_key:
         headers["api-key"] = api_key
-    req = urllib.request.Request(url=url, headers=headers, method="DELETE")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            logger.info(
-                f"RAG collection reset: deleted {collection} at {qdrant_url} "
-                f"(status={getattr(resp, 'status', 200)})"
-            )
-    except urllib.error.HTTPError as e:
-        if int(getattr(e, "code", 0) or 0) == 404:
-            logger.info(f"RAG collection reset: collection {collection} not found, treated as clean.")
-        else:
-            body = ""
-            try:
-                body = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                body = str(e)
-            logger.warning(
-                f"RAG collection reset failed: status={getattr(e, 'code', None)} "
-                f"url={url} detail={body[:300]}"
-            )
-    except Exception as e:
-        logger.warning(f"RAG collection reset failed: url={url} error={e}")
+    deleted = 0
+    missing = 0
+    failed = 0
+    for collection in deduped:
+        url = f"{qdrant_url}/collections/{collection}"
+        req = urllib.request.Request(url=url, headers=headers, method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                deleted += 1
+                logger.info(
+                    f"RAG collection reset: deleted {collection} at {qdrant_url} "
+                    f"(status={getattr(resp, 'status', 200)})"
+                )
+        except urllib.error.HTTPError as e:
+            if int(getattr(e, "code", 0) or 0) == 404:
+                missing += 1
+                logger.info(f"RAG collection reset: collection {collection} not found, treated as clean.")
+            else:
+                failed += 1
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    body = str(e)
+                logger.warning(
+                    f"RAG collection reset failed: status={getattr(e, 'code', None)} "
+                    f"url={url} detail={body[:300]}"
+                )
+        except Exception as e:
+            failed += 1
+            logger.warning(f"RAG collection reset failed: url={url} error={e}")
+    logger.info(
+        "RAG collection reset summary: "
+        f"deleted={deleted}, missing={missing}, failed={failed}, total={len(deduped)}"
+    )
 
 
 def _prepare_sim_logs(project_root: str) -> None:

@@ -5,7 +5,7 @@
 # --- Global Simulation Configuration ---
 # Parameters for controlling overall simulator behavior.
 simulation:
-  max_ticks: 50          # Maximum time steps for simulation run
+  max_ticks: 200          # Maximum time steps for simulation run
   num_episodes: 1        # Run multiple episodes for evolution
 
 # --- Module Path Configuration ---

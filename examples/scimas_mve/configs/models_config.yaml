@@ -1,5 +1,5 @@
 - name: OpenAIProvider
-  model: "gpt-4-0613"
-  api_key: "your_openai_api_key"
-  base_url: "https://api.openai.com/v1"
+  model: your-model-name
+  api_key: "your-api-key"
+  base_url: "your-base-url"
   capabilities: ["chat"]

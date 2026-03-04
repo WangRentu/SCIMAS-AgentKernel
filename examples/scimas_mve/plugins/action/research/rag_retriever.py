@@ -56,6 +56,27 @@ class RagRetriever:
         rows.sort(key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
         return rows[: max(1, int(topk))]
 
+    def merge_rows(
+        self,
+        *,
+        vector_rows: List[Dict[str, Any]],
+        lexical_rows: List[Dict[str, Any]],
+        topk: int,
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen = set()
+        for row in (vector_rows or []) + (lexical_rows or []):
+            source_id = str((row or {}).get("source_id") or "")
+            source_type = str((row or {}).get("source_type") or "")
+            text = str((row or {}).get("text") or "")
+            key = f"{source_type}|{source_id}|{hash(text)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+        merged.sort(key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
+        return merged[: max(1, int(topk))]
+
     def rerank_results(
         self,
         *,
@@ -116,12 +137,15 @@ class RagRetriever:
         min_score: float,
         quotas: Dict[str, int],
         local_docs: List[Dict[str, Any]],
+        mode: str = "fallback",
+        vector_rows: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        source_rows: List[Dict[str, Any]] = []
+        source_rows: List[Dict[str, Any]] = list(vector_rows or [])
         status = "ok"
         fallback_reason = ""
+        retrieval_mode = str(mode or "fallback").strip().lower()
 
-        if self.store is not None:
+        if not source_rows and self.store is not None:
             ret = await self.store.search(query_text=query_text, topk=max(topk * 3, topk), min_score=min_score)
             if bool(ret.get("ok")):
                 source_rows = list(ret.get("results") or [])
@@ -129,13 +153,20 @@ class RagRetriever:
                 status = str(ret.get("status") or "degraded")
                 fallback_reason = str(ret.get("error") or ret.get("status") or "search_failed")
 
-        if not source_rows:
-            fallback_rows = self.token_fallback_search(query_text=query_text, local_docs=local_docs, topk=max(topk * 3, topk))
-            if fallback_rows:
-                source_rows = fallback_rows
-                status = "ok" if status == "ok" else f"{status}+token_fallback"
+        fallback_rows = self.token_fallback_search(query_text=query_text, local_docs=local_docs, topk=max(topk * 3, topk))
+        if retrieval_mode == "hybrid":
+            if source_rows or fallback_rows:
+                source_rows = self.merge_rows(vector_rows=source_rows, lexical_rows=fallback_rows, topk=max(topk * 3, topk))
+                status = "ok" if source_rows else status
             elif status == "ok":
                 status = "empty"
+        else:
+            if not source_rows:
+                if fallback_rows:
+                    source_rows = fallback_rows
+                    status = "ok" if status == "ok" else f"{status}+token_fallback"
+                elif status == "ok":
+                    status = "empty"
 
         selected = self.rerank_results(rows=source_rows, quotas=quotas, min_score=min_score)
         block = self.build_context(rows=selected)
@@ -143,6 +174,7 @@ class RagRetriever:
             "action": action,
             "status": status,
             "fallback_reason": fallback_reason,
+            "retrieval_mode": retrieval_mode,
             "query_text": query_text,
             "all_results": source_rows,
             "selected": selected,

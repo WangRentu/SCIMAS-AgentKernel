@@ -9,9 +9,16 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from examples.scimas_mve.visualization.trend_dashboard import build_dashboard_payload
+from examples.scimas_mve.visualization.trend_dashboard import (
+    build_dashboard_payload,
+    normalize_llm_io_rows,
+    normalize_rag_io_rows,
+    normalize_retrieve_evidence_rows,
+    normalize_retrieve_guardrail_rows,
+    normalize_retrieve_pipeline_rows,
+)
 
 
 def _json_bytes(data: Dict[str, Any]) -> bytes:
@@ -62,6 +69,7 @@ class LiveDashboardServer(ThreadingHTTPServer):
         self.static_dir = static_dir
         self.sse_interval_s = sse_interval_s
         self.snapshot_seq = 0
+        self.log_cache = LogCache()
 
     def build_snapshot(self) -> Tuple[Dict[str, Any], str]:
         payload = build_dashboard_payload(base_dir=self.base_dir)
@@ -74,6 +82,38 @@ class LiveDashboardServer(ThreadingHTTPServer):
         body = _json_bytes(payload)
         sig = hashlib.sha1(body).hexdigest()
         return payload, sig
+
+
+class LogCache:
+    """Lightweight mtime-based JSONL cache to avoid full rescans each SSE cycle."""
+
+    def __init__(self):
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def read_jsonl(self, path: str) -> list[Dict[str, Any]]:
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            self._cache[path] = {"mtime_ns": None, "size": None, "rows": []}
+            return []
+        cached = self._cache.get(path)
+        if cached and cached.get("mtime_ns") == st.st_mtime_ns and cached.get("size") == st.st_size:
+            return list(cached.get("rows") or [])
+        rows = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception:
+            rows = []
+        self._cache[path] = {"mtime_ns": st.st_mtime_ns, "size": st.st_size, "rows": rows}
+        return list(rows)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -106,6 +146,180 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    @staticmethod
+    def _qparam(params: Dict[str, list[str]], key: str, default: str = "") -> str:
+        vals = params.get(key) or []
+        if not vals:
+            return default
+        return str(vals[-1] or default)
+
+    @staticmethod
+    def _to_int(v: str, default: int) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _row_text(row: Dict[str, Any]) -> str:
+        try:
+            return json.dumps(row, ensure_ascii=False).lower()
+        except Exception:
+            return str(row).lower()
+
+    def _resolve_episode(self, rows: list[Dict[str, Any]], episode_param: str) -> int | None:
+        ep_raw = (episode_param or "").strip().lower()
+        if ep_raw in {"", "current"}:
+            eps = [int(r.get("episode_id") or 0) for r in rows if int(r.get("episode_id") or 0) > 0]
+            return max(eps) if eps else None
+        if ep_raw in {"all", "0"}:
+            return None
+        try:
+            ep = int(ep_raw)
+            return ep if ep > 0 else None
+        except Exception:
+            return None
+
+    def _filter_rows(
+        self,
+        rows: list[Dict[str, Any]],
+        *,
+        episode: int | None,
+        agent: str,
+        action: str,
+        task_id: str,
+        run_id: str,
+    ) -> list[Dict[str, Any]]:
+        out = []
+        agent_l = agent.lower().strip()
+        action_l = action.lower().strip()
+        task_l = task_id.lower().strip()
+        run_l = run_id.lower().strip()
+        for row in rows:
+            if episode is not None and int(row.get("episode_id") or 0) != int(episode):
+                continue
+            if agent_l and str(row.get("agent_id") or "").lower() != agent_l:
+                continue
+            if action_l and str(row.get("action") or "").lower() != action_l:
+                continue
+            row_text = ""
+            if task_l:
+                row_text = self._row_text(row)
+                if task_l not in row_text:
+                    continue
+            if run_l:
+                if not row_text:
+                    row_text = self._row_text(row)
+                if run_l not in row_text:
+                    continue
+            out.append(row)
+        return out
+
+    def _paginate(self, rows: list[Dict[str, Any]], *, cursor: str, limit: int) -> tuple[list[Dict[str, Any]], str]:
+        start = self._to_int(cursor, 0)
+        start = max(0, start)
+        lim = max(1, min(200, limit))
+        end = start + lim
+        sliced = rows[start:end]
+        next_cursor = str(end) if end < len(rows) else ""
+        return sliced, next_cursor
+
+    def _kind_conf(self, kind: str) -> tuple[str, Any]:
+        base = self.server.base_dir
+        if kind == "llm_io":
+            return os.path.join(base, "logs", "app", "audit", "llm_io.jsonl"), normalize_llm_io_rows
+        if kind == "rag_io":
+            return os.path.join(base, "logs", "app", "audit", "rag_io.jsonl"), normalize_rag_io_rows
+        if kind == "retrieve_pipeline":
+            return os.path.join(base, "logs", "app", "action", "retrieve_pipeline.jsonl"), normalize_retrieve_pipeline_rows
+        if kind == "retrieve_guardrail":
+            return os.path.join(base, "logs", "app", "action", "retrieve_guardrail.jsonl"), normalize_retrieve_guardrail_rows
+        if kind == "retrieve_evidence":
+            return os.path.join(base, "logs", "app", "action", "retrieve_evidence.jsonl"), normalize_retrieve_evidence_rows
+        return "", None
+
+    def _query_kind(self, *, kind: str, params: Dict[str, list[str]]) -> Dict[str, Any]:
+        path, normalizer = self._kind_conf(kind)
+        if not path or normalizer is None:
+            return {"ok": False, "error": f"unknown_kind:{kind}"}
+        raw_rows = self.server.log_cache.read_jsonl(path)
+        norm = normalizer(raw_rows, max_rows=3000)
+        summary_rows = list((norm or {}).get("rows_summary") or [])
+        detail_rows = list((norm or {}).get("rows_detail") or [])
+        details_by_id = {str(r.get("id") or ""): r for r in detail_rows if str(r.get("id") or "")}
+        summary_rows = sorted(summary_rows, key=lambda x: x.get("ts", ""), reverse=True)
+
+        episode_param = self._qparam(params, "episode", "current")
+        episode = self._resolve_episode(summary_rows, episode_param)
+        agent = self._qparam(params, "agent", "")
+        action = self._qparam(params, "action", "")
+        task_id = self._qparam(params, "task_id", "")
+        run_id = self._qparam(params, "run_id", "")
+        cursor = self._qparam(params, "cursor", "")
+        limit = self._to_int(self._qparam(params, "limit", "50"), 50)
+
+        filtered = self._filter_rows(
+            summary_rows,
+            episode=episode,
+            agent=agent,
+            action=action,
+            task_id=task_id,
+            run_id=run_id,
+        )
+        paged, next_cursor = self._paginate(filtered, cursor=cursor, limit=limit)
+        return {
+            "ok": True,
+            "kind": kind,
+            "rows": paged,
+            "next_cursor": next_cursor,
+            "total": len(filtered),
+            "episode": episode if episode is not None else "all",
+            "details_by_id": details_by_id,
+        }
+
+    def _fetch_detail(self, *, kind: str, item_id: str) -> Dict[str, Any]:
+        path, normalizer = self._kind_conf(kind)
+        if not path or normalizer is None:
+            return {"ok": False, "error": f"unknown_kind:{kind}"}
+        raw_rows = self.server.log_cache.read_jsonl(path)
+        norm = normalizer(raw_rows, max_rows=3000)
+        detail_rows = list((norm or {}).get("rows_detail") or [])
+        target = None
+        for row in detail_rows:
+            if str(row.get("id") or "") == str(item_id or ""):
+                target = row
+                break
+        if target is None:
+            return {"ok": False, "error": f"detail_not_found:{kind}:{item_id}"}
+
+        if kind == "retrieve_pipeline":
+            agent_id = str(target.get("agent_id") or "")
+            episode_id = int(target.get("episode_id") or 0)
+            ts = str(target.get("ts") or "")
+            guard_norm = normalize_retrieve_guardrail_rows(
+                self.server.log_cache.read_jsonl(os.path.join(self.server.base_dir, "logs", "app", "action", "retrieve_guardrail.jsonl")),
+                max_rows=3000,
+            )
+            evid_norm = normalize_retrieve_evidence_rows(
+                self.server.log_cache.read_jsonl(os.path.join(self.server.base_dir, "logs", "app", "action", "retrieve_evidence.jsonl")),
+                max_rows=3000,
+            )
+            guard_rows = [
+                r
+                for r in (guard_norm.get("rows_detail") or [])
+                if str(r.get("agent_id") or "") == agent_id and int(r.get("episode_id") or 0) == episode_id and str(r.get("ts") or "") <= ts
+            ]
+            evid_rows = [
+                r
+                for r in (evid_norm.get("rows_detail") or [])
+                if str(r.get("agent_id") or "") == agent_id and int(r.get("episode_id") or 0) == episode_id and str(r.get("ts") or "") <= ts
+            ]
+            target = dict(target)
+            target["related_guardrail"] = guard_rows[:3]
+            target["related_evidence"] = evid_rows[:3]
+
+        return {"ok": True, "kind": kind, "record": target}
+
     def _serve_sse(self) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -131,7 +345,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        params = parse_qs(parsed.query or "", keep_blank_values=True)
         if path in {"/", "/index.html"}:
             self._send_file("index.html", "text/html; charset=utf-8")
             return
@@ -147,6 +363,32 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/events":
             self._serve_sse()
+            return
+        if path == "/api/audit/llm":
+            out = self._query_kind(kind="llm_io", params=params)
+            self._send_json(HTTPStatus.OK if out.get("ok") else HTTPStatus.BAD_REQUEST, out)
+            return
+        if path == "/api/audit/rag":
+            out = self._query_kind(kind="rag_io", params=params)
+            self._send_json(HTTPStatus.OK if out.get("ok") else HTTPStatus.BAD_REQUEST, out)
+            return
+        if path == "/api/retrieve/pipeline":
+            out = self._query_kind(kind="retrieve_pipeline", params=params)
+            self._send_json(HTTPStatus.OK if out.get("ok") else HTTPStatus.BAD_REQUEST, out)
+            return
+        if path == "/api/retrieve/guardrail":
+            out = self._query_kind(kind="retrieve_guardrail", params=params)
+            self._send_json(HTTPStatus.OK if out.get("ok") else HTTPStatus.BAD_REQUEST, out)
+            return
+        if path == "/api/retrieve/evidence":
+            out = self._query_kind(kind="retrieve_evidence", params=params)
+            self._send_json(HTTPStatus.OK if out.get("ok") else HTTPStatus.BAD_REQUEST, out)
+            return
+        if path == "/api/audit/detail":
+            kind = self._qparam(params, "kind", "")
+            item_id = self._qparam(params, "id", "")
+            out = self._fetch_detail(kind=kind, item_id=item_id)
+            self._send_json(HTTPStatus.OK if out.get("ok") else HTTPStatus.NOT_FOUND, out)
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": f"unknown_path:{path}"})
 

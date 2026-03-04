@@ -21,6 +21,14 @@ const state = {
   inspectorWidth: 460,
   inspectorScrollByKey: {},
   lastInspectorKey: "",
+  ioScope: { episode: "current", agent: "", action: "" },
+  ioListByTab: {},
+  ioDetailById: {},
+  ioLoadingByTab: {},
+  ioLoadingByDetail: {},
+  ioLastSeenTs: {},
+  ioExpandedBlocks: {},
+  ioSelectionByTab: {},
 };
 
 function esc(s) {
@@ -37,6 +45,149 @@ function toLocal(ts) {
   } catch {
     return String(ts);
   }
+}
+
+function fmtNum(v, digits = 3) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "-";
+  return n.toFixed(digits);
+}
+
+function ioSetExpanded(key, value) {
+  state.ioExpandedBlocks[key] = !!value;
+}
+
+function ioIsExpanded(key, fallback = false) {
+  if (Object.prototype.hasOwnProperty.call(state.ioExpandedBlocks, key)) {
+    return !!state.ioExpandedBlocks[key];
+  }
+  return !!fallback;
+}
+
+function ioScopeParams() {
+  const params = new URLSearchParams();
+  const selected = state.selected?.value || {};
+  const episodeScope = String(state.ioScope.episode || "current").toLowerCase();
+  if (episodeScope === "all") {
+    params.set("episode", "all");
+  } else if (state.episode > 0) {
+    params.set("episode", String(state.episode));
+  } else {
+    params.set("episode", "current");
+  }
+  const agent = String(selected.owner || selected.agent_id || state.ioScope.agent || "").trim();
+  const action = String(selected.task_type || selected.action || state.ioScope.action || "").trim();
+  const taskId = String(selected.task_id || "").trim();
+  const runId = String(selected.run_id || "").trim();
+  if (agent) params.set("agent", agent);
+  if (action) params.set("action", action);
+  if (taskId) params.set("task_id", taskId);
+  if (runId) params.set("run_id", runId);
+  params.set("limit", "80");
+  return params;
+}
+
+function ioEndpointForTab(tab) {
+  if (tab === "llm_io") return "/api/audit/llm";
+  if (tab === "rag_io") return "/api/audit/rag";
+  if (tab === "retrieve") return "/api/retrieve/pipeline";
+  return "";
+}
+
+function ioKindForTab(tab) {
+  if (tab === "llm_io") return "llm_io";
+  if (tab === "rag_io") return "rag_io";
+  if (tab === "retrieve") return "retrieve_pipeline";
+  return "";
+}
+
+function ioCacheKey(tab) {
+  const params = ioScopeParams();
+  return `${tab}|${params.toString()}`;
+}
+
+async function fetchIoList(tab) {
+  const endpoint = ioEndpointForTab(tab);
+  if (!endpoint) return;
+  const key = ioCacheKey(tab);
+  if (state.ioLoadingByTab[key]) return;
+  state.ioLoadingByTab[key] = true;
+  try {
+    const params = ioScopeParams();
+    const res = await fetch(`${endpoint}?${params.toString()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`io_list_http_${res.status}`);
+    const data = await res.json();
+    state.ioListByTab[key] = data;
+    const rows = data.rows || [];
+    const prevTs = String(state.ioLastSeenTs[tab] || "");
+    if (rows.length && !prevTs) state.ioLastSeenTs[tab] = String(rows[0].ts || "");
+    if (!state.ioSelectionByTab[tab] && rows.length) state.ioSelectionByTab[tab] = String(rows[0].id || "");
+  } catch (e) {
+    state.ioListByTab[key] = { ok: false, error: String(e), rows: [] };
+  } finally {
+    state.ioLoadingByTab[key] = false;
+    renderInspector();
+  }
+}
+
+async function fetchIoDetail(kind, id) {
+  if (!kind || !id) return;
+  const key = `${kind}:${id}`;
+  if (state.ioDetailById[key] || state.ioLoadingByDetail[key]) return;
+  state.ioLoadingByDetail[key] = true;
+  try {
+    const res = await fetch(`/api/audit/detail?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`, {
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`io_detail_http_${res.status}`);
+    const data = await res.json();
+    state.ioDetailById[key] = data;
+  } catch (e) {
+    state.ioDetailById[key] = { ok: false, error: String(e), kind, record: null };
+  } finally {
+    state.ioLoadingByDetail[key] = false;
+    renderInspector();
+  }
+}
+
+function renderCollapsibleText(title, text, key, limit = 300) {
+  const raw = String(text || "");
+  const short = raw.length > limit ? `${raw.slice(0, limit)}...` : raw;
+  const expanded = ioIsExpanded(key, false);
+  return `
+    <div class="io-block">
+      <div class="io-block-head">
+        <div class="io-block-title">${esc(title)}</div>
+        <button class="io-mini-btn" data-io-toggle="${esc(key)}">${expanded ? "Collapse" : "Expand"}</button>
+      </div>
+      <pre>${esc(expanded ? raw : short)}</pre>
+    </div>
+  `;
+}
+
+function renderJsonTree(obj, keyPrefix = "json", depth = 0, maxDepth = 4) {
+  if (depth > maxDepth) return `<span class="muted">...</span>`;
+  if (obj == null) return `<span class="json-null">null</span>`;
+  if (typeof obj !== "object") return `<span class="json-leaf">${esc(String(obj))}</span>`;
+  if (Array.isArray(obj)) {
+    const items = obj.slice(0, 40).map((v, i) => `<li>${renderJsonTree(v, `${keyPrefix}.${i}`, depth + 1, maxDepth)}</li>`).join("");
+    return `<details class="json-tree" open><summary>[${obj.length}]</summary><ul>${items}</ul></details>`;
+  }
+  const entries = Object.entries(obj).slice(0, 80);
+  const body = entries
+    .map(([k, v]) => `<li><span class="json-key">${esc(k)}</span>: ${renderJsonTree(v, `${keyPrefix}.${k}`, depth + 1, maxDepth)}</li>`)
+    .join("");
+  return `<details class="json-tree" open><summary>{${entries.length}}</summary><ul>${body}</ul></details>`;
+}
+
+function bindIoToggles(container) {
+  container.querySelectorAll("[data-io-toggle]").forEach((btn) => {
+    btn.onclick = () => {
+      const key = btn.dataset.ioToggle || "";
+      ioSetExpanded(key, !ioIsExpanded(key));
+      renderInspector();
+    };
+  });
 }
 
 function setHealthDot(level) {
@@ -834,7 +985,7 @@ function renderInspector() {
     <div class="k">confidence</div><div>${task ? `${Math.round(estimateConfidence(task) * 100)}%` : "-"}</div>
   `;
 
-  const tabNames = ["overview", "code", "console", "artifacts", "reasoning", "paper", "compare"];
+  const tabNames = ["overview", "code", "console", "artifacts", "reasoning", "paper", "compare", "llm_io", "rag_io", "retrieve"];
   tabs.innerHTML = tabNames.map((n) => `<button class="tab-btn ${state.tab === n ? "active" : ""}" data-tab="${n}">${n}</button>`).join("");
   tabs.querySelectorAll("button").forEach((btn) => {
     btn.onclick = () => {
@@ -851,6 +1002,229 @@ function renderInspector() {
       content.scrollTop = y;
     });
   };
+
+  if (["llm_io", "rag_io", "retrieve"].includes(state.tab)) {
+    const key = ioCacheKey(state.tab);
+    const cache = state.ioListByTab[key];
+    if (!cache && !state.ioLoadingByTab[key]) {
+      content.innerHTML = `<div class="muted">Loading ${esc(state.tab)} ...</div>`;
+      fetchIoList(state.tab);
+      restoreScroll();
+      return;
+    }
+    if (state.ioLoadingByTab[key] && !cache) {
+      content.innerHTML = `<div class="muted">Loading ${esc(state.tab)} ...</div>`;
+      restoreScroll();
+      return;
+    }
+    if (!cache || !cache.ok) {
+      content.innerHTML = `<div class="muted">Failed to load ${esc(state.tab)}.</div><pre>${esc(cache?.error || "unknown_error")}</pre>`;
+      restoreScroll();
+      return;
+    }
+    const rows = cache.rows || [];
+    const tab = state.tab;
+    const selectedIoId = state.ioSelectionByTab[tab] || (rows[0] ? rows[0].id : "");
+    if (selectedIoId && !state.ioSelectionByTab[tab]) {
+      state.ioSelectionByTab[tab] = selectedIoId;
+    }
+    const kind = ioKindForTab(tab);
+    const detailKey = `${kind}:${selectedIoId}`;
+    const detail = selectedIoId ? state.ioDetailById[detailKey] : null;
+    if (selectedIoId && !detail && !state.ioLoadingByDetail[detailKey]) {
+      fetchIoDetail(kind, selectedIoId);
+    }
+
+    const lastSeenTs = String(state.ioLastSeenTs[tab] || "");
+    const listHtml = rows
+      .map((r) => {
+        const id = String(r.id || "");
+        const isSel = id === selectedIoId;
+        const ts = String(r.ts || "");
+        const isNew = !!lastSeenTs && ts > lastSeenTs;
+        const status = String(r.status || (r.ok_status ? "ok" : (r.ok_status === false ? "error" : "")));
+        const sub = [
+          r.agent_id ? `agent:${r.agent_id}` : "",
+          r.action ? `action:${r.action}` : "",
+          r.phase ? `phase:${r.phase}` : "",
+          r.operation ? `op:${r.operation}` : "",
+        ].filter(Boolean).join(" · ");
+        return `
+          <button class="io-list-item ${isSel ? "active" : ""}" data-io-row-id="${esc(id)}">
+            <div class="io-list-top">
+              <span class="io-list-title">${esc(toLocal(ts))}</span>
+              ${isNew ? '<span class="io-badge new">NEW</span>' : ""}
+              ${status ? `<span class="io-badge">${esc(status)}</span>` : ""}
+            </div>
+            <div class="io-list-sub">${esc(sub || "-")}</div>
+          </button>
+        `;
+      })
+      .join("");
+
+    let detailHtml = `<div class="muted">Select a record to view detail.</div>`;
+    if (selectedIoId) {
+      if (state.ioLoadingByDetail[detailKey] && !detail) {
+        detailHtml = `<div class="muted">Loading detail...</div>`;
+      } else if (detail && detail.ok) {
+        const rec = detail.record || {};
+        const metaKv = `
+          <div class="kv">
+            <div class="k">id</div><div>${esc(selectedIoId)}</div>
+            <div class="k">episode</div><div>${esc(rec.episode_id || "-")}</div>
+            <div class="k">task</div><div>${esc(rec.task_name || "-")}</div>
+            <div class="k">agent</div><div>${esc(rec.agent_id || "-")}</div>
+            <div class="k">action</div><div>${esc(rec.action || "-")}</div>
+            <div class="k">ts</div><div>${esc(toLocal(rec.ts || ""))}</div>
+          </div>
+        `;
+        if (tab === "llm_io") {
+          const promptKey = `llm_prompt_${selectedIoId}`;
+          const rawKey = `llm_raw_${selectedIoId}`;
+          detailHtml = `
+            <div class="io-block">
+              <div class="io-block-title">Meta</div>
+              ${metaKv}
+            </div>
+            <div class="io-block">
+              <div class="io-block-title">Prompt Summary</div>
+              <div class="kv">
+                <div class="k">prompt_chars</div><div>${esc(rec.prompt_chars)}</div>
+                <div class="k">response_chars</div><div>${esc(rec.response_chars)}</div>
+                <div class="k">ok</div><div>${esc(rec.ok_status)}</div>
+                <div class="k">reason</div><div>${esc(rec.reason || "-")}</div>
+              </div>
+            </div>
+            ${renderCollapsibleText("Prompt Body", rec.prompt || "", promptKey, 500)}
+            <div class="io-block">
+              <div class="io-block-title">Parsed Output</div>
+              <div class="json-host">${renderJsonTree(rec.parsed_json || {}, `llm_parsed_${selectedIoId}`)}</div>
+            </div>
+            ${renderCollapsibleText("Raw Response", rec.raw_response || "", rawKey, 500)}
+          `;
+        } else if (tab === "rag_io") {
+          const ctxKey = `rag_ctx_${selectedIoId}`;
+          detailHtml = `
+            <div class="io-block">
+              <div class="io-block-title">Meta</div>
+              ${metaKv}
+            </div>
+            <div class="io-block">
+              <div class="io-block-title">Operation</div>
+              <div class="kv">
+                <div class="k">operation</div><div>${esc(rec.operation || "-")}</div>
+                <div class="k">status</div><div>${esc(rec.status || "-")}</div>
+                <div class="k">fallback_reason</div><div>${esc(rec.fallback_reason || "-")}</div>
+                <div class="k">retrieval_mode</div><div>${esc(rec.retrieval_mode || "-")}</div>
+                <div class="k">selected_count</div><div>${esc(rec.selected_count || 0)}</div>
+              </div>
+            </div>
+            <div class="io-block">
+              <div class="io-block-title">Query Params</div>
+              <div class="json-host">${renderJsonTree({
+                query_text: rec.query_text || "",
+                collections: rec.collections || [],
+                quotas: rec.quotas || {},
+                refs: rec.refs || []
+              }, `rag_query_${selectedIoId}`)}</div>
+            </div>
+            <div class="io-block">
+              <div class="io-block-title">Selected Rows</div>
+              <div class="table-compact-wrap">
+                <table class="table-compact">
+                  <thead><tr><th>source</th><th>id</th><th>score</th><th>mode</th></tr></thead>
+                  <tbody>
+                    ${(rec.selected_rows || []).slice(0, 30).map((x) => `
+                      <tr>
+                        <td>${esc(x.source_type || "-")}</td>
+                        <td>${esc(x.source_id || "-")}</td>
+                        <td>${esc(fmtNum(x.score, 3))}</td>
+                        <td>${esc(x.retrieval_mode || "-")}</td>
+                      </tr>
+                    `).join("")}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            ${renderCollapsibleText("Context", rec.context || "", ctxKey, 500)}
+          `;
+        } else {
+          const payloadKey = `retrieve_payload_${selectedIoId}`;
+          detailHtml = `
+            <div class="io-block">
+              <div class="io-block-title">Meta</div>
+              ${metaKv}
+            </div>
+            <div class="io-block">
+              <div class="io-block-title">Pipeline Phase</div>
+              <div class="kv">
+                <div class="k">phase</div><div>${esc(rec.phase || "-")}</div>
+                <div class="k">source</div><div>${esc((rec.payload || {}).source || "-")}</div>
+                <div class="k">ok</div><div>${esc((rec.payload || {}).ok ?? true)}</div>
+                <div class="k">reward</div><div>${esc((rec.payload || {}).reward ?? "-")}</div>
+              </div>
+            </div>
+            ${renderCollapsibleText("Pipeline Payload", JSON.stringify(rec.payload || {}, null, 2), payloadKey, 700)}
+            <div class="io-block">
+              <div class="io-block-title">Guardrail (nearest)</div>
+              <div class="json-host">${renderJsonTree((rec.related_guardrail || [])[0] || {}, `retrieve_guard_${selectedIoId}`)}</div>
+            </div>
+            <div class="io-block">
+              <div class="io-block-title">Evidence (nearest)</div>
+              <div class="json-host">${renderJsonTree((rec.related_evidence || [])[0] || {}, `retrieve_evid_${selectedIoId}`)}</div>
+            </div>
+          `;
+        }
+      } else if (detail && !detail.ok) {
+        detailHtml = `<div class="muted">Detail not found.</div><pre>${esc(detail.error || "detail_not_found")}</pre>`;
+      }
+    }
+    const scopeVal = String(state.ioScope.episode || "current").toLowerCase() === "all" ? "all" : "current";
+    content.innerHTML = `
+      <div class="io-shell">
+        <div class="io-toolbar">
+          <label>
+            episode scope:
+            <select data-io-scope-episode>
+              <option value="current" ${scopeVal === "current" ? "selected" : ""}>current</option>
+              <option value="all" ${scopeVal === "all" ? "selected" : ""}>all</option>
+            </select>
+          </label>
+          <button class="io-mini-btn" data-io-refresh="1">Refresh</button>
+        </div>
+        <div class="io-list">${listHtml || '<div class="muted">No records.</div>'}</div>
+        <div class="io-detail">${detailHtml}</div>
+      </div>
+    `;
+    const scopeSelect = content.querySelector("[data-io-scope-episode]");
+    if (scopeSelect) {
+      scopeSelect.onchange = () => {
+        state.ioScope.episode = String(scopeSelect.value || "current");
+        state.ioSelectionByTab[tab] = "";
+        fetchIoList(tab);
+      };
+    }
+    const refreshBtn = content.querySelector("[data-io-refresh]");
+    if (refreshBtn) {
+      refreshBtn.onclick = () => {
+        const cacheKey = ioCacheKey(tab);
+        delete state.ioListByTab[cacheKey];
+        state.ioSelectionByTab[tab] = "";
+        fetchIoList(tab);
+      };
+    }
+    content.querySelectorAll("[data-io-row-id]").forEach((btn) => {
+      btn.onclick = () => {
+        const id = btn.dataset.ioRowId || "";
+        state.ioSelectionByTab[tab] = id;
+        if (id) fetchIoDetail(kind, id);
+        renderInspector();
+      };
+    });
+    bindIoToggles(content);
+    restoreScroll();
+    return;
+  }
 
   if (state.tab === "overview") {
     const relatedTaskRows = tasks

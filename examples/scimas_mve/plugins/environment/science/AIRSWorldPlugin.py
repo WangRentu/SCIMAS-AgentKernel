@@ -176,6 +176,11 @@ class AIRSWorldPlugin(SciencePluginBase):
             "false",
             "no",
         }
+        self._prepared_cache_persist_enable = os.getenv("SCIMAS_AIRS_PREPARED_CACHE_ENABLE", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
 
         self._write_min_completed_read = int(os.getenv("SCIMAS_WRITE_MIN_COMPLETED_READ", "1"))
         self._write_min_completed_experiment = int(os.getenv("SCIMAS_WRITE_MIN_COMPLETED_EXPERIMENT", "1"))
@@ -215,6 +220,13 @@ class AIRSWorldPlugin(SciencePluginBase):
         self.tasks_root = self._resolve_path(tasks_root, project_root=self._project_root)
         self.shared_data_dir = self._resolve_path(shared_data_dir, project_root=self._project_root)
         self.workspace_root = self._resolve_path(workspace_root, project_root=self._project_root)
+        prepared_cache_dir_cfg = str(
+            os.getenv("SCIMAS_AIRS_PREPARED_CACHE_DIR", "data/airs_prepared_cache") or "data/airs_prepared_cache"
+        ).strip()
+        self._prepared_cache_persist_root = self._resolve_path(
+            prepared_cache_dir_cfg,
+            project_root=self._project_root,
+        )
         self._all_agent_ids = self._load_agent_ids()
 
         self._task_log_path = os.path.join(self._project_root, "logs", "app", "environment", "taskboard.jsonl")
@@ -263,6 +275,8 @@ class AIRSWorldPlugin(SciencePluginBase):
         os.makedirs(os.path.dirname(self._eval_failure_log_path), exist_ok=True)
         os.makedirs(os.path.dirname(self._eval_cache_log_path), exist_ok=True)
         os.makedirs(self.workspace_root, exist_ok=True)
+        if self._prepared_cache_persist_enable:
+            os.makedirs(self._prepared_cache_persist_root, exist_ok=True)
         self._load_eval_cache_sync()
         logger.info(
             f"AIRSWorldPlugin initialized: tasks_root={self.tasks_root}, shared_data_dir={self.shared_data_dir}, "
@@ -2424,6 +2438,134 @@ class AIRSWorldPlugin(SciencePluginBase):
                 return True
         return any(root.iterdir()) if root.exists() else False
 
+    def _prepared_cache_ready_at(self, cache_dir: Path) -> bool:
+        if not cache_dir.exists():
+            return False
+        for split in ("train", "validation", "val", "dev", "test"):
+            if (cache_dir / split).exists():
+                return True
+        try:
+            return any(cache_dir.iterdir())
+        except Exception:
+            return False
+
+    def _raw_dataset_path_for_task(self, task: Dict[str, Any]) -> Path:
+        dataset_rel = str((task or {}).get("dataset_rel") or "").strip()
+        if dataset_rel:
+            return Path(self.shared_data_dir) / dataset_rel
+        dataset_name = str(((task or {}).get("logging_info") or {}).get("dataset") or "").strip()
+        if dataset_name:
+            return Path(self.shared_data_dir) / dataset_name
+        return Path(self.shared_data_dir)
+
+    def _raw_dataset_fingerprint_for_task(self, task: Dict[str, Any]) -> str:
+        path = self._raw_dataset_path_for_task(task)
+        if not path.exists():
+            return "missing"
+        try:
+            st = path.stat()
+            head = [f"{path}", f"{int(st.st_mtime)}", f"{int(st.st_size)}"]
+            if path.is_dir():
+                entries = sorted(path.iterdir(), key=lambda p: p.name)[:48]
+                for item in entries:
+                    try:
+                        ist = item.stat()
+                        head.append(f"{item.name}:{int(ist.st_mtime)}:{int(ist.st_size)}")
+                    except Exception:
+                        head.append(f"{item.name}:na")
+            return hashlib.sha1("|".join(head).encode("utf-8")).hexdigest()
+        except Exception:
+            return f"stat_error:{path.name}"
+
+    def _prepare_script_hash_for_task(self, task: Dict[str, Any]) -> str:
+        prepare_path = Path(str((task or {}).get("task_path") or "")) / "prepare.py"
+        if not prepare_path.exists():
+            return "missing_prepare"
+        try:
+            return self._file_sha256(str(prepare_path))
+        except Exception:
+            return "prepare_hash_error"
+
+    def _prepared_persistent_cache_key(self, task: Dict[str, Any]) -> str:
+        task_name = str((task or {}).get("task_name") or "").strip() or "unknown_task"
+        dataset_rel = str((task or {}).get("dataset_rel") or "").strip()
+        metric = str(((task or {}).get("logging_info") or {}).get("metric") or "").strip()
+        raw_fp = self._raw_dataset_fingerprint_for_task(task)
+        prep_hash = self._prepare_script_hash_for_task(task)
+        key_blob = "|".join(
+            [
+                "v1",
+                task_name,
+                dataset_rel,
+                metric,
+                raw_fp,
+                prep_hash,
+            ]
+        )
+        return hashlib.sha1(key_blob.encode("utf-8")).hexdigest()
+
+    def _prepared_persistent_cache_path(self, task: Dict[str, Any]) -> Path:
+        return Path(self._prepared_cache_persist_root) / self._prepared_persistent_cache_key(task)
+
+    def _try_load_prepared_cache_from_persistent(self, task: Dict[str, Any]) -> Optional[str]:
+        if not self._prepared_cache_persist_enable:
+            return None
+        target = self._prepared_persistent_cache_path(task)
+        if not self._prepared_cache_ready_at(target):
+            return None
+        self._prepared_data_cache_dir = str(target)
+        return str(target)
+
+    def _publish_prepared_cache_to_persistent(self, *, task: Dict[str, Any], local_cache_dir: str) -> Optional[str]:
+        if not self._prepared_cache_persist_enable:
+            return None
+        src = Path(str(local_cache_dir or ""))
+        if not self._prepared_cache_ready_at(src):
+            return None
+
+        target = self._prepared_persistent_cache_path(task)
+        if self._prepared_cache_ready_at(target):
+            return str(target)
+
+        root = Path(self._prepared_cache_persist_root)
+        root.mkdir(parents=True, exist_ok=True)
+        staging = root / f"{target.name}.__staging__.{uuid.uuid4().hex[:8]}"
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+
+        try:
+            for child in src.iterdir():
+                src_child = src / child.name
+                dst_child = staging / child.name
+                if src_child.is_dir():
+                    shutil.copytree(src_child, dst_child, dirs_exist_ok=True)
+                elif src_child.exists():
+                    shutil.copy2(src_child, dst_child)
+            meta = {
+                "created_at": datetime.utcnow().isoformat() + "Z",
+                "task_name": str((task or {}).get("task_name") or ""),
+                "dataset_rel": str((task or {}).get("dataset_rel") or ""),
+                "metric": str(((task or {}).get("logging_info") or {}).get("metric") or ""),
+                "prepare_hash": self._prepare_script_hash_for_task(task),
+                "raw_fingerprint": self._raw_dataset_fingerprint_for_task(task),
+                "cache_key": target.name,
+            }
+            with open(staging / "_cache_meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+
+            try:
+                os.replace(str(staging), str(target))
+            except Exception:
+                # Multi-process race fallback: if another writer published first, reuse it.
+                if not self._prepared_cache_ready_at(target):
+                    raise
+            return str(target)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+
     def _load_data_card_from_disk(self, profile_dir: Path) -> Optional[Dict[str, Any]]:
         card_path = profile_dir / "data_card.json"
         if not card_path.exists():
@@ -2692,6 +2834,39 @@ class AIRSWorldPlugin(SciencePluginBase):
         )
         self._method_card_cache = dict(method_card)
         return method_card
+
+    async def publish_method_card(
+        self,
+        method_card: Optional[Dict[str, Any]] = None,
+        agent_id: Optional[str] = None,
+        refresh: bool = False,
+    ) -> Dict[str, Any]:
+        del refresh
+        task = self._current_task
+        if not task:
+            await self.reset_episode()
+            task = self._current_task
+        if not task:
+            return {"ok": False, "reason": "no_active_task", "agent_id": agent_id}
+        if not isinstance(method_card, dict):
+            return {"ok": False, "reason": "invalid_method_card", "agent_id": agent_id}
+
+        card = dict(method_card)
+        card["ok"] = bool(card.get("ok", True))
+        card["card_type"] = "method_card"
+        card.setdefault("version", "v2")
+        card.setdefault("task_name", task.get("task_name"))
+        card.setdefault("metric", str((task.get("logging_info") or {}).get("metric") or ""))
+        card.setdefault("category", str((task.get("logging_info") or {}).get("category") or ""))
+        card["agent_id"] = agent_id
+        method_dir = Path(self._task_workspace()) / "_analysis" / "method_card"
+        method_dir.mkdir(parents=True, exist_ok=True)
+        (method_dir / "method_card.json").write_text(
+            json.dumps(card, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self._method_card_cache = dict(card)
+        return {"ok": True, "method_card": card, "agent_id": agent_id}
 
     def _next_run_id(self) -> str:
         self._run_seq += 1
@@ -3221,12 +3396,62 @@ class AIRSWorldPlugin(SciencePluginBase):
             "solver_mode": "code_agent",
             "stdout_tail": (run_result.stdout or "")[-1500:],
             "stderr_tail": (run_result.stderr or "")[-1500:],
+            "exit_code": int(run_result.exit_code),
             "executor_used": executor_name,
             "executor_fallback_used": fallback_used,
             "code_workspace": str(workspace_dir),
             "code_log_path": str(code_log_path),
             "code_artifacts": list(run_result.artifacts),
             "dev_eval": dev_eval,
+        }
+
+    def _load_code_agent_failure_from_log(self, agent_log_dir: str) -> Dict[str, Any]:
+        log_path = Path(agent_log_dir) / "code_run.json"
+        if not log_path.exists():
+            return {}
+        try:
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        run_result = payload.get("run_result")
+        if not isinstance(run_result, dict):
+            return {}
+        return {
+            "exit_code": run_result.get("exit_code"),
+            "stdout_tail": str(run_result.get("stdout") or "")[-1500:],
+            "stderr_tail": str(run_result.get("stderr") or "")[-1500:],
+        }
+
+    def _collect_split_columns(self, data_mount_dir: str, split_name: str) -> List[str]:
+        cols: List[str] = []
+        csv_path = Path(data_mount_dir) / f"{split_name}.csv"
+        if csv_path.exists():
+            try:
+                with csv_path.open("r", encoding="utf-8", newline="") as f:
+                    reader = csv.reader(f)
+                    header = next(reader, [])
+                cols = [str(c).strip() for c in header if str(c).strip()]
+            except Exception:
+                cols = []
+        if cols:
+            return cols[:256]
+
+        split_dir = Path(data_mount_dir) / split_name
+        if not split_dir.exists():
+            return []
+        try:
+            from datasets import load_from_disk
+
+            ds = load_from_disk(str(split_dir))
+            cols = [str(c).strip() for c in (getattr(ds, "column_names", []) or []) if str(c).strip()]
+        except Exception:
+            cols = []
+        return cols[:256]
+
+    def _collect_data_columns(self, data_mount_dir: str) -> Dict[str, List[str]]:
+        return {
+            "train": self._collect_split_columns(data_mount_dir=data_mount_dir, split_name="train"),
+            "test": self._collect_split_columns(data_mount_dir=data_mount_dir, split_name="test"),
         }
 
     def _run_solver_submission(
@@ -3554,10 +3779,23 @@ class AIRSWorldPlugin(SciencePluginBase):
         return {"prepare_stdout_tail": out[-1000:], "prepare_stderr_tail": err[-1000:]}
 
     def _ensure_prepared_data_cache(self, task: Dict[str, Any], run_agent_log_dir: str) -> Dict[str, Any]:
+        del run_agent_log_dir
         if self._solver_prepare_once and self._prepared_cache_ready():
-            return {"cache_dir": self._prepared_cache_dir(), "prepare_stdout_tail": ""}
+            return {"cache_dir": self._prepared_cache_dir(), "prepare_stdout_tail": "", "cache_scope": "episode"}
         if self._solver_prepare_once and self._prepared_data_cache_dir and (not Path(str(self._prepared_data_cache_dir)).exists()):
             self._prepared_data_cache_dir = None
+        if self._solver_prepare_once:
+            persistent_cache = self._try_load_prepared_cache_from_persistent(task)
+            if persistent_cache:
+                logger.info(
+                    f"AIRS prepare cache hit (cross-run): task={str((task or {}).get('task_name') or '')} "
+                    f"key={Path(persistent_cache).name}"
+                )
+                return {
+                    "cache_dir": persistent_cache,
+                    "prepare_stdout_tail": "",
+                    "cache_scope": "cross_run_persistent",
+                }
 
         base = Path(self._task_workspace())
         cache_data_dir = base / "_prepared_agent_data"
@@ -3589,10 +3827,16 @@ class AIRSWorldPlugin(SciencePluginBase):
             if stage_log_dir.exists():
                 shutil.rmtree(stage_log_dir, ignore_errors=True)
             raise
-        self._prepared_data_cache_dir = str(cache_data_dir)
+        final_cache_dir = str(cache_data_dir)
+        if self._solver_prepare_once:
+            persistent_cache = self._publish_prepared_cache_to_persistent(task=task, local_cache_dir=str(cache_data_dir))
+            if persistent_cache:
+                final_cache_dir = str(persistent_cache)
+        self._prepared_data_cache_dir = final_cache_dir
         return {
             "cache_dir": self._prepared_data_cache_dir,
             "prepare_stdout_tail": str(prepare_result.get("prepare_stdout_tail") or ""),
+            "cache_scope": "cross_run_persistent" if final_cache_dir != str(cache_data_dir) else "episode",
         }
 
     def _materialize_data_mount_from_cache(self, cache_dir: str, target_dir: str) -> None:
@@ -3877,6 +4121,16 @@ class AIRSWorldPlugin(SciencePluginBase):
                 "eval_split": "dev",
                 "failure_stage": "prepare",
                 "exit_code": None,
+                "code_agent_attempted": False,
+                "code_agent_ok": False,
+                "code_agent_error": "",
+                "code_agent_exit_code": None,
+                "code_agent_stdout_tail": "",
+                "code_agent_stderr_tail": "",
+                "fallback_solver_used": False,
+                "fallback_solver_ok": False,
+                "data_columns": {"train": [], "test": []},
+                "execution_path": "solver_only",
                 "executor_diag": {
                     "backend": self._code_executor_backend,
                     "timeout_hit": False,
@@ -3917,6 +4171,15 @@ class AIRSWorldPlugin(SciencePluginBase):
         executor_fallback_used = False
         failure_stage = "unknown"
         exit_code = None
+        code_agent_attempted = False
+        code_agent_ok = False
+        code_agent_error = ""
+        code_agent_exit_code = None
+        code_agent_stdout_tail = ""
+        code_agent_stderr_tail = ""
+        fallback_solver_used = False
+        fallback_solver_ok = False
+        data_columns: Dict[str, List[str]] = {"train": [], "test": []}
         executor_diag: Dict[str, Any] = {
             "backend": self._code_executor_backend,
             "timeout_hit": False,
@@ -3940,10 +4203,12 @@ class AIRSWorldPlugin(SciencePluginBase):
                         )
             prepare_stdout_tail = str(prepare_cache.get("prepare_stdout_tail") or "")
             self._materialize_data_mount_from_cache(str(prepare_cache.get("cache_dir") or ""), str(data_mount))
+            data_columns = self._collect_data_columns(data_mount_dir=str(data_mount))
 
             solver_result = None
             code_error = None
             if self._code_agent_enable:
+                code_agent_attempted = True
                 try:
                     code_result = self._run_code_submission(
                         task=task,
@@ -3953,14 +4218,27 @@ class AIRSWorldPlugin(SciencePluginBase):
                     )
                     if isinstance(code_result, dict) and code_result.get("submission_path"):
                         solver_result = code_result
+                        code_agent_ok = True
+                        code_agent_exit_code = int(code_result.get("exit_code", 0))
+                        code_agent_stdout_tail = str(code_result.get("stdout_tail") or "")
+                        code_agent_stderr_tail = str(code_result.get("stderr_tail") or "")
                 except Exception as e:
                     code_error = str(e)
+                    code_agent_ok = False
+                    code_agent_error = code_error
+                    code_failure = self._load_code_agent_failure_from_log(agent_log_dir=str(agent_log))
+                    raw_exit = code_failure.get("exit_code")
+                    if isinstance(raw_exit, int):
+                        code_agent_exit_code = raw_exit
+                    code_agent_stdout_tail = str(code_failure.get("stdout_tail") or "")[-1500:]
+                    code_agent_stderr_tail = str(code_failure.get("stderr_tail") or "")[-1500:]
                     fallback_reason = f"code_agent:{code_error}"
                     failure_stage = "execute"
                     logger.info(f"AIRS code-agent fallback on {task.get('task_name')}/{run_id}: {code_error}")
 
             solver_error = None
             if solver_result is None and self._solver_enabled:
+                fallback_solver_used = bool(code_agent_attempted and not code_agent_ok)
                 try:
                     solver_result = self._run_solver_submission(
                         task=task,
@@ -3968,9 +4246,11 @@ class AIRSWorldPlugin(SciencePluginBase):
                         agent_log_dir=str(agent_log),
                         config=config or {},
                     )
+                    fallback_solver_ok = isinstance(solver_result, dict) and bool(solver_result.get("submission_path"))
                 except Exception as e:
                     solver_error = str(e)
                     fallback_reason = solver_error
+                    fallback_solver_ok = False
                     failure_stage = "execute"
                     logger.info(f"AIRS solver fallback on {task.get('task_name')}/{run_id}: {solver_error}")
 
@@ -4010,6 +4290,8 @@ class AIRSWorldPlugin(SciencePluginBase):
                 )
                 solver_mode = "rule_template_fallback"
                 failure_stage = "format"
+                fallback_solver_used = bool(code_agent_attempted and not code_agent_ok)
+                fallback_solver_ok = False
 
             metric_name = str((task.get("logging_info") or {}).get("metric") or "")
             if isinstance(dev_score, (int, float)):
@@ -4030,13 +4312,22 @@ class AIRSWorldPlugin(SciencePluginBase):
 
         ended = datetime.utcnow()
         elapsed_s = max(0.0, (ended - started).total_seconds())
-        merged_err = f"{error or ''}\n{stderr_tail or ''}\n{stdout_tail or ''}".lower()
+        merged_err = (
+            f"{error or ''}\n{stderr_tail or ''}\n{stdout_tail or ''}\n"
+            f"{code_agent_error or ''}\n{code_agent_stderr_tail or ''}\n{code_agent_stdout_tail or ''}"
+        ).lower()
         if "timed out" in merged_err or "timeout" in merged_err:
             executor_diag["timeout_hit"] = True
         if "out of memory" in merged_err or "oom" in merged_err:
             executor_diag["memory_hit"] = True
         if "killed" in merged_err:
             executor_diag["killed"] = True
+        if code_agent_attempted and code_agent_ok:
+            execution_path = "code_agent_only"
+        elif code_agent_attempted:
+            execution_path = "code_agent_fail_fallback_solver"
+        else:
+            execution_path = "solver_only"
         run_record = {
             "run_id": run_id,
             "ts": started.isoformat() + "Z",
@@ -4069,6 +4360,16 @@ class AIRSWorldPlugin(SciencePluginBase):
             "eval_split": "dev",
             "failure_stage": failure_stage,
             "exit_code": exit_code if isinstance(exit_code, int) else None,
+            "code_agent_attempted": bool(code_agent_attempted),
+            "code_agent_ok": bool(code_agent_ok),
+            "code_agent_error": str(code_agent_error or ""),
+            "code_agent_exit_code": code_agent_exit_code if isinstance(code_agent_exit_code, int) else None,
+            "code_agent_stdout_tail": str(code_agent_stdout_tail or ""),
+            "code_agent_stderr_tail": str(code_agent_stderr_tail or ""),
+            "fallback_solver_used": bool(fallback_solver_used),
+            "fallback_solver_ok": bool(fallback_solver_ok),
+            "data_columns": data_columns if isinstance(data_columns, dict) else {"train": [], "test": []},
+            "execution_path": execution_path,
             "executor_diag": executor_diag,
         }
         self._score_cache.append(run_record)

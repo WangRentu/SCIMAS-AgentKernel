@@ -125,9 +125,11 @@ class RagStore:
             vectors.append([float(x) for x in emb])
         return vectors
 
-    async def _ensure_collection(self, vector_size: int) -> bool:
+    async def _ensure_collection(self, vector_size: int, *, collection: Optional[str] = None) -> bool:
         base = self.cfg.qdrant_url.rstrip("/")
-        name = self.cfg.collection
+        name = str(collection or self.cfg.collection).strip()
+        if not name:
+            return False
         headers = {}
         if self.cfg.qdrant_api_key:
             headers["api-key"] = self.cfg.qdrant_api_key
@@ -217,6 +219,36 @@ class RagStore:
             },
         }
 
+    async def ensure_collections(self, collections: List[str]) -> Dict[str, Any]:
+        if not self.cfg.enable:
+            return {"ok": False, "status": "disabled", "collections": {}}
+        names = []
+        seen = set()
+        for name in collections or []:
+            n = str(name or "").strip()
+            if not n or n in seen:
+                continue
+            seen.add(n)
+            names.append(n)
+        if not names:
+            return {"ok": False, "status": "empty", "collections": {}}
+        probe = await self._embed_texts(["scimas_rag_bootstrap"])
+        if not probe or not probe[0]:
+            return {"ok": False, "status": "degraded:embed_unavailable", "collections": {}, "error": "embed_probe_failed"}
+        vector_size = len(probe[0])
+        details: Dict[str, Dict[str, Any]] = {}
+        all_ok = True
+        for name in names:
+            ok = await self._ensure_collection(vector_size=vector_size, collection=name)
+            details[name] = {"ok": bool(ok), "vector_size": int(vector_size)}
+            if not ok:
+                all_ok = False
+        return {
+            "ok": all_ok,
+            "status": "ok" if all_ok else "degraded:ensure_collection_failed",
+            "collections": details,
+        }
+
     def build_points(self, docs: List[Dict[str, Any]], vectors: List[List[float]]) -> List[Dict[str, Any]]:
         points: List[Dict[str, Any]] = []
         for doc, vec in zip(docs, vectors):
@@ -247,7 +279,12 @@ class RagStore:
             points.append({"id": pid, "vector": vec, "payload": payload})
         return points
 
-    async def upsert_documents(self, docs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    async def upsert_documents(
+        self,
+        docs: List[Dict[str, Any]],
+        *,
+        collection: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if not self.cfg.enable:
             return {"ok": False, "status": "disabled", "indexed_points": 0}
         if not docs:
@@ -285,7 +322,8 @@ class RagStore:
         vector_size = len(vectors[0]) if vectors else 0
         if vector_size <= 0:
             return {"ok": False, "status": "degraded:empty_vector", "indexed_points": 0}
-        collection_ok = await self._ensure_collection(vector_size)
+        target_collection = str(collection or self.cfg.collection).strip()
+        collection_ok = await self._ensure_collection(vector_size, collection=target_collection)
         if not collection_ok:
             return {"ok": False, "status": "degraded:qdrant_unavailable", "indexed_points": 0}
 
@@ -297,7 +335,7 @@ class RagStore:
         payload = {"points": points}
         ret = await self._http_json_async(
             method="PUT",
-            url=f"{base}/collections/{self.cfg.collection}/points?wait=true",
+            url=f"{base}/collections/{target_collection}/points?wait=true",
             payload=payload,
             headers=headers,
         )
@@ -313,9 +351,17 @@ class RagStore:
             "status": "ok",
             "indexed_points": len(points),
             "documents": len(docs),
+            "collection": target_collection,
         }
 
-    async def search(self, *, query_text: str, topk: int, min_score: float = 0.0) -> Dict[str, Any]:
+    async def search(
+        self,
+        *,
+        query_text: str,
+        topk: int,
+        min_score: float = 0.0,
+        collection: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if not self.cfg.enable:
             return {"ok": False, "status": "disabled", "results": []}
         q = str(query_text or "").strip()
@@ -337,9 +383,20 @@ class RagStore:
             "with_payload": True,
             "with_vector": False,
         }
+        target_collection = str(collection or self.cfg.collection).strip()
+        if not target_collection:
+            return {"ok": False, "status": "degraded:collection_missing", "results": []}
+        if not await self._ensure_collection(len(vector), collection=target_collection):
+            return {
+                "ok": False,
+                "status": "degraded:qdrant_collection_init_failed",
+                "results": [],
+                "collection": target_collection,
+            }
+
         ret = await self._http_json_async(
             method="POST",
-            url=f"{base}/collections/{self.cfg.collection}/points/search",
+            url=f"{base}/collections/{target_collection}/points/search",
             payload=payload,
             headers=headers,
         )

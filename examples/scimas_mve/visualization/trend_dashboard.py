@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -46,6 +47,266 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
             except Exception:
                 continue
     return rows
+
+
+def _sha1_id(prefix: str, payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
+    return f"{prefix}:{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _extract_text(v: Any) -> str:
+    if isinstance(v, dict):
+        if isinstance(v.get("text"), str):
+            return str(v.get("text") or "")
+        return json.dumps(v, ensure_ascii=False)
+    return str(v or "")
+
+
+def _clip(v: Any, n: int = 300) -> str:
+    s = _extract_text(v)
+    return s[:n]
+
+
+def _normalize_llm_io_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    rows = _latest_by_reset(rows, "episode_id")
+    summary: List[Dict[str, Any]] = []
+    detail: List[Dict[str, Any]] = []
+    for rec in rows[-max_rows:]:
+        meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+        inp = rec.get("input") if isinstance(rec.get("input"), dict) else {}
+        out = rec.get("output") if isinstance(rec.get("output"), dict) else {}
+        prompt_obj = inp.get("prompt")
+        prompt_text = _extract_text(prompt_obj)
+        raw_obj = out.get("raw_response")
+        raw_text = _extract_text(raw_obj)
+        parsed = out.get("parsed_json")
+        record = {
+            "id": _sha1_id("llm", {"meta": meta, "prompt": prompt_text[:512], "raw": raw_text[:512]}),
+            "ts": str(meta.get("ts") or ""),
+            "tick": _to_int(meta.get("tick"), 0),
+            "episode_id": _to_int(meta.get("episode_id"), 0),
+            "task_name": str(meta.get("task_name") or ""),
+            "agent_id": str(meta.get("agent_id") or ""),
+            "action": str(meta.get("action") or ""),
+            "kind": str(meta.get("kind") or ""),
+            "ok_status": bool(out.get("ok", False)),
+            "reason": str(out.get("reason") or ""),
+            "prompt_chars": len(prompt_text),
+            "response_chars": len(raw_text),
+            "prompt_preview": _clip(prompt_text, 260),
+            "response_preview": _clip(raw_text, 260),
+            "has_parsed_json": isinstance(parsed, (dict, list)),
+            "prompt": prompt_text,
+            "raw_response": raw_text,
+            "parsed_json": parsed if isinstance(parsed, (dict, list)) else {},
+            "record": rec,
+        }
+        summary.append(
+            {
+                "id": record["id"],
+                "ts": record["ts"],
+                "tick": record["tick"],
+                "episode_id": record["episode_id"],
+                "task_name": record["task_name"],
+                "agent_id": record["agent_id"],
+                "action": record["action"],
+                "ok_status": record["ok_status"],
+                "reason": record["reason"],
+                "prompt_chars": record["prompt_chars"],
+                "response_chars": record["response_chars"],
+                "prompt_preview": record["prompt_preview"],
+                "response_preview": record["response_preview"],
+            }
+        )
+        detail.append(record)
+    summary = sorted(summary, key=lambda x: x.get("ts", ""), reverse=True)
+    detail = sorted(detail, key=lambda x: x.get("ts", ""), reverse=True)
+    return {"rows_summary": summary, "rows_detail": detail}
+
+
+def _normalize_rag_io_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    rows = _latest_by_reset(rows, "episode_id")
+    summary: List[Dict[str, Any]] = []
+    detail: List[Dict[str, Any]] = []
+    for rec in rows[-max_rows:]:
+        meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+        inp = rec.get("input") if isinstance(rec.get("input"), dict) else {}
+        out = rec.get("output") if isinstance(rec.get("output"), dict) else {}
+        selected_rows = out.get("selected_rows") if isinstance(out.get("selected_rows"), list) else []
+        record = {
+            "id": _sha1_id("rag", {"meta": meta, "in": inp, "out": {"status": out.get("status"), "rows": len(selected_rows)}}),
+            "ts": str(meta.get("ts") or ""),
+            "episode_id": _to_int(meta.get("episode_id"), 0),
+            "task_name": str(meta.get("task_name") or ""),
+            "agent_id": str(meta.get("agent_id") or ""),
+            "action": str(meta.get("action") or ""),
+            "operation": str(meta.get("operation") or ""),
+            "run_id": str(meta.get("run_id") or ""),
+            "paper_id": str(meta.get("paper_id") or ""),
+            "status": str(out.get("status") or ""),
+            "fallback_reason": str(out.get("fallback_reason") or ""),
+            "result_count": _to_int(out.get("result_count"), 0),
+            "selected_count": _to_int(out.get("selected_count"), 0),
+            "retrieval_mode": str(out.get("retrieval_mode") or inp.get("retrieve_mode") or ""),
+            "query_text": _extract_text(inp.get("query_text")),
+            "collections": inp.get("collections") if isinstance(inp.get("collections"), list) else [],
+            "quotas": inp.get("quotas") if isinstance(inp.get("quotas"), dict) else {},
+            "selected_rows": selected_rows[:40],
+            "refs": out.get("refs") if isinstance(out.get("refs"), list) else [],
+            "context": _extract_text(out.get("context")),
+            "record": rec,
+        }
+        summary.append(
+            {
+                "id": record["id"],
+                "ts": record["ts"],
+                "episode_id": record["episode_id"],
+                "task_name": record["task_name"],
+                "agent_id": record["agent_id"],
+                "action": record["action"],
+                "operation": record["operation"],
+                "status": record["status"],
+                "fallback_reason": record["fallback_reason"],
+                "selected_count": record["selected_count"],
+                "retrieval_mode": record["retrieval_mode"],
+                "query_preview": _clip(record["query_text"], 220),
+            }
+        )
+        detail.append(record)
+    summary = sorted(summary, key=lambda x: x.get("ts", ""), reverse=True)
+    detail = sorted(detail, key=lambda x: x.get("ts", ""), reverse=True)
+    return {"rows_summary": summary, "rows_detail": detail}
+
+
+def _normalize_retrieve_pipeline_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    rows = _latest_by_reset(rows, "episode_id")
+    summary: List[Dict[str, Any]] = []
+    detail: List[Dict[str, Any]] = []
+    for rec in rows[-max_rows:]:
+        payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+        row = {
+            "id": _sha1_id("retrieve_pipeline", {"ts": rec.get("ts"), "agent_id": rec.get("agent_id"), "phase": rec.get("phase"), "payload": payload}),
+            "ts": str(rec.get("ts") or ""),
+            "episode_id": _to_int(rec.get("episode_id"), 0),
+            "task_name": str(rec.get("task_name") or ""),
+            "agent_id": str(rec.get("agent_id") or ""),
+            "phase": str(rec.get("phase") or ""),
+            "refresh": bool(rec.get("refresh", False)),
+            "payload": payload,
+            "record": rec,
+        }
+        summary.append(
+            {
+                "id": row["id"],
+                "ts": row["ts"],
+                "episode_id": row["episode_id"],
+                "task_name": row["task_name"],
+                "agent_id": row["agent_id"],
+                "phase": row["phase"],
+                "ok": bool((payload or {}).get("ok", True)),
+                "source": str((payload or {}).get("source") or ""),
+                "reward": (payload or {}).get("reward"),
+            }
+        )
+        detail.append(row)
+    summary = sorted(summary, key=lambda x: x.get("ts", ""), reverse=True)
+    detail = sorted(detail, key=lambda x: x.get("ts", ""), reverse=True)
+    return {"rows_summary": summary, "rows_detail": detail}
+
+
+def _normalize_retrieve_guardrail_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    rows = _latest_by_reset(rows, "episode_id")
+    summary: List[Dict[str, Any]] = []
+    detail: List[Dict[str, Any]] = []
+    for rec in rows[-max_rows:]:
+        quality = rec.get("quality") if isinstance(rec.get("quality"), dict) else {}
+        row = {
+            "id": _sha1_id("retrieve_guardrail", {"ts": rec.get("ts"), "agent_id": rec.get("agent_id"), "quality": quality}),
+            "ts": str(rec.get("ts") or ""),
+            "episode_id": _to_int(rec.get("episode_id"), 0),
+            "task_name": str(rec.get("task_name") or ""),
+            "agent_id": str(rec.get("agent_id") or ""),
+            "source": str(rec.get("source") or ""),
+            "quality": quality,
+            "record": rec,
+        }
+        summary.append(
+            {
+                "id": row["id"],
+                "ts": row["ts"],
+                "episode_id": row["episode_id"],
+                "task_name": row["task_name"],
+                "agent_id": row["agent_id"],
+                "source": row["source"],
+                "level": str(quality.get("level") or ""),
+                "degraded": bool(quality.get("degraded", False)),
+                "citation_coverage": _to_float(quality.get("citation_coverage"), 0.0),
+                "executable_minimum": bool(quality.get("executable_minimum", False)),
+            }
+        )
+        detail.append(row)
+    summary = sorted(summary, key=lambda x: x.get("ts", ""), reverse=True)
+    detail = sorted(detail, key=lambda x: x.get("ts", ""), reverse=True)
+    return {"rows_summary": summary, "rows_detail": detail}
+
+
+def _normalize_retrieve_evidence_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    rows = _latest_by_reset(rows, "episode_id")
+    summary: List[Dict[str, Any]] = []
+    detail: List[Dict[str, Any]] = []
+    for rec in rows[-max_rows:]:
+        evidence = rec.get("evidence") if isinstance(rec.get("evidence"), list) else []
+        row = {
+            "id": _sha1_id("retrieve_evidence", {"ts": rec.get("ts"), "agent_id": rec.get("agent_id"), "count": len(evidence)}),
+            "ts": str(rec.get("ts") or ""),
+            "episode_id": _to_int(rec.get("episode_id"), 0),
+            "task_name": str(rec.get("task_name") or ""),
+            "agent_id": str(rec.get("agent_id") or ""),
+            "rag_status": str(rec.get("rag_status") or ""),
+            "evidence_count": _to_int(rec.get("evidence_count"), len(evidence)),
+            "evidence": evidence[:60],
+            "record": rec,
+        }
+        summary.append(
+            {
+                "id": row["id"],
+                "ts": row["ts"],
+                "episode_id": row["episode_id"],
+                "task_name": row["task_name"],
+                "agent_id": row["agent_id"],
+                "rag_status": row["rag_status"],
+                "evidence_count": row["evidence_count"],
+            }
+        )
+        detail.append(row)
+    summary = sorted(summary, key=lambda x: x.get("ts", ""), reverse=True)
+    detail = sorted(detail, key=lambda x: x.get("ts", ""), reverse=True)
+    return {"rows_summary": summary, "rows_detail": detail}
+
+
+def _collect_llm_io(base_dir: str, max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    path = os.path.join(base_dir, "logs", "app", "audit", "llm_io.jsonl")
+    return _normalize_llm_io_rows(_read_jsonl(path), max_rows=max_rows)
+
+
+def _collect_rag_io(base_dir: str, max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    path = os.path.join(base_dir, "logs", "app", "audit", "rag_io.jsonl")
+    return _normalize_rag_io_rows(_read_jsonl(path), max_rows=max_rows)
+
+
+def _collect_retrieve_pipeline(base_dir: str, max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    path = os.path.join(base_dir, "logs", "app", "action", "retrieve_pipeline.jsonl")
+    return _normalize_retrieve_pipeline_rows(_read_jsonl(path), max_rows=max_rows)
+
+
+def _collect_retrieve_guardrail(base_dir: str, max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    path = os.path.join(base_dir, "logs", "app", "action", "retrieve_guardrail.jsonl")
+    return _normalize_retrieve_guardrail_rows(_read_jsonl(path), max_rows=max_rows)
+
+
+def _collect_retrieve_evidence(base_dir: str, max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    path = os.path.join(base_dir, "logs", "app", "action", "retrieve_evidence.jsonl")
+    return _normalize_retrieve_evidence_rows(_read_jsonl(path), max_rows=max_rows)
 
 
 def _latest_by_reset(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
@@ -683,6 +944,11 @@ def _build_dashboard_payload(base_dir: str) -> Dict[str, Any]:
     code_loops = _collect_code_loop_logs(base_dir)
     precondition_gates = _collect_precondition_gates(base_dir)
     eval_failures = _collect_eval_failures(base_dir)
+    llm_io = _collect_llm_io(base_dir, max_rows=800)
+    rag_io = _collect_rag_io(base_dir, max_rows=800)
+    retrieve_pipeline = _collect_retrieve_pipeline(base_dir, max_rows=800)
+    retrieve_guardrail = _collect_retrieve_guardrail(base_dir, max_rows=800)
+    retrieve_evidence = _collect_retrieve_evidence(base_dir, max_rows=800)
 
     state_counts = Counter([str(x.get("state") or "unknown") for x in tb.get("task_snapshot") or []])
     release_reasons = tb.get("release_reasons") or {}
@@ -740,12 +1006,39 @@ def _build_dashboard_payload(base_dir: str) -> Dict[str, Any]:
         "code_loops": code_loops,
         "precondition_gates": precondition_gates,
         "eval_failures": eval_failures,
+        "audit": {
+            "llm_io_summary": (llm_io or {}).get("rows_summary", [])[:120],
+            "rag_io_summary": (rag_io or {}).get("rows_summary", [])[:120],
+            "retrieve_pipeline_summary": (retrieve_pipeline or {}).get("rows_summary", [])[:120],
+            "retrieve_guardrail_summary": (retrieve_guardrail or {}).get("rows_summary", [])[:120],
+            "retrieve_evidence_summary": (retrieve_evidence or {}).get("rows_summary", [])[:120],
+        },
     }
 
 
 def build_dashboard_payload(base_dir: str) -> Dict[str, Any]:
     """Public payload builder for separated frontend-backend dashboard servers."""
     return _build_dashboard_payload(base_dir=base_dir)
+
+
+def normalize_llm_io_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    return _normalize_llm_io_rows(rows, max_rows=max_rows)
+
+
+def normalize_rag_io_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    return _normalize_rag_io_rows(rows, max_rows=max_rows)
+
+
+def normalize_retrieve_pipeline_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    return _normalize_retrieve_pipeline_rows(rows, max_rows=max_rows)
+
+
+def normalize_retrieve_guardrail_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    return _normalize_retrieve_guardrail_rows(rows, max_rows=max_rows)
+
+
+def normalize_retrieve_evidence_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+    return _normalize_retrieve_evidence_rows(rows, max_rows=max_rows)
 
 
 def generate_trend_dashboard(base_dir: str, out_dir: str) -> Dict[str, Any]:
