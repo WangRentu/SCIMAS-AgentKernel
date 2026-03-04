@@ -67,10 +67,42 @@ def _clip(v: Any, n: int = 300) -> str:
     return s[:n]
 
 
+def _estimate_tokens_from_chars(chars: int, chars_per_token: float = 4.0) -> int:
+    if chars <= 0:
+        return 0
+    cpt = float(chars_per_token) if chars_per_token and chars_per_token > 0 else 4.0
+    return max(1, int(round(float(chars) / cpt)))
+
+
+def _llm_token_costs(input_tokens: int, output_tokens: int) -> Dict[str, float]:
+    try:
+        input_cny_per_mtok = float(os.getenv("SCIMAS_LLM_INPUT_CNY_PER_MTOKEN", "0.6"))
+    except Exception:
+        input_cny_per_mtok = 0.6
+    try:
+        output_cny_per_mtok = float(os.getenv("SCIMAS_LLM_OUTPUT_CNY_PER_MTOKEN", "1.2"))
+    except Exception:
+        output_cny_per_mtok = 1.2
+
+    input_cost_cny = (float(max(0, input_tokens)) / 1_000_000.0) * input_cny_per_mtok
+    output_cost_cny = (float(max(0, output_tokens)) / 1_000_000.0) * output_cny_per_mtok
+    return {
+        "input_cny_per_mtoken": float(input_cny_per_mtok),
+        "output_cny_per_mtoken": float(output_cny_per_mtok),
+        "input_cost_cny": float(input_cost_cny),
+        "output_cost_cny": float(output_cost_cny),
+        "total_cost_cny": float(input_cost_cny + output_cost_cny),
+    }
+
+
 def _normalize_llm_io_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
     rows = _latest_by_reset(rows, "episode_id")
     summary: List[Dict[str, Any]] = []
     detail: List[Dict[str, Any]] = []
+    try:
+        chars_per_token = float(os.getenv("SCIMAS_LLM_CHARS_PER_TOKEN_EST", "4.0"))
+    except Exception:
+        chars_per_token = 4.0
     for rec in rows[-max_rows:]:
         meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
         inp = rec.get("input") if isinstance(rec.get("input"), dict) else {}
@@ -80,6 +112,9 @@ def _normalize_llm_io_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> D
         raw_obj = out.get("raw_response")
         raw_text = _extract_text(raw_obj)
         parsed = out.get("parsed_json")
+        prompt_tokens_est = _estimate_tokens_from_chars(len(prompt_text), chars_per_token=chars_per_token)
+        completion_tokens_est = _estimate_tokens_from_chars(len(raw_text), chars_per_token=chars_per_token)
+        total_tokens_est = int(prompt_tokens_est + completion_tokens_est)
         record = {
             "id": _sha1_id("llm", {"meta": meta, "prompt": prompt_text[:512], "raw": raw_text[:512]}),
             "ts": str(meta.get("ts") or ""),
@@ -93,6 +128,9 @@ def _normalize_llm_io_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> D
             "reason": str(out.get("reason") or ""),
             "prompt_chars": len(prompt_text),
             "response_chars": len(raw_text),
+            "prompt_tokens_est": prompt_tokens_est,
+            "completion_tokens_est": completion_tokens_est,
+            "total_tokens_est": total_tokens_est,
             "prompt_preview": _clip(prompt_text, 260),
             "response_preview": _clip(raw_text, 260),
             "has_parsed_json": isinstance(parsed, (dict, list)),
@@ -114,6 +152,9 @@ def _normalize_llm_io_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> D
                 "reason": record["reason"],
                 "prompt_chars": record["prompt_chars"],
                 "response_chars": record["response_chars"],
+                "prompt_tokens_est": record["prompt_tokens_est"],
+                "completion_tokens_est": record["completion_tokens_est"],
+                "total_tokens_est": record["total_tokens_est"],
                 "prompt_preview": record["prompt_preview"],
                 "response_preview": record["response_preview"],
             }
@@ -122,6 +163,36 @@ def _normalize_llm_io_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> D
     summary = sorted(summary, key=lambda x: x.get("ts", ""), reverse=True)
     detail = sorted(detail, key=lambda x: x.get("ts", ""), reverse=True)
     return {"rows_summary": summary, "rows_detail": detail}
+
+
+def _collect_llm_usage_summary(llm_rows_summary: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = list(llm_rows_summary or [])
+    prompt_tokens_total = 0
+    completion_tokens_total = 0
+    for row in rows:
+        prompt_tokens_total += _to_int(row.get("prompt_tokens_est"), 0)
+        completion_tokens_total += _to_int(row.get("completion_tokens_est"), 0)
+    total_tokens = int(prompt_tokens_total + completion_tokens_total)
+    costs = _llm_token_costs(prompt_tokens_total, completion_tokens_total)
+    return {
+        "sample_rows": len(rows),
+        "input_tokens_est": int(prompt_tokens_total),
+        "output_tokens_est": int(completion_tokens_total),
+        "total_tokens_est": total_tokens,
+        "pricing": {
+            "input_cny_per_mtoken": costs["input_cny_per_mtoken"],
+            "output_cny_per_mtoken": costs["output_cny_per_mtoken"],
+        },
+        "cost_cny": {
+            "input": costs["input_cost_cny"],
+            "output": costs["output_cost_cny"],
+            "total": costs["total_cost_cny"],
+        },
+        "token_estimation": {
+            "method": "chars_div_chars_per_token",
+            "chars_per_token": float(os.getenv("SCIMAS_LLM_CHARS_PER_TOKEN_EST", "4.0")),
+        },
+    }
 
 
 def _normalize_rag_io_rows(rows: List[Dict[str, Any]], max_rows: int = 500) -> Dict[str, List[Dict[str, Any]]]:
@@ -945,6 +1016,7 @@ def _build_dashboard_payload(base_dir: str) -> Dict[str, Any]:
     precondition_gates = _collect_precondition_gates(base_dir)
     eval_failures = _collect_eval_failures(base_dir)
     llm_io = _collect_llm_io(base_dir, max_rows=800)
+    llm_usage_summary = _collect_llm_usage_summary((llm_io or {}).get("rows_summary") or [])
     rag_io = _collect_rag_io(base_dir, max_rows=800)
     retrieve_pipeline = _collect_retrieve_pipeline(base_dir, max_rows=800)
     retrieve_guardrail = _collect_retrieve_guardrail(base_dir, max_rows=800)
@@ -1007,6 +1079,7 @@ def _build_dashboard_payload(base_dir: str) -> Dict[str, Any]:
         "precondition_gates": precondition_gates,
         "eval_failures": eval_failures,
         "audit": {
+            "llm_usage_summary": llm_usage_summary,
             "llm_io_summary": (llm_io or {}).get("rows_summary", [])[:120],
             "rag_io_summary": (rag_io or {}).get("rows_summary", [])[:120],
             "retrieve_pipeline_summary": (retrieve_pipeline or {}).get("rows_summary", [])[:120],

@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
 from typing import Dict, Any, List, Optional, Tuple
 
 
@@ -49,16 +50,41 @@ class ModelProvider(ABC):
         ValueError: If required parameters are missing from the configuration.
     """
 
+    @staticmethod
+    def _resolve_env_value(value: Any) -> Optional[str]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        expanded = os.path.expandvars(raw).strip()
+        if raw.startswith("${") and raw.endswith("}") and expanded == raw:
+            return None
+        if raw.startswith("$") and not raw.startswith("${") and expanded == raw:
+            return None
+        return expanded or None
+
     def __init__(self, model_config: Dict[str, Any]):
-        required_params = ["base_url", "model"]
-        missing = [p for p in required_params if not model_config.get(p)]
+        base_url = self._resolve_env_value(model_config.get("base_url"))
+        model = self._resolve_env_value(model_config.get("model"))
+        api_key = self._resolve_env_value(model_config.get("api_key"))
+        if not api_key:
+            api_key = self._resolve_env_value(os.getenv("OPENAI_API_KEY"))
+        capabilities_raw = model_config.get("capabilities", ["chat"])
+        if isinstance(capabilities_raw, str):
+            capabilities = [x.strip() for x in capabilities_raw.split(",") if x.strip()]
+        elif isinstance(capabilities_raw, list):
+            capabilities = [str(x).strip() for x in capabilities_raw if str(x).strip()]
+        else:
+            capabilities = ["chat"]
+
+        required_params = {"base_url": base_url, "model": model}
+        missing = [p for p, v in required_params.items() if not v]
         if missing:
             raise ValueError(f"Missing required parameters: {missing}")
 
-        self.base_url: str = model_config["base_url"]
-        self.model: str = model_config["model"]
-        self.api_key: str | None = model_config.get("api_key")
-        self.capabilities: List[str] = model_config.get("capabilities", ["chat"])
+        self.base_url: str = str(base_url)
+        self.model: str = str(model)
+        self.api_key: str | None = api_key
+        self.capabilities: List[str] = capabilities or ["chat"]
         self.config: Dict[str, Any] = model_config
 
     def __str__(self) -> str:

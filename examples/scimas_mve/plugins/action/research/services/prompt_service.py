@@ -684,6 +684,14 @@ class PromptService:
         train_columns = [str(x) for x in (observed_columns.get("train") or []) if str(x).strip()][:128]
         test_columns = [str(x) for x in (observed_columns.get("test") or []) if str(x).strip()][:128]
         enforce_columns = bool(getattr(self.plugin, "_experiment_prompt_enforce_columns", True))
+        column_constraints = ""
+        if enforce_columns:
+            column_constraints = textwrap.dedent(
+                """
+                11) Use only columns observed in 'Observed train/test columns' unless guarded fallback checks prove existence at runtime.
+                12) Never hardcode imaginary column names; validate columns before selecting features/targets.
+                """
+            ).strip()
         phase_guidance = {
             "generate": "Write first executable baseline code for this task.",
             "repair": "Fix execution/runtime errors and keep scientific validity.",
@@ -766,7 +774,7 @@ class PromptService:
             8) Read `.task_manifest.json` to get metric/category/scoring_column and format submission accordingly.
             9) Do NOT repeat previously failed error_codes if provided in Diagnosis JSON.
             10) Keep valid existing logic unless a rule in TemplateFix explicitly changes it.
-            {"11) Use only columns observed in 'Observed train/test columns' unless guarded fallback checks prove existence at runtime.\n            12) Never hardcode imaginary column names; validate columns before selecting features/targets." if enforce_columns else ""}
+            {column_constraints}
 
             Return ONLY JSON:
             {{

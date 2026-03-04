@@ -1,7 +1,6 @@
 import asyncio
 import json
 import re
-from datetime import datetime
 from typing import Any, Dict
 
 
@@ -89,7 +88,8 @@ class LlmService:
     async def call_llm_json(self, *, agent_id: str, action_name: str, prompt: str) -> Dict[str, Any]:
         tick = await self.plugin.controller.run_system("timer", "get_tick")
         world_spec = await self.plugin.controller.run_environment("science", "get_world_spec")
-        ts = datetime.utcnow().isoformat() + "Z"
+        ts_info = self.plugin._audit_timestamp_fields()
+        ts = ts_info["ts"]
 
         if not self.plugin._llm_ready(action_name):
             await self.log_llm_audit(

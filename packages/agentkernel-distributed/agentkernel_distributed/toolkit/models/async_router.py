@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import os
 import random
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -26,6 +27,50 @@ class AsyncModelRouter:
     The router operates entirely locally and chooses a provider that matches the
     requested capability and optional model name.
     """
+
+    @staticmethod
+    def _redact_headers(headers: Dict[str, object]) -> Dict[str, object]:
+        safe = dict(headers or {})
+        auth = str(safe.get("Authorization") or "")
+        if auth:
+            if len(auth) > 24:
+                safe["Authorization"] = f"{auth[:16]}...{auth[-4:]}"
+            else:
+                safe["Authorization"] = "***"
+        return safe
+
+    @staticmethod
+    def _build_chat_request_debug_payload(params: Dict[str, object]) -> Dict[str, object]:
+        payload = params.get("json") if isinstance(params, dict) else {}
+        if not isinstance(payload, dict):
+            payload = {}
+        messages = payload.get("messages")
+        msg_items = messages if isinstance(messages, list) else []
+        message_summary = []
+        total_chars = 0
+        for idx, item in enumerate(msg_items[:6]):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            content = str(item.get("content") or "")
+            total_chars += len(content)
+            message_summary.append(
+                {
+                    "idx": idx,
+                    "role": role,
+                    "content_chars": len(content),
+                    "content_preview": content[:200],
+                }
+            )
+        return {
+            "url": str(params.get("url") or ""),
+            "headers": AsyncModelRouter._redact_headers(params.get("headers") if isinstance(params.get("headers"), dict) else {}),
+            "model": payload.get("model"),
+            "messages_count": len(msg_items),
+            "messages_total_chars": total_chars,
+            "message_summary": message_summary,
+            "sampling_keys": [k for k in payload.keys() if k not in {"model", "messages"}],
+        }
 
     def __init__(self, models_configs: Optional[List[Dict[str, object]]] = None) -> None:
         """
@@ -158,6 +203,18 @@ class AsyncModelRouter:
                             
                 except Exception as exc:
                     logger.warning("%s chat request failed with %s: %s", self, provider.model, exc)
+                    dump_req = os.getenv("AK_DUMP_FAILED_CHAT_REQUEST", "1").lower() not in {"0", "false", "no"}
+                    if dump_req:
+                        try:
+                            debug_payload = self._build_chat_request_debug_payload(params)
+                            logger.warning(
+                                "%s failed_request_debug provider=%s payload=%s",
+                                self,
+                                provider.model,
+                                debug_payload,
+                            )
+                        except Exception as dump_exc:  # pragma: no cover
+                            logger.warning("%s failed to dump failed request payload: %s", self, dump_exc)
                     continue
 
             logger.error("All providers failed for chat request. Retrying in %d seconds...", retry_delay)

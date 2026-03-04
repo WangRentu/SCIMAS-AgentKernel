@@ -53,6 +53,18 @@ function fmtNum(v, digits = 3) {
   return n.toFixed(digits);
 }
 
+function fmtInt(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "0";
+  return Math.round(n).toLocaleString();
+}
+
+function fmtCny(v, digits = 4) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "¥0.0000";
+  return `¥${n.toFixed(digits)}`;
+}
+
 function ioSetExpanded(key, value) {
   state.ioExpandedBlocks[key] = !!value;
 }
@@ -437,9 +449,38 @@ function renderHeader(meta, timing, teamSummary, serverInfo) {
   const now = serverInfo.ts || new Date().toISOString();
   document.getElementById("sim-clock-chip").textContent = `clock: ${toLocal(now)}`;
 
-  const runCount = Number((((state.payload || {}).runs || {}).runs || []).length);
-  const tokenCost = (runCount * 0.0025).toFixed(4);
-  document.getElementById("token-chip").textContent = `token cost: $${tokenCost}`;
+  const audit = (state.payload || {}).audit || {};
+  const usage = audit.llm_usage_summary || {};
+  let inTok = 0;
+  let outTok = 0;
+  let inCost = 0;
+  let outCost = 0;
+  let totalCost = 0;
+  const pricing = usage.pricing || {};
+  const inRate = Number(pricing.input_cny_per_mtoken || 0.6);
+  const outRate = Number(pricing.output_cny_per_mtoken || 1.2);
+
+  const llmRows = Array.isArray(audit.llm_io_summary) ? audit.llm_io_summary : [];
+  const episodeFilteredRows = llmRows.filter((row) => {
+    if (state.episode > 0) return Number(row.episode_id || 0) === Number(state.episode);
+    return true;
+  });
+  for (const row of episodeFilteredRows) {
+    inTok += Number(row.prompt_tokens_est || 0);
+    outTok += Number(row.completion_tokens_est || 0);
+  }
+  if (!(inTok > 0 || outTok > 0)) {
+    inTok = Number(usage.input_tokens_est || 0);
+    outTok = Number(usage.output_tokens_est || 0);
+  }
+  inCost = (inTok / 1_000_000) * inRate;
+  outCost = (outTok / 1_000_000) * outRate;
+  totalCost = inCost + outCost;
+
+  document.getElementById("token-chip").textContent =
+    `token cost: ${fmtCny(totalCost)} (in ${fmtInt(inTok)} / out ${fmtInt(outTok)})`;
+  document.getElementById("token-chip").title =
+    `Input: ¥${inRate}/1M tok, Output: ¥${outRate}/1M tok | in ${fmtCny(inCost)}, out ${fmtCny(outCost)}`;
 
   const gpu = serverInfo.gpu || {};
   if (gpu.available) {

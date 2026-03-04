@@ -529,7 +529,8 @@ class RagService:
     ) -> None:
         if not self.plugin._audit_io_enable:
             return
-        ts = datetime.utcnow().isoformat() + "Z"
+        ts_info = self.plugin._audit_timestamp_fields()
+        ts = ts_info["ts"]
         meta = {
             "ts": ts,
             "episode_id": world_spec.get("episode_id"),

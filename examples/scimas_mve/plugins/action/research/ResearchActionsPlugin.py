@@ -129,9 +129,10 @@ class ResearchActionsPlugin(OtherActionsPlugin):
                 tick = await self.controller.run_system("timer", "get_tick")
             except Exception:
                 tick = None
+            ts_info = self._audit_timestamp_fields()
             session_record = {
                 "meta": {
-                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "ts": ts_info["ts"],
                     "tick": tick,
                     "episode_id": (world_spec or {}).get("episode_id"),
                     "task_name": (world_spec or {}).get("task_name"),
@@ -201,6 +202,10 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             return json.loads(json.dumps(value, ensure_ascii=False, default=str))
         except Exception:
             return str(value)
+
+    def _audit_timestamp_fields(self) -> Dict[str, str]:
+        # Keep audit timestamps aligned with terminal log style.
+        return {"ts": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")}
 
     async def _append_markdown_audit(
         self,
