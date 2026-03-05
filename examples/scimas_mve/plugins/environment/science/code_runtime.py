@@ -68,6 +68,8 @@ class WorkspaceManager:
         for name in ("src", "outputs", "logs", "snapshots"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
 
+        source = Path(data_mount_dir).resolve()
+        split_info = self._collect_data_split_info(source)
         manifest = {
             "task_name": task.get("task_name"),
             "task_path": task.get("task_path"),
@@ -76,6 +78,10 @@ class WorkspaceManager:
             "dataset": (task.get("logging_info") or {}).get("dataset"),
             "scoring_column": (task.get("logging_info") or {}).get("scoring_column", "prediction"),
             "target_column_hint": target_column_hint or "",
+            "available_splits": split_info.get("available_splits") or [],
+            "prepare_split_manifest": split_info.get("prepare_split_manifest") or {},
+            "dev_split_name": split_info.get("dev_split_name") or "",
+            "dev_split_from_train": bool(split_info.get("dev_split_from_train", False)),
         }
         (self.root / ".task_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -83,7 +89,6 @@ class WorkspaceManager:
         )
 
         data_link = self.root / "data"
-        source = Path(data_mount_dir).resolve()
         if data_link.exists() or data_link.is_symlink():
             if data_link.is_dir() and not data_link.is_symlink():
                 shutil.rmtree(data_link, ignore_errors=True)
@@ -105,6 +110,37 @@ class WorkspaceManager:
         if not bridge.exists():
             bridge.write_text(_data_bridge_script(), encoding="utf-8")
         return {"workspace_dir": str(self.root), "manifest_path": str(self.root / ".task_manifest.json")}
+
+    def _collect_data_split_info(self, data_root: Path) -> Dict[str, Any]:
+        available_splits: List[str] = []
+        for split in ("train", "validation", "val", "dev", "test", "test_with_labels"):
+            split_path = data_root / split
+            csv_path = data_root / f"{split}.csv"
+            if split_path.exists() or csv_path.exists():
+                available_splits.append(split)
+
+        split_manifest: Dict[str, Any] = {}
+        manifest_path = data_root / "_prepare_split_manifest.json"
+        if manifest_path.exists():
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    split_manifest = loaded
+            except Exception:
+                split_manifest = {}
+
+        dev_split_name = str(split_manifest.get("dev_split_name") or "")
+        if not dev_split_name:
+            for cand in ("validation", "val", "dev"):
+                if cand in available_splits:
+                    dev_split_name = cand
+                    break
+        return {
+            "available_splits": available_splits,
+            "prepare_split_manifest": split_manifest,
+            "dev_split_name": dev_split_name,
+            "dev_split_from_train": bool(split_manifest.get("created_from_train", False)),
+        }
 
     def _materialize_csv_compat_views(self, data_root: Path) -> None:
         """

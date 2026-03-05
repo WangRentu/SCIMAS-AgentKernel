@@ -87,6 +87,213 @@ class RetrieveOperator:
             )
         return evidence
 
+    def _cold_start_seed_evidence(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        data_card: Optional[Dict[str, Any]],
+        template_card: Optional[Dict[str, Any]],
+        topic: str,
+        start_index: int,
+        needed: int,
+    ) -> List[Dict[str, Any]]:
+        if needed <= 0:
+            return []
+        task_name = str(world_spec.get("task_name") or "").strip()
+        metric = str(world_spec.get("metric") or "").strip()
+        category = str(world_spec.get("category") or "").strip()
+        problem = str(world_spec.get("research_problem") or "").strip()
+        desc = ""
+        for key in ("project_description", "project_description_md", "task_description", "description", "objective"):
+            text = str(world_spec.get(key) or "").strip()
+            if text:
+                desc = text
+                break
+        if not desc and isinstance(world_spec.get("task_meta"), dict):
+            meta = world_spec.get("task_meta") or {}
+            for key in ("project_description", "task_description", "description", "objective"):
+                text = str(meta.get(key) or "").strip()
+                if text:
+                    desc = text
+                    break
+
+        candidates: List[Dict[str, Any]] = []
+        # Evidence 1: task spec / description.
+        task_text_lines = [
+            f"task={task_name}",
+            f"metric={metric}",
+            f"category={category}",
+            f"problem={problem}",
+            f"topic={topic or 'task_baselines'}",
+        ]
+        if desc:
+            task_text_lines.append(f"description={self.plugin._truncate(desc, 1400)}")
+        candidates.append(
+            {
+                "source_type": "task_spec",
+                "source_id": f"seed:task_spec:{task_name or 'unknown'}",
+                "tags": [metric, category, "task_spec", "seed"],
+                "text": "\n".join([x for x in task_text_lines if str(x).strip()]),
+            }
+        )
+
+        # Evidence 2+: baseline guidance from template card.
+        template_baselines = (
+            (template_card or {}).get("recommended_baselines")
+            if isinstance((template_card or {}).get("recommended_baselines"), list)
+            else []
+        )
+        for idx, baseline in enumerate(template_baselines[:4], start=1):
+            if not isinstance(baseline, dict):
+                continue
+            steps = self.plugin._safe_text_list(
+                baseline.get("key_steps") or baseline.get("implementation_steps"),
+                limit=5,
+                item_limit=180,
+            )
+            pitfalls = self.plugin._safe_text_list(
+                baseline.get("pitfalls") or baseline.get("risks"),
+                limit=4,
+                item_limit=160,
+            )
+            text_parts = [
+                f"name={self.plugin._truncate(baseline.get('name'), 120)}",
+                f"use_when={self.plugin._truncate(baseline.get('use_when'), 220)}",
+            ]
+            if steps:
+                text_parts.append("steps=" + "; ".join(steps))
+            if pitfalls:
+                text_parts.append("pitfalls=" + "; ".join(pitfalls))
+            candidates.append(
+                {
+                    "source_type": "method_card",
+                    "source_id": f"seed:baseline:{task_name or 'unknown'}:{idx}",
+                    "tags": [metric, category, "baseline", "seed"],
+                    "text": " | ".join([x for x in text_parts if str(x).strip()]),
+                }
+            )
+
+        # Evidence: evaluation protocol.
+        protocol = self.plugin._safe_text_list(
+            (template_card or {}).get("evaluation_protocol"),
+            limit=8,
+            item_limit=180,
+        )
+        if not protocol:
+            protocol = [
+                "align optimization with metric direction on dev/proxy split",
+                "validate submission schema and row count before evaluate",
+                "track seed stability before promoting best run",
+            ]
+        candidates.append(
+            {
+                "source_type": "method_card",
+                "source_id": f"seed:eval_protocol:{task_name or 'unknown'}",
+                "tags": [metric, category, "evaluation_protocol", "seed"],
+                "text": "evaluation_protocol=" + " ; ".join(protocol[:6]),
+            }
+        )
+
+        # Optional evidence: data-card risk summary.
+        if isinstance(data_card, dict):
+            risk_flags = self.plugin._safe_text_list(data_card.get("risk_flags"), limit=6, item_limit=100)
+            target_col = str(data_card.get("target_column") or "")
+            if risk_flags or target_col:
+                dc_text = f"target_column={target_col}; risk_flags={'; '.join(risk_flags)}"
+                candidates.append(
+                    {
+                        "source_type": "data_card",
+                        "source_id": f"seed:data_card:{task_name or 'unknown'}",
+                        "tags": [metric, category, "data_card", "seed"],
+                        "text": dc_text,
+                    }
+                )
+
+        # Deduplicate and cut.
+        seen_text = set()
+        selected: List[Dict[str, Any]] = []
+        for item in candidates:
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            text_key = text[:1200]
+            if text_key in seen_text:
+                continue
+            seen_text.add(text_key)
+            selected.append(item)
+            if len(selected) >= max(needed, int(self.plugin._retrieve_min_evidence)):
+                break
+
+        seeded: List[Dict[str, Any]] = []
+        for offset, item in enumerate(selected, start=0):
+            seeded.append(
+                {
+                    "evidence_id": f"EVID-{start_index + offset:04d}",
+                    "source_collection": str(getattr(self.plugin, "_rag_collection_literature", "") or "literature_chunks"),
+                    "source_type": str(item.get("source_type") or "seed"),
+                    "source_id": str(item.get("source_id") or f"seed:{offset + 1}"),
+                    "tags": list(item.get("tags") or []),
+                    "chunk_text": str(item.get("text") or ""),
+                    "match_score": 0.31,
+                    "retrieval_mode": "seed",
+                }
+            )
+        return seeded
+
+    def _cold_start_seed_docs(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        data_card: Optional[Dict[str, Any]],
+        template_card: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        docs: List[Dict[str, Any]] = []
+        docs.extend(
+            self.plugin._rag_docs_from_world_spec(
+                world_spec=world_spec,
+                agent_id=agent_id,
+                action="retrieve_seed",
+            )
+        )
+        if isinstance(data_card, dict):
+            docs.extend(
+                self.plugin._rag_docs_from_data_card(
+                    world_spec=world_spec,
+                    agent_id=agent_id,
+                    data_card=data_card,
+                    action="retrieve_seed",
+                )
+            )
+        if isinstance(template_card, dict):
+            docs.extend(
+                self.plugin._rag_docs_from_method_card(
+                    world_spec=world_spec,
+                    agent_id=agent_id,
+                    method_card=template_card,
+                    action="retrieve_seed",
+                )
+            )
+            protocol = self.plugin._safe_text_list(
+                template_card.get("evaluation_protocol"),
+                limit=8,
+                item_limit=180,
+            )
+            if protocol:
+                source_id = f"eval_protocol:{self.plugin._rag_hash(str(world_spec.get('task_name') or 'task'))[:12]}"
+                doc = self.plugin._rag_doc_base(
+                    world_spec=world_spec,
+                    agent_id=agent_id,
+                    source_type="method_card",
+                    source_id=source_id,
+                    action="retrieve_seed",
+                    tags=["evaluation_protocol", str(world_spec.get("metric") or ""), str(world_spec.get("category") or "")],
+                    quality=0.78,
+                )
+                doc["text"] = "evaluation_protocol=" + " ; ".join(protocol[:6])
+                docs.append(doc)
+        return [d for d in docs if isinstance(d, dict) and str(d.get("text") or "").strip()]
+
     def _sanitize_method_card(self, card: Dict[str, Any], *, world_spec: Dict[str, Any], topic: str) -> Dict[str, Any]:
         result = dict(card or {})
         result["ok"] = bool(result.get("ok", True))
@@ -460,6 +667,24 @@ class RetrieveOperator:
             world_spec = await self.plugin.controller.run_environment("science", "get_world_spec")
 
         topic_val = topic or "task_baselines"
+        fallback_card: Dict[str, Any] = {}
+        if self.plugin._retrieve_template_fallback:
+            fallback_card = await self.plugin.controller.run_environment(
+                "science",
+                "retrieve_method_card",
+                agent_id=agent_id,
+                topic=topic_val,
+                refresh=bool(refresh),
+            )
+
+        # Bootstrap episode-level RAG knowledge before retrieval.
+        await self.plugin._rag_bootstrap_episode_knowledge(
+            agent_id=agent_id,
+            world_spec=world_spec,
+            data_card=data_card if isinstance(data_card, dict) else None,
+            method_card=fallback_card if isinstance(fallback_card, dict) else None,
+        )
+
         query_bundle = self._context_bundle(
             world_spec=world_spec,
             data_card=data_card if isinstance(data_card, dict) else None,
@@ -487,6 +712,39 @@ class RetrieveOperator:
         )
         selected_rows = list((rag_result or {}).get("selected") or [])
         evidence_pack = self._build_evidence_pack(selected_rows=selected_rows)
+        if len(evidence_pack) < int(self.plugin._retrieve_min_evidence):
+            needed = int(self.plugin._retrieve_min_evidence) - len(evidence_pack)
+            seed_evidence = self._cold_start_seed_evidence(
+                world_spec=world_spec,
+                data_card=data_card if isinstance(data_card, dict) else None,
+                template_card=fallback_card if isinstance(fallback_card, dict) else None,
+                topic=topic_val,
+                start_index=len(evidence_pack) + 1,
+                needed=max(needed, 3),
+            )
+            if seed_evidence:
+                evidence_pack.extend(seed_evidence)
+                seed_docs = self._cold_start_seed_docs(
+                    world_spec=world_spec,
+                    agent_id=agent_id,
+                    data_card=data_card if isinstance(data_card, dict) else None,
+                    template_card=fallback_card if isinstance(fallback_card, dict) else None,
+                )
+                if seed_docs:
+                    await self.plugin._rag_index_documents(
+                        agent_id=agent_id,
+                        action="retrieve_literature",
+                        docs=seed_docs,
+                    )
+                await self._log_retrieve_pipeline(
+                    agent_id=agent_id,
+                    phase="cold_start_seed",
+                    payload={
+                        "seeded_count": len(seed_evidence),
+                        "evidence_count_after_seed": len(evidence_pack),
+                        "trigger": "insufficient_evidence_for_l0",
+                    },
+                )
         await self._log_retrieve_evidence(
             agent_id=agent_id,
             evidence_pack=evidence_pack,
@@ -528,16 +786,6 @@ class RetrieveOperator:
                     phase="composer",
                     payload={"llm_ok": False, "llm_reason": llm_result.get("reason")},
                 )
-
-        fallback_card: Dict[str, Any] = {}
-        if self.plugin._retrieve_template_fallback:
-            fallback_card = await self.plugin.controller.run_environment(
-                "science",
-                "retrieve_method_card",
-                agent_id=agent_id,
-                topic=topic_val,
-                refresh=bool(refresh),
-            )
 
         if not method_card_candidate and isinstance(fallback_card, dict):
             method_card_candidate = dict(fallback_card)

@@ -215,7 +215,22 @@ class EasyPlanPlugin(PlanPlugin):
             current_tick=current_tick,
         )
         open_tasks = (listed_open or {}).get("tasks", []) if isinstance(listed_open, dict) else []
-        chosen = self._choose_open_task(open_tasks)
+        chosen: Optional[Dict[str, Any]] = None
+        if open_tasks:
+            # Guard against hypothesize loops: once VDH passes, always claim a ready
+            # experiment first if one exists.
+            last_vdh_report = await self.state_plug.get_state("last_vdh_report")
+            last_vdh_ok = isinstance(last_vdh_report, dict) and bool(last_vdh_report.get("final_ok", False))
+            if last_vdh_ok:
+                ready_experiments = [
+                    t
+                    for t in open_tasks
+                    if str(t.get("task_type") or "") == "experiment" and bool(t.get("ready", True))
+                ]
+                if ready_experiments:
+                    chosen = ready_experiments[0]
+        if chosen is None:
+            chosen = self._choose_open_task(open_tasks)
         if not chosen:
             return {
                 "action": self._choose_non_claim_action(

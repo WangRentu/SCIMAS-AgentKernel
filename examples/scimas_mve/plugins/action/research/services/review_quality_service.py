@@ -11,6 +11,22 @@ class ReviewQualityService:
     def __init__(self, plugin: Any):
         self.plugin = plugin
 
+    def _qgr_thresholds_for_stage(self, stage: Optional[str]) -> Dict[str, Any]:
+        stage_raw = str(stage or "").strip().lower()
+        if stage_raw in {"early", "run", "run_level", "post_experiment", "cold_start"}:
+            return {
+                "stage": "early",
+                "min_issues": int(getattr(self.plugin, "_qgr_early_min_issue_count", 1)),
+                "min_citations": int(getattr(self.plugin, "_qgr_early_min_citations", 1)),
+                "min_relevance": float(getattr(self.plugin, "_qgr_early_relevance_threshold", 0.2)),
+            }
+        return {
+            "stage": "prewrite",
+            "min_issues": int(getattr(self.plugin, "_qgr_min_issue_count", 2)),
+            "min_citations": int(getattr(self.plugin, "_qgr_min_citations", 3)),
+            "min_relevance": float(getattr(self.plugin, "_qgr_relevance_threshold", 0.75)),
+        }
+
     def normalize_review_issues(self, review_note: Dict[str, Any]) -> List[Dict[str, Any]]:
         issues: List[Dict[str, Any]] = []
         raw = review_note.get("issues")
@@ -357,7 +373,9 @@ class ReviewQualityService:
         review_note: Dict[str, Any],
         issues: List[Dict[str, Any]],
         context_text: str,
+        stage: Optional[str] = None,
     ) -> Dict[str, Any]:
+        thresholds = self._qgr_thresholds_for_stage(stage=stage)
         citation_set = set()
         for issue in issues:
             if not isinstance(issue, dict):
@@ -366,19 +384,20 @@ class ReviewQualityService:
                 ref_s = str(ref)
                 if ref_s:
                     citation_set.add(ref_s)
-        min_issue_ok = len(issues) >= self.plugin._qgr_min_issue_count
-        min_citation_ok = len(citation_set) >= self.plugin._qgr_min_citations
+        min_issue_ok = len(issues) >= int(thresholds.get("min_issues", 1))
+        min_citation_ok = len(citation_set) >= int(thresholds.get("min_citations", 1))
         relevance = await self.qgr_relevance_score(review_note=review_note, context_text=context_text)
-        relevance_ok = float(relevance.get("score", 0.0) or 0.0) >= self.plugin._qgr_relevance_threshold
+        relevance_ok = float(relevance.get("score", 0.0) or 0.0) >= float(thresholds.get("min_relevance", 0.0))
         fact_check = await self.qgr_fact_check(issues)
         fact_ok = int(fact_check.get("hallucinated_count", 0) or 0) == 0
         valid = bool(min_issue_ok and min_citation_ok and relevance_ok and fact_ok)
         return {
             "valid": valid,
+            "stage": str(thresholds.get("stage") or "prewrite"),
             "thresholds": {
-                "min_issues": self.plugin._qgr_min_issue_count,
-                "min_citations": self.plugin._qgr_min_citations,
-                "min_relevance": self.plugin._qgr_relevance_threshold,
+                "min_issues": int(thresholds.get("min_issues", 1)),
+                "min_citations": int(thresholds.get("min_citations", 1)),
+                "min_relevance": float(thresholds.get("min_relevance", 0.0)),
             },
             "metrics": {
                 "issue_count": len(issues),

@@ -134,13 +134,20 @@ class WriteOperator:
             await self.plugin._append_trace(agent_id, "write", 0.0, ar.data or {})
             return ar
 
-        valid_runs = [obs for obs in observations if obs.get("ok") and obs.get("run_id")]
+        valid_runs = [
+            obs
+            for obs in observations
+            if (
+                bool(obs.get("evidence_ok", obs.get("ok", False)))
+                and obs.get("run_id")
+            )
+        ]
         if not valid_runs:
             ar = self.plugin._action_error(
                 "write",
-                "No successful experiment run available for submission.",
+                "No scientifically successful experiment run available for submission.",
                 effective_action="write",
-                detail={"precondition_failed": True, "reason": "no_successful_run"},
+                detail={"precondition_failed": True, "reason": "no_evidence_backed_run"},
             )
             await self.plugin._append_trace(agent_id, "write", 0.0, ar.data or {})
             return ar

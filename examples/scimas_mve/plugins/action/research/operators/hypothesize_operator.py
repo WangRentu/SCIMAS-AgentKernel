@@ -245,6 +245,20 @@ class HypothesizeOperator:
             await self.plugin._append_trace(agent_id, "hypothesize", hypo_reward, ar.data or {})
             return ar
 
+        experiment_spawn_result: Dict[str, Any] = {"spawned": False, "reason": "not_requested"}
+        recovery_service = getattr(self.plugin, "_recovery_service", None)
+        if recovery_service is not None and hasattr(recovery_service, "ensure_experiment_spawned"):
+            try:
+                experiment_spawn_result = await recovery_service.ensure_experiment_spawned(
+                    reason="hypothesize_gate_pass",
+                    priority=4,
+                )
+            except Exception as e:
+                experiment_spawn_result = {
+                    "spawned": False,
+                    "reason": f"spawn_failed:{self.plugin._truncate(str(e), 120)}",
+                }
+
         ar = ActionResult.success(
             method_name="hypothesize",
             message="AIRS strategy plan updated.",
@@ -252,6 +266,7 @@ class HypothesizeOperator:
                 "hypothesis": hypothesis,
                 "plan_spec": plan_spec,
                 "vdh": vdh_report,
+                "experiment_spawn": experiment_spawn_result,
                 "reward": hypo_reward,
                 "effective_action": "hypothesize",
                 "reward_components": reward_components,

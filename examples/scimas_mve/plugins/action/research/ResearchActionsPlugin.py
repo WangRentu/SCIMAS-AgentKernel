@@ -732,6 +732,17 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         payload.pop("self", None)
         return self._service_sync("_rag_service", RagService, "rag_docs_from_data_card", default=[], **payload)
 
+    def _rag_docs_from_world_spec(
+        self,
+        *,
+        world_spec: Dict[str, Any],
+        agent_id: str,
+        action: str,
+    ) -> List[Dict[str, Any]]:
+        payload = dict(locals())
+        payload.pop("self", None)
+        return self._service_sync("_rag_service", RagService, "rag_docs_from_world_spec", default=[], **payload)
+
     def _rag_docs_from_observation(
         self,
         *,
@@ -1294,6 +1305,7 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         review_note: Dict[str, Any],
         issues: List[Dict[str, Any]],
         context_text: str,
+        stage: Optional[str] = None,
     ) -> Dict[str, Any]:
         return await self._service_async(
             "_review_quality_service",
@@ -1303,6 +1315,7 @@ class ResearchActionsPlugin(OtherActionsPlugin):
             review_note=review_note,
             issues=issues,
             context_text=context_text,
+            stage=stage,
         )
 
     def _qgr_predictive_bonus(

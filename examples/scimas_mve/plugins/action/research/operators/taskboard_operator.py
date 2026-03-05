@@ -184,9 +184,36 @@ class TaskboardOperator:
 
         selected_task_id = task_id
         llm_selection: Optional[Dict[str, Any]] = None
+        forced_selection: Optional[Dict[str, Any]] = None
+        listed = await self.plugin.controller.run_environment("science", "task_list", status="open", current_tick=current_tick)
+        all_open_tasks = (listed or {}).get("tasks", []) if isinstance(listed, dict) else []
+        task_map_all = {str(t.get("task_id") or ""): t for t in all_open_tasks}
+
+        # Guard against hypothesize loops:
+        # once VDH has a passing hypothesis and there is a ready experiment task,
+        # force experiment claim even if planner sent a specific hypothesize task_id.
+        if all_open_tasks:
+            ready_experiment_tasks = [
+                t for t in all_open_tasks if str(t.get("task_type") or "") == "experiment" and bool(t.get("ready", True))
+            ]
+            if ready_experiment_tasks:
+                last_vdh = await self.plugin._get_state(agent_id, "last_vdh_report")
+                last_vdh_ok = isinstance(last_vdh, dict) and bool(last_vdh.get("final_ok", False))
+                if last_vdh_ok:
+                    selected_task = task_map_all.get(str(selected_task_id or ""))
+                    selected_is_experiment = str((selected_task or {}).get("task_type") or "") == "experiment"
+                    if not selected_task_id or not selected_is_experiment:
+                        selected_task_id = str(ready_experiment_tasks[0].get("task_id") or "")
+                        forced_selection = {
+                            "reason": "force_experiment_after_hypothesis_pass",
+                            "task_id": selected_task_id,
+                            "ready_experiment_count": len(ready_experiment_tasks),
+                            "overrode_task_id": str(task_id or "") if task_id else "",
+                            "overrode_task_type": str(task_type or "") if task_type else "",
+                        }
+
         if not selected_task_id:
-            listed = await self.plugin.controller.run_environment("science", "task_list", status="open", current_tick=current_tick)
-            tasks = (listed or {}).get("tasks", []) if isinstance(listed, dict) else []
+            tasks = list(all_open_tasks)
             if task_type:
                 tasks = [t for t in tasks if t.get("task_type") == task_type]
             if tasks:
@@ -194,7 +221,7 @@ class TaskboardOperator:
                 role_plan = await self.plugin._get_state(agent_id, "llm_role_plan")
                 active_task_name = str(world_spec.get("task_name") or "")
                 role_plan_stale = not isinstance(role_plan, dict) or role_plan.get("task_name") != active_task_name
-                if self.plugin._llm_ready("claim_task") and role_plan_stale:
+                if not selected_task_id and self.plugin._llm_ready("claim_task") and role_plan_stale:
                     hypothesis = await self.plugin._get_state(agent_id, "hypothesis") or []
                     notes = await self.plugin._get_state(agent_id, "notes") or []
                     observations = await self.plugin._get_state(agent_id, "observations") or []
@@ -255,7 +282,7 @@ class TaskboardOperator:
                     primary_task_id = str(role_plan.get("primary_task_id") or "")
 
                 task_map = {str(t.get("task_id")): t for t in tasks}
-                if primary_task_id and primary_task_id in task_map:
+                if not selected_task_id and primary_task_id and primary_task_id in task_map:
                     selected_task_id = primary_task_id
                 if not selected_task_id and preferred_types:
                     for preferred in preferred_types:
@@ -349,6 +376,7 @@ class TaskboardOperator:
                 "ok": ok,
                 "reward": reward,
                 "llm_selection": llm_selection,
+                "forced_selection": forced_selection,
                 "effective_action": effective_action,
                 "claim_result": claim_res,
                 "auto_dispatch": (

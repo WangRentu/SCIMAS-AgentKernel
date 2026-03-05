@@ -162,6 +162,10 @@ class ConfigService:
             "SCIMAS_EXPERIMENT_PROMPT_ENFORCE_COLUMNS",
             "1",
         ).lower() not in {"0", "false", "no"}
+        p._experiment_require_evidence_ok = os.getenv(
+            "SCIMAS_EXPERIMENT_REQUIRE_EVIDENCE_OK",
+            "1",
+        ).lower() not in {"0", "false", "no"}
         p._claim_backoff_base = int(max(1, int(os.getenv("SCIMAS_CLAIM_BACKOFF_BASE", "1"))))
         p._claim_backoff_max = int(max(p._claim_backoff_base, int(os.getenv("SCIMAS_CLAIM_BACKOFF_MAX", "8"))))
         p._claim_cost = float(max(0.0, float(os.getenv("SCIMAS_CLAIM_COST", "0.002"))))
@@ -180,6 +184,11 @@ class ConfigService:
         p._qgr_min_issue_count = int(max(1, int(os.getenv("SCIMAS_QGR_MIN_ISSUES", "2"))))
         p._qgr_min_citations = int(max(1, int(os.getenv("SCIMAS_QGR_MIN_CITATIONS", "3"))))
         p._qgr_relevance_threshold = float(max(0.0, min(1.0, float(os.getenv("SCIMAS_QGR_RELEVANCE_THRESHOLD", "0.75")))))
+        p._qgr_early_min_issue_count = int(max(1, int(os.getenv("SCIMAS_QGR_EARLY_MIN_ISSUES", "1"))))
+        p._qgr_early_min_citations = int(max(1, int(os.getenv("SCIMAS_QGR_EARLY_MIN_CITATIONS", "1"))))
+        p._qgr_early_relevance_threshold = float(
+            max(0.0, min(1.0, float(os.getenv("SCIMAS_QGR_EARLY_RELEVANCE_THRESHOLD", "0.2"))))
+        )
         p._qgr_fact_support_threshold = float(max(0.0, min(1.0, float(os.getenv("SCIMAS_QGR_FACT_SUPPORT_THRESHOLD", "0.20")))))
         p._qgr_base_reward = float(os.getenv("SCIMAS_QGR_BASE_REWARD", "0.2"))
         p._qgr_quality_bonus = float(os.getenv("SCIMAS_QGR_QUALITY_BONUS", "0.5"))

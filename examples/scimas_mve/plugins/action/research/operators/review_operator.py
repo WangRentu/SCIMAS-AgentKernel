@@ -113,6 +113,7 @@ class ReviewOperator:
                     review_note=review_note,
                     issues=issues,
                     context_text=paper_context,
+                    stage="prewrite",
                 )
                 await self.plugin._log_review_gate(agent_id=agent_id, paper_id=paper_id, run_id=None, gate=qgr_gate)
                 if not bool(qgr_gate.get("valid", False)):
@@ -249,6 +250,23 @@ class ReviewOperator:
             if latest is None:
                 latest = {}
 
+            if not bool(latest.get("evidence_ok", latest.get("ok", False))):
+                ar = ActionResult.success(
+                    method_name="review",
+                    message="Review deferred: run lacks scientific evidence (dev proxy/preflight).",
+                    data={
+                        "ok": False,
+                        "review_deferred": True,
+                        "reason": "run_evidence_not_ready",
+                        "run_id": latest.get("run_id") or run_id,
+                        "reward": 0.0,
+                        "effective_action": "review",
+                        "reward_components": {"review_reward": 0.0, "learning_reward": 0.0},
+                    },
+                )
+                await self.plugin._append_trace(agent_id, "review", 0.0, ar.data or {})
+                return ar
+
             next_plan = self.plugin._derive_next_solver_plan_from_history(plan_spec=plan_spec, run_history=run_history)
             await self.plugin._set_state(agent_id, "plan_spec", next_plan)
 
@@ -306,6 +324,7 @@ class ReviewOperator:
                 review_note=review_note,
                 issues=self.plugin._normalize_review_issues(review_note),
                 context_text=run_context,
+                stage="early",
             )
             await self.plugin._log_review_gate(
                 agent_id=agent_id,

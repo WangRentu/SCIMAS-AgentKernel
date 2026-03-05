@@ -87,6 +87,29 @@ class ExperimentOperator:
             merged[split] = vals
         return merged
 
+    @staticmethod
+    def _derive_evidence_ok(result: Dict[str, Any]) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if "evidence_ok" in result:
+            return bool(result.get("evidence_ok", False))
+        exec_ok = bool(result.get("exec_ok", result.get("ok", False)))
+        has_dev_proxy = bool(
+            isinstance(result.get("dev_score"), (int, float))
+            or isinstance(result.get("dev_score_norm"), (int, float))
+            or (
+                isinstance(result.get("dev_eval"), dict)
+                and (
+                    bool((result.get("dev_eval") or {}).get("ok", False))
+                    or isinstance((result.get("dev_eval") or {}).get("raw_score"), (int, float))
+                    or isinstance((result.get("dev_eval") or {}).get("score_norm"), (int, float))
+                )
+            )
+        )
+        preflight = result.get("submission_preflight")
+        preflight_ok = bool(preflight.get("ok", False)) if isinstance(preflight, dict) else True
+        return bool(exec_ok and has_dev_proxy and preflight_ok)
+
     async def _run_code_research_loop(
         self,
         *,
@@ -119,6 +142,7 @@ class ExperimentOperator:
         had_code_agent_success = False
         require_code_agent_success = bool(getattr(self.plugin, "_experiment_require_code_agent_success", True))
         treat_fallback_as_repair = bool(getattr(self.plugin, "_experiment_treat_fallback_as_repair", True))
+        require_evidence_ok = bool(getattr(self.plugin, "_experiment_require_evidence_ok", True))
         observed_data_columns = self._columns_from_data_card(data_card if isinstance(data_card, dict) else None)
 
         max_rounds = min(self.plugin._code_debug_rounds, max(1, int(budget or self.plugin._code_debug_rounds)))
@@ -269,7 +293,8 @@ class ExperimentOperator:
             )
 
             result_payload = result or {}
-            round_ok = bool(result_payload.get("ok", False))
+            round_exec_ok = bool(result_payload.get("exec_ok", result_payload.get("ok", False)))
+            round_evidence_ok = self._derive_evidence_ok(result_payload)
             run_columns = self._normalize_columns_map(result_payload.get("data_columns"))
             if run_columns.get("train") or run_columns.get("test"):
                 observed_data_columns = self._merge_columns_map(observed_data_columns, run_columns)
@@ -277,9 +302,11 @@ class ExperimentOperator:
             code_agent_attempted = bool(result_payload.get("code_agent_attempted", False))
             code_agent_ok = bool(result_payload.get("code_agent_ok", not code_agent_attempted))
             code_agent_failed = bool(code_agent_attempted and not code_agent_ok)
-            fallback_masked_failure = bool(round_ok and code_agent_failed)
-            round_success = bool(round_ok)
+            fallback_masked_failure = bool(round_exec_ok and code_agent_failed)
+            round_success = bool(round_exec_ok)
             if code_agent_failed and (require_code_agent_success or treat_fallback_as_repair):
+                round_success = False
+            if require_evidence_ok and not round_evidence_ok:
                 round_success = False
 
             if not round_success:
@@ -292,6 +319,20 @@ class ExperimentOperator:
                     diagnosis_result["stderr_tail"] = str(result_payload.get("code_agent_stderr_tail") or "")
                 if not str(diagnosis_result.get("stdout_tail") or "").strip() and str(result_payload.get("code_agent_stdout_tail") or "").strip():
                     diagnosis_result["stdout_tail"] = str(result_payload.get("code_agent_stdout_tail") or "")
+                if round_exec_ok and require_evidence_ok and not round_evidence_ok:
+                    diag_reason = str(result_payload.get("evidence_reason") or "")
+                    preflight = result_payload.get("submission_preflight") or {}
+                    if not isinstance(preflight, dict):
+                        preflight = {}
+                    preflight_code = str(preflight.get("error_code") or "")
+                    if not diag_reason:
+                        diag_reason = "missing_dev_proxy_or_submission_preflight"
+                    diagnosis_result["ok"] = False
+                    diagnosis_result["error"] = f"evidence_not_ready:{diag_reason}"
+                    if not str(diagnosis_result.get("stderr_tail") or "").strip():
+                        diagnosis_result["stderr_tail"] = (
+                            f"submission_preflight_error={preflight_code}; has_dev_proxy={bool(result_payload.get('has_dev_proxy', False))}"
+                        )
                 diagnosis = self.plugin._classify_experiment_failure(
                     result=diagnosis_result,
                     code_plan=code_plan,
@@ -311,6 +352,14 @@ class ExperimentOperator:
                         error_codes.append("code_agent_failed_with_solver_fallback")
                     diagnosis["error_codes"] = error_codes
                     diagnosis["root_cause"] = "code_agent_failed_solver_fallback_masked"
+                    diagnosis["retryable"] = True
+                if round_exec_ok and require_evidence_ok and not round_evidence_ok:
+                    diagnosis = dict(diagnosis or {})
+                    error_codes = list(diagnosis.get("error_codes") or [])
+                    if "scientific_evidence_not_ready" not in error_codes:
+                        error_codes.append("scientific_evidence_not_ready")
+                    diagnosis["error_codes"] = error_codes
+                    diagnosis["root_cause"] = "missing_dev_proxy_or_submission_preflight"
                     diagnosis["retryable"] = True
                 failure_context = self.plugin._build_repair_context(
                     diagnosis=diagnosis,
@@ -682,7 +731,12 @@ class ExperimentOperator:
             "fallback_solver_ok": bool((result or {}).get("fallback_solver_ok", False)),
             "execution_path": (result or {}).get("execution_path"),
             "data_columns": (result or {}).get("data_columns"),
-            "ok": bool((result or {}).get("ok", False)),
+            "exec_ok": bool((result or {}).get("exec_ok", (result or {}).get("ok", False))),
+            "evidence_ok": self._derive_evidence_ok(result or {}),
+            "evidence_reason": (result or {}).get("evidence_reason"),
+            "has_dev_proxy": bool((result or {}).get("has_dev_proxy", False)),
+            "submission_preflight": (result or {}).get("submission_preflight"),
+            "ok": self._derive_evidence_ok(result or {}),
             "error": (result or {}).get("error"),
             "elapsed_s": (result or {}).get("elapsed_s"),
             "strategy": run_config.get("strategy"),
@@ -712,6 +766,8 @@ class ExperimentOperator:
         score_norm = float((result or {}).get("score_norm", 0.0) or 0.0)
         dev_score_norm = (result or {}).get("dev_score_norm")
         dev_score_norm = float(dev_score_norm) if isinstance(dev_score_norm, (int, float)) else score_norm
+        exec_ok = bool(observation.get("exec_ok", False))
+        evidence_ok = bool(observation.get("evidence_ok", False))
         cost = float((result or {}).get("cost", 0.0) or 0.0)
         prev_best_dev = max(
             [float(o.get("dev_score_norm", 0.0) or 0.0) for o in prior_observations if bool(o.get("ok"))] or [0.0]
@@ -724,21 +780,24 @@ class ExperimentOperator:
             ok=bool((result or {}).get("ok", False)),
         )
         vram_eff = self.plugin._estimate_vram_efficiency(result=result or {}, world_spec=world_spec)
-        if bool((result or {}).get("ok", False)):
+        if evidence_ok:
             reward += self.plugin._experiment_success_reward
             if first_pass:
                 reward += self.plugin._experiment_first_pass_bonus
             if isinstance(vram_eff, (int, float)):
                 reward += self.plugin._experiment_vram_reward_weight * float(vram_eff)
+        elif exec_ok:
+            reward = min(reward, -0.01)
         if flags.get("oom", False):
             reward -= self.plugin._experiment_oom_penalty
         if flags.get("typeerror", False):
             reward -= self.plugin._experiment_typeerror_penalty
-        if not bool((result or {}).get("ok", False)):
+        if not evidence_ok:
             reward = min(reward, -0.02)
         reward = max(-1.0, min(2.0, float(reward)))
 
-        if bool((result or {}).get("ok", False)):
+        post_experiment_recovery = None
+        if evidence_ok:
             try:
                 await self.plugin.controller.run_environment(
                     "science",
@@ -752,11 +811,39 @@ class ExperimentOperator:
                 )
             except Exception as e:
                 logger.warning(f"Failed to enqueue post-experiment review task: {e}")
+        elif exec_ok:
+            recovery_service = getattr(self.plugin, "_recovery_service", None)
+            if recovery_service is not None and hasattr(recovery_service, "ensure_experiment_spawned"):
+                try:
+                    post_experiment_recovery = await recovery_service.ensure_experiment_spawned(
+                        reason="missing_scientific_evidence"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to ensure experiment spawn after evidence miss: {e}")
+            else:
+                try:
+                    created = await self.plugin.controller.run_environment(
+                        "science",
+                        "task_create",
+                        task_type="experiment",
+                        payload={
+                            "reason": "missing_scientific_evidence",
+                            "from_run_id": observation.get("run_id"),
+                        },
+                        priority=4,
+                    )
+                    post_experiment_recovery = {"spawned": bool((created or {}).get("ok", False)), "raw": created}
+                except Exception as e:
+                    logger.warning(f"Failed to create evidence-recovery experiment task: {e}")
 
         ar = ActionResult.success(
             method_name="experiment",
             message="AIRS experiment executed.",
             data={
+                "ok": bool(evidence_ok),
+                "exec_ok": bool(exec_ok),
+                "evidence_ok": bool(evidence_ok),
+                "evidence_reason": str(observation.get("evidence_reason") or ""),
                 "observation": observation,
                 "exp_count": exp_count,
                 "reward": reward,
@@ -781,11 +868,15 @@ class ExperimentOperator:
                     "oom_flag": bool(flags.get("oom", False)),
                     "typeerror_flag": bool(flags.get("typeerror", False)),
                     "vram_efficiency": float(vram_eff) if isinstance(vram_eff, (int, float)) else None,
+                    "exec_ok": bool(exec_ok),
+                    "evidence_ok": bool(evidence_ok),
+                    "evidence_reason": str(observation.get("evidence_reason") or ""),
                     "code_agent_attempted": bool((result or {}).get("code_agent_attempted", False)),
                     "code_agent_ok": bool((result or {}).get("code_agent_ok", False)),
                     "fallback_solver_used": bool((result or {}).get("fallback_solver_used", False)),
                     "execution_path": (result or {}).get("execution_path"),
                 },
+                "post_experiment_recovery": post_experiment_recovery,
             },
         )
         await self.plugin._append_trace(agent_id, "experiment", reward, ar.data or {})

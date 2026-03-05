@@ -205,6 +205,22 @@ class AIRSWorldPlugin(SciencePluginBase):
         self._profile_timeseries_max_rows = int(
             max(128, int(os.getenv("SCIMAS_PROFILE_TIMESERIES_MAX_ROWS", str(profile_timeseries_max_rows))))
         )
+        self._prepare_auto_dev_split_enable = os.getenv("SCIMAS_PREPARE_AUTO_DEV_SPLIT_ENABLE", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._prepare_auto_dev_split_name = str(os.getenv("SCIMAS_PREPARE_AUTO_DEV_SPLIT_NAME", "validation")).strip().lower()
+        if self._prepare_auto_dev_split_name not in {"validation", "val", "dev"}:
+            self._prepare_auto_dev_split_name = "validation"
+        self._prepare_auto_dev_split_ratio = float(
+            max(0.01, min(0.5, float(os.getenv("SCIMAS_PREPARE_AUTO_DEV_SPLIT_RATIO", "0.1"))))
+        )
+        self._prepare_auto_dev_split_min_rows = int(max(1, int(os.getenv("SCIMAS_PREPARE_AUTO_DEV_SPLIT_MIN_ROWS", "64"))))
+        self._prepare_auto_dev_split_max_rows = int(
+            max(0, int(os.getenv("SCIMAS_PREPARE_AUTO_DEV_SPLIT_MAX_ROWS", "20000")))
+        )
+        self._prepare_auto_dev_split_seed = int(os.getenv("SCIMAS_PREPARE_AUTO_DEV_SPLIT_SEED", "42"))
         self._profile_data_lock = asyncio.Lock()
         self._prepare_data_lock = asyncio.Lock()
 
@@ -2696,6 +2712,7 @@ class AIRSWorldPlugin(SciencePluginBase):
 
         if self._prepared_cache_ready() and not refresh:
             cache_dir = self._prepared_cache_dir()
+            split_meta = self._ensure_dev_split_from_train(task=task, data_mount_dir=cache_dir)
             return {
                 "ok": True,
                 "cached": True,
@@ -2706,11 +2723,13 @@ class AIRSWorldPlugin(SciencePluginBase):
                     "dev_rows": self._prepared_split_row_count(cache_dir, ["validation", "val", "dev"]),
                     "test_rows": self._prepared_split_row_count(cache_dir, ["test"]),
                 },
+                "dev_split_meta": split_meta,
             }
 
         async with self._prepare_data_lock:
             if self._prepared_cache_ready() and not refresh:
                 cache_dir = self._prepared_cache_dir()
+                split_meta = self._ensure_dev_split_from_train(task=task, data_mount_dir=cache_dir)
                 return {
                     "ok": True,
                     "cached": True,
@@ -2721,6 +2740,7 @@ class AIRSWorldPlugin(SciencePluginBase):
                         "dev_rows": self._prepared_split_row_count(cache_dir, ["validation", "val", "dev"]),
                         "test_rows": self._prepared_split_row_count(cache_dir, ["test"]),
                     },
+                    "dev_split_meta": split_meta,
                 }
             try:
                 run_log_dir = str(Path(self._task_workspace()) / "_prepared_agent_log")
@@ -2740,6 +2760,7 @@ class AIRSWorldPlugin(SciencePluginBase):
                         "dev_rows": self._prepared_split_row_count(cache_dir, ["validation", "val", "dev"]),
                         "test_rows": self._prepared_split_row_count(cache_dir, ["test"]),
                     },
+                    "dev_split_meta": prepare_cache.get("dev_split_meta") if isinstance(prepare_cache, dict) else {},
                 }
             except asyncio.TimeoutError:
                 logger.warning(
@@ -3778,15 +3799,178 @@ class AIRSWorldPlugin(SciencePluginBase):
             raise RuntimeError(f"prepare.py failed: {err[-800:]}")
         return {"prepare_stdout_tail": out[-1000:], "prepare_stderr_tail": err[-1000:]}
 
+    def _ensure_prepare_split_manifest(
+        self,
+        *,
+        data_mount_dir: str,
+        split_meta: Dict[str, Any],
+    ) -> None:
+        root = Path(data_mount_dir)
+        if not root.exists():
+            return
+        payload = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "auto_dev_split_enabled": bool(self._prepare_auto_dev_split_enable),
+            "dev_split_name": str(split_meta.get("dev_split_name") or ""),
+            "created_from_train": bool(split_meta.get("created_from_train", False)),
+            "reason": str(split_meta.get("reason") or ""),
+            "train_rows_before": int(split_meta.get("train_rows_before", 0) or 0),
+            "train_rows_after": int(split_meta.get("train_rows_after", 0) or 0),
+            "dev_rows": int(split_meta.get("dev_rows", 0) or 0),
+            "ratio": float(split_meta.get("ratio", self._prepare_auto_dev_split_ratio) or self._prepare_auto_dev_split_ratio),
+            "seed": int(split_meta.get("seed", self._prepare_auto_dev_split_seed) or self._prepare_auto_dev_split_seed),
+        }
+        manifest_path = root / "_prepare_split_manifest.json"
+        manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _ensure_dev_split_from_train(self, *, task: Dict[str, Any], data_mount_dir: str) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "created_from_train": False,
+            "dev_split_name": "",
+            "reason": "disabled",
+            "train_rows_before": 0,
+            "train_rows_after": 0,
+            "dev_rows": 0,
+            "ratio": float(self._prepare_auto_dev_split_ratio),
+            "seed": int(self._prepare_auto_dev_split_seed),
+        }
+        if not self._prepare_auto_dev_split_enable:
+            return result
+
+        root = Path(data_mount_dir)
+        if not root.exists():
+            result["reason"] = "data_mount_missing"
+            return result
+
+        from datasets import load_from_disk
+
+        existing_dev_name = ""
+        for split_name in ("validation", "val", "dev"):
+            split_path = root / split_name
+            if not split_path.exists():
+                continue
+            try:
+                n_rows = int(len(load_from_disk(str(split_path))))
+            except Exception:
+                n_rows = 0
+            if n_rows > 0:
+                existing_dev_name = split_name
+                result.update(
+                    {
+                        "created_from_train": False,
+                        "dev_split_name": existing_dev_name,
+                        "reason": "already_exists",
+                        "dev_rows": n_rows,
+                    }
+                )
+                self._ensure_prepare_split_manifest(data_mount_dir=data_mount_dir, split_meta=result)
+                return result
+
+        train_path = root / "train"
+        if not train_path.exists():
+            result["reason"] = "train_split_missing"
+            self._ensure_prepare_split_manifest(data_mount_dir=data_mount_dir, split_meta=result)
+            return result
+
+        try:
+            train_ds = load_from_disk(str(train_path))
+            train_rows = int(len(train_ds))
+        except Exception as e:
+            result["reason"] = f"train_split_load_failed:{e}"
+            self._ensure_prepare_split_manifest(data_mount_dir=data_mount_dir, split_meta=result)
+            return result
+
+        result["train_rows_before"] = train_rows
+        if train_rows < 2:
+            result["reason"] = "train_rows_too_small"
+            self._ensure_prepare_split_manifest(data_mount_dir=data_mount_dir, split_meta=result)
+            return result
+
+        desired = int(round(float(train_rows) * float(self._prepare_auto_dev_split_ratio)))
+        desired = max(self._prepare_auto_dev_split_min_rows, desired)
+        if self._prepare_auto_dev_split_max_rows > 0:
+            desired = min(desired, int(self._prepare_auto_dev_split_max_rows))
+        desired = min(desired, train_rows - 1)
+        if desired <= 0:
+            result["reason"] = "computed_dev_rows_zero"
+            self._ensure_prepare_split_manifest(data_mount_dir=data_mount_dir, split_meta=result)
+            return result
+
+        task_name = str((task or {}).get("task_name") or "")
+        task_seed = int(hashlib.sha1(task_name.encode("utf-8")).hexdigest()[:8], 16) if task_name else 0
+        seed = int((self._prepare_auto_dev_split_seed + task_seed) % (2**31 - 1))
+        rng = random.Random(seed)
+        all_indices = list(range(train_rows))
+        rng.shuffle(all_indices)
+        dev_idx = sorted(all_indices[:desired])
+        dev_idx_set = set(dev_idx)
+        train_idx = [i for i in range(train_rows) if i not in dev_idx_set]
+        if not train_idx or not dev_idx:
+            result["reason"] = "split_indices_invalid"
+            self._ensure_prepare_split_manifest(data_mount_dir=data_mount_dir, split_meta=result)
+            return result
+
+        dev_split_name = str(self._prepare_auto_dev_split_name or "validation")
+        tmp_train = root / "train.__tmp_split__"
+        tmp_dev = root / f"{dev_split_name}.__tmp_split__"
+        for p in (tmp_train, tmp_dev):
+            if p.exists():
+                shutil.rmtree(p, ignore_errors=True)
+
+        try:
+            train_new = train_ds.select(train_idx)
+            dev_new = train_ds.select(dev_idx)
+            train_new.save_to_disk(str(tmp_train))
+            dev_new.save_to_disk(str(tmp_dev))
+
+            if train_path.exists():
+                shutil.rmtree(train_path, ignore_errors=True)
+            os.replace(str(tmp_train), str(train_path))
+
+            for old_dev_name in ("validation", "val", "dev"):
+                old_dev_path = root / old_dev_name
+                if old_dev_name != dev_split_name and old_dev_path.exists():
+                    shutil.rmtree(old_dev_path, ignore_errors=True)
+            dev_target = root / dev_split_name
+            if dev_target.exists():
+                shutil.rmtree(dev_target, ignore_errors=True)
+            os.replace(str(tmp_dev), str(dev_target))
+        finally:
+            if tmp_train.exists():
+                shutil.rmtree(tmp_train, ignore_errors=True)
+            if tmp_dev.exists():
+                shutil.rmtree(tmp_dev, ignore_errors=True)
+
+        result.update(
+            {
+                "created_from_train": True,
+                "dev_split_name": dev_split_name,
+                "reason": "created",
+                "seed": seed,
+                "train_rows_after": int(len(train_idx)),
+                "dev_rows": int(len(dev_idx)),
+            }
+        )
+        self._ensure_prepare_split_manifest(data_mount_dir=data_mount_dir, split_meta=result)
+        return result
+
     def _ensure_prepared_data_cache(self, task: Dict[str, Any], run_agent_log_dir: str) -> Dict[str, Any]:
         del run_agent_log_dir
         if self._solver_prepare_once and self._prepared_cache_ready():
-            return {"cache_dir": self._prepared_cache_dir(), "prepare_stdout_tail": "", "cache_scope": "episode"}
+            cache_dir = self._prepared_cache_dir()
+            split_meta = self._ensure_dev_split_from_train(task=task, data_mount_dir=cache_dir)
+            return {
+                "cache_dir": cache_dir,
+                "prepare_stdout_tail": "",
+                "cache_scope": "episode",
+                "dev_split_meta": split_meta,
+            }
         if self._solver_prepare_once and self._prepared_data_cache_dir and (not Path(str(self._prepared_data_cache_dir)).exists()):
             self._prepared_data_cache_dir = None
         if self._solver_prepare_once:
             persistent_cache = self._try_load_prepared_cache_from_persistent(task)
             if persistent_cache:
+                split_meta = self._ensure_dev_split_from_train(task=task, data_mount_dir=str(persistent_cache))
                 logger.info(
                     f"AIRS prepare cache hit (cross-run): task={str((task or {}).get('task_name') or '')} "
                     f"key={Path(persistent_cache).name}"
@@ -3795,6 +3979,7 @@ class AIRSWorldPlugin(SciencePluginBase):
                     "cache_dir": persistent_cache,
                     "prepare_stdout_tail": "",
                     "cache_scope": "cross_run_persistent",
+                    "dev_split_meta": split_meta,
                 }
 
         base = Path(self._task_workspace())
@@ -3815,6 +4000,8 @@ class AIRSWorldPlugin(SciencePluginBase):
                 agent_log_dir=str(stage_log_dir),
                 data_mount_dir=str(stage_data_dir),
             )
+            split_meta = self._ensure_dev_split_from_train(task=task, data_mount_dir=str(stage_data_dir))
+            prepare_result["dev_split_meta"] = split_meta
             if cache_data_dir.exists():
                 shutil.rmtree(cache_data_dir, ignore_errors=True)
             if cache_log_dir.exists():
@@ -3837,6 +4024,7 @@ class AIRSWorldPlugin(SciencePluginBase):
             "cache_dir": self._prepared_data_cache_dir,
             "prepare_stdout_tail": str(prepare_result.get("prepare_stdout_tail") or ""),
             "cache_scope": "cross_run_persistent" if final_cache_dir != str(cache_data_dir) else "episode",
+            "dev_split_meta": prepare_result.get("dev_split_meta") if isinstance(prepare_result, dict) else {},
         }
 
     def _materialize_data_mount_from_cache(self, cache_dir: str, target_dir: str) -> None:
@@ -4129,6 +4317,11 @@ class AIRSWorldPlugin(SciencePluginBase):
                 "code_agent_stderr_tail": "",
                 "fallback_solver_used": False,
                 "fallback_solver_ok": False,
+                "exec_ok": False,
+                "evidence_ok": False,
+                "evidence_reason": f"hard_stop:{stop_reason}",
+                "has_dev_proxy": False,
+                "submission_preflight": {"ok": False, "error_code": "hard_stop", "message": f"hard_stop:{stop_reason}"},
                 "data_columns": {"train": [], "test": []},
                 "execution_path": "solver_only",
                 "executor_diag": {
@@ -4179,6 +4372,15 @@ class AIRSWorldPlugin(SciencePluginBase):
         code_agent_stderr_tail = ""
         fallback_solver_used = False
         fallback_solver_ok = False
+        exec_ok = False
+        evidence_ok = False
+        evidence_reason = "not_evaluated"
+        has_dev_proxy = False
+        submission_preflight: Dict[str, Any] = {
+            "ok": False,
+            "error_code": "submission_not_checked",
+            "message": "submission preflight not executed",
+        }
         data_columns: Dict[str, List[str]] = {"train": [], "test": []}
         executor_diag: Dict[str, Any] = {
             "backend": self._code_executor_backend,
@@ -4303,6 +4505,16 @@ class AIRSWorldPlugin(SciencePluginBase):
             elif isinstance(dev_score_norm, (int, float)):
                 score_norm = float(dev_score_norm)
                 raw_score = float(dev_score_norm)
+
+            if submission_path and os.path.exists(submission_path):
+                try:
+                    submission_preflight = self._preflight_submission_schema(task=task, submission_path=submission_path)
+                except Exception as e:
+                    submission_preflight = {
+                        "ok": False,
+                        "error_code": "preflight_runtime_error",
+                        "message": str(e),
+                    }
         except Exception as e:
             ok = False
             error = str(e)
@@ -4322,6 +4534,33 @@ class AIRSWorldPlugin(SciencePluginBase):
             executor_diag["memory_hit"] = True
         if "killed" in merged_err:
             executor_diag["killed"] = True
+        exec_ok = bool(submission_path and os.path.exists(submission_path) and not str(error or "").strip())
+        has_dev_proxy = bool(
+            isinstance(dev_score, (int, float))
+            or isinstance(dev_score_norm, (int, float))
+            or (
+                isinstance(dev_eval, dict)
+                and (
+                    bool(dev_eval.get("ok", False))
+                    or isinstance(dev_eval.get("raw_score"), (int, float))
+                    or isinstance(dev_eval.get("score_norm"), (int, float))
+                )
+            )
+        )
+        preflight_ok = bool((submission_preflight or {}).get("ok", False))
+        evidence_ok = bool(exec_ok and has_dev_proxy and preflight_ok)
+        evidence_reasons: List[str] = []
+        if not exec_ok:
+            evidence_reasons.append("exec_failed")
+        if exec_ok and not has_dev_proxy:
+            evidence_reasons.append("missing_dev_proxy")
+        if exec_ok and not preflight_ok:
+            evidence_reasons.append(
+                f"submission_preflight_failed:{str((submission_preflight or {}).get('error_code') or 'unknown')}"
+            )
+        evidence_reason = "ok" if evidence_ok else "|".join(evidence_reasons or ["missing_evidence"])
+        ok = exec_ok
+
         if code_agent_attempted and code_agent_ok:
             execution_path = "code_agent_only"
         elif code_agent_attempted:
@@ -4368,6 +4607,11 @@ class AIRSWorldPlugin(SciencePluginBase):
             "code_agent_stderr_tail": str(code_agent_stderr_tail or ""),
             "fallback_solver_used": bool(fallback_solver_used),
             "fallback_solver_ok": bool(fallback_solver_ok),
+            "exec_ok": bool(exec_ok),
+            "evidence_ok": bool(evidence_ok),
+            "evidence_reason": str(evidence_reason or ""),
+            "has_dev_proxy": bool(has_dev_proxy),
+            "submission_preflight": submission_preflight if isinstance(submission_preflight, dict) else {},
             "data_columns": data_columns if isinstance(data_columns, dict) else {"train": [], "test": []},
             "execution_path": execution_path,
             "executor_diag": executor_diag,
