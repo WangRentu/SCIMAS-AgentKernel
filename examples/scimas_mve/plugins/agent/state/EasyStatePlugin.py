@@ -1,6 +1,5 @@
 from typing import Dict, Any, Optional, List
 
-import copy
 import os
 from agentkernel_standalone.toolkit.logger import get_logger
 from agentkernel_standalone.mas.agent.base.plugin_base import StatePlugin
@@ -25,41 +24,9 @@ class EasyStatePlugin(StatePlugin):
             "SCIMAS_VERBOSE_STATE_LOGS",
             "1" if log_mode == "verbose" else "0",
         ).lower() in {"1", "true", "yes"}
-        self._default_action_space = action_space or [
-            "read",
-            "prepare_data",
-            "profile_data",
-            "retrieve_literature",
-            "hypothesize",
-            "experiment",
-            "replicate",
-            "write",
-            "review",
-            "share_evidence",
-            "share_observation",
-            "claim_task",
-            "complete_task",
-        ]
-        self._default_policy = policy or {
-            "read": 0.14,
-            "prepare_data": 0.05,
-            "profile_data": 0.07,
-            "retrieve_literature": 0.05,
-            "hypothesize": 0.12,
-            "experiment": 0.20,
-            "replicate": 0.02,
-            "write": 0.12,
-            "review": 0.08,
-            "share_evidence": 0.05,
-            "share_observation": 0.05,
-            "claim_task": 0.06,
-            "complete_task": 0.04,
-        }
-        self._state_data.setdefault("policy", copy.deepcopy(self._default_policy))
-        self._state_data.setdefault("alpha", alpha)
-        self._state_data.setdefault("beta", beta)
-        self._state_data.setdefault("action_space", list(self._default_action_space))
         self._state_data.setdefault("budget", budget)
+        self._state_data.setdefault("phase_status", {})
+        self._state_data.setdefault("last_action_ok", False)
         self._state_data.setdefault("exp_count", 0)
         self._state_data.setdefault("observations", [])
         self._state_data.setdefault("replications", [])
@@ -73,6 +40,8 @@ class EasyStatePlugin(StatePlugin):
         self._state_data.setdefault("inbox_evidence", [])
         self._state_data.setdefault("last_action", None)
         self._state_data.setdefault("last_effective_action", None)
+        self._state_data.setdefault("last_action_seq", 0)
+        self._state_data.setdefault("last_reflected_seq", 0)
         self._state_data.setdefault("last_reward", 0.0)
         self._state_data.setdefault("last_learning_reward", 0.0)
         self._state_data.setdefault("last_reward_components", {})

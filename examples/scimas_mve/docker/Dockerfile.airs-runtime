@@ -26,6 +26,14 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 
 RUN python - <<'PY'
 import importlib
+import torch
+
+# Build-time guard: fail if a CPU-only torch wheel was installed.
+if torch.version.cuda is None or "+cu" not in str(torch.__version__):
+    raise RuntimeError(
+        f"Expected CUDA torch wheel, got torch={torch.__version__}, torch.version.cuda={torch.version.cuda}"
+    )
+
 mods = [
     "datasets",
     "numpy",
@@ -45,7 +53,10 @@ for m in mods:
         missing.append((m, str(e)))
 if missing:
     raise RuntimeError(f"Missing modules in image: {missing}")
-print("AIRS runtime dependency check passed.")
+print(
+    "AIRS runtime dependency check passed. "
+    f"torch={torch.__version__}, torch.version.cuda={torch.version.cuda}"
+)
 PY
 
 CMD ["python", "-c", "print('scimas-airs-runtime ready')"]

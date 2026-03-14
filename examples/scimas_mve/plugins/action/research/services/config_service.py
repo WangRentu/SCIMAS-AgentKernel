@@ -166,6 +166,10 @@ class ConfigService:
             "SCIMAS_EXPERIMENT_REQUIRE_EVIDENCE_OK",
             "1",
         ).lower() not in {"0", "false", "no"}
+        p._experiment_require_publish_ready = os.getenv(
+            "SCIMAS_EXPERIMENT_REQUIRE_PUBLISH_READY",
+            "0",
+        ).lower() not in {"0", "false", "no"}
         p._claim_backoff_base = int(max(1, int(os.getenv("SCIMAS_CLAIM_BACKOFF_BASE", "1"))))
         p._claim_backoff_max = int(max(p._claim_backoff_base, int(os.getenv("SCIMAS_CLAIM_BACKOFF_MAX", "8"))))
         p._claim_cost = float(max(0.0, float(os.getenv("SCIMAS_CLAIM_COST", "0.002"))))

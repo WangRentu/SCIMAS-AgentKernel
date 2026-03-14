@@ -594,15 +594,6 @@ class DevEvaluator:
         return None
 
     def _find_dev_predictions(self, workspace_dir: Path):
-        candidates = [
-            workspace_dir / "outputs" / "dev_predictions.csv",
-            workspace_dir / "outputs" / "dev_predictions.parquet",
-            workspace_dir / "dev_predictions.csv",
-            workspace_dir / "dev_predictions.parquet",
-        ]
-        for path in candidates:
-            if path.exists():
-                return self._load_df(path), path
         metrics_path = workspace_dir / "outputs" / "dev_metrics.json"
         if metrics_path.exists():
             try:
@@ -617,6 +608,16 @@ class DevEvaluator:
                 return data, codegen_metrics_path
             except Exception:
                 return None, codegen_metrics_path
+
+        candidates = [
+            workspace_dir / "outputs" / "dev_predictions.csv",
+            workspace_dir / "outputs" / "dev_predictions.parquet",
+            workspace_dir / "dev_predictions.csv",
+            workspace_dir / "dev_predictions.parquet",
+        ]
+        for path in candidates:
+            if path.exists():
+                return self._load_df(path), path
         return None, None
 
     def _evaluate_retrieval_dev(self, *, task: Dict[str, Any], data_dir: Path, workspace_dir: Path) -> Dict[str, Any]:

@@ -26,45 +26,69 @@ class EasyInvokePlugin(InvokePlugin):
         state_comp = self._component.agent.get_component("state")
         self.state_plug = state_comp._plugin
     async def execute(self, current_tick: int):
-        
+        executed = False
         self.plans = self.plan_plug.plan
         for plan in self.plans:
             action = plan.get("action")
-            if not action:
+            if not action or action == "idle":
                 continue
             result = await self._run_research_action(action, plan)
             await self._record_result(action, result)
+            executed = True
+        if not executed:
+            await self._clear_last_result()
 
     async def _run_research_action(self, action: str, plan: Dict[str, Any]) -> ActionResult:
-        payload = {k: v for k, v in plan.items() if k != "action"}
+        payload = {k: v for k, v in plan.items() if k not in ("action", "greedy_improve")}
         payload["agent_id"] = self.agent_id
+        if plan.get("greedy_improve"):
+            config = payload.get("config") or {}
+            if not isinstance(config, dict):
+                config = {}
+            config["greedy_improve"] = True
+            payload["config"] = config
         return await self.controller.run_action("otheractions", action, **payload)
+
+    async def _clear_last_result(self) -> None:
+        await self.state_plug.set_state("last_action", None)
+        await self.state_plug.set_state("last_effective_action", None)
+        await self.state_plug.set_state("last_reward", 0.0)
+        await self.state_plug.set_state("last_learning_reward", 0.0)
+        await self.state_plug.set_state("last_reward_components", {})
+        await self.state_plug.set_state("last_action_ok", None)
 
     async def _record_result(self, action: str, result: ActionResult) -> None:
         if not isinstance(result, ActionResult):
+            await self._clear_last_result()
             return
-        if isinstance(result.data, dict):
-            reward = result.data.get("reward")
-            if reward is not None:
-                effective_action = result.data.get("effective_action") or action
-                reward_components = result.data.get("reward_components") or {}
-                learning_reward = self._derive_learning_reward(
-                    action=action,
-                    effective_action=effective_action,
-                    reward=float(reward),
-                    reward_components=reward_components,
-                )
-                await self.state_plug.set_state("last_action", action)
-                await self.state_plug.set_state("last_effective_action", effective_action)
-                await self.state_plug.set_state("last_reward", reward)
-                await self.state_plug.set_state("last_learning_reward", learning_reward)
-                await self.state_plug.set_state("last_reward_components", reward_components)
-                await self._update_episode_ledgers(effective_action, float(reward), reward_components)
+        payload = result.data if isinstance(result.data, dict) else {}
+        effective_action = payload.get("effective_action") or action
+        reward_raw = payload.get("reward", 0.0)
+        try:
+            reward = float(reward_raw or 0.0)
+        except (TypeError, ValueError):
+            reward = 0.0
+        reward_components = payload.get("reward_components") or {}
+        learning_reward = self._derive_learning_reward(
+            action=action,
+            effective_action=effective_action,
+            reward=reward,
+            reward_components=reward_components,
+        )
+        action_ok = bool(result.is_successful() and payload.get("ok", True))
+        action_seq = int((await self.state_plug.get_state("last_action_seq")) or 0) + 1
+        await self.state_plug.set_state("last_action", action)
+        await self.state_plug.set_state("last_effective_action", effective_action)
+        await self.state_plug.set_state("last_reward", reward)
+        await self.state_plug.set_state("last_learning_reward", learning_reward)
+        await self.state_plug.set_state("last_reward_components", reward_components)
+        await self.state_plug.set_state("last_action_ok", action_ok)
+        await self.state_plug.set_state("last_action_seq", action_seq)
         if self._verbose_invoke_logs:
             logger.info(f"Agent {self.agent_id} executed {action} with status {result.status}")
 
+    @staticmethod
     def _derive_learning_reward(
-        self,
         *,
         action: str,
         effective_action: str,
@@ -77,25 +101,4 @@ class EasyInvokePlugin(InvokePlugin):
                 return float(explicit)
             if action == "complete_task":
                 return float(reward_components.get("inner_reward", 0.0) or 0.0)
-        # Claiming a task is a workflow step; avoid overfitting policy to claim bonuses.
-        if action == "claim_task" and effective_action == "claim_task":
-            return 0.0
         return reward
-
-    async def _update_episode_ledgers(
-        self,
-        effective_action: str,
-        reward: float,
-        reward_components: Dict[str, Any],
-    ) -> None:
-        ledger = await self.state_plug.get_state("episode_reward_ledger") or {}
-        counts = await self.state_plug.get_state("episode_action_counts") or {}
-        counts[effective_action] = int(counts.get(effective_action, 0) or 0) + 1
-        ledger["total_reward"] = float(ledger.get("total_reward", 0.0) or 0.0) + reward
-        if isinstance(reward_components, dict):
-            for key, value in reward_components.items():
-                if not isinstance(value, (int, float)):
-                    continue
-                ledger[key] = float(ledger.get(key, 0.0) or 0.0) + float(value)
-        await self.state_plug.set_state("episode_reward_ledger", ledger)
-        await self.state_plug.set_state("episode_action_counts", counts)

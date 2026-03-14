@@ -76,6 +76,18 @@ class DiagnosisService:
             severity = "high"
             root_cause = "memory_pressure"
             repair_hints.extend(["enable_sampling", "reduce_batch_size", "reduce_feature_count"])
+        elif "cannot load dev data from" in merged or ("filenotfounderror" in merged and "dev data from" in merged):
+            error_class = "io"
+            severity = "medium"
+            root_cause = "dev_split_hardcoded_or_unavailable"
+            error_codes.append("dev_split_name_or_presence_misuse")
+            repair_hints.extend(
+                [
+                    "read_manifest_available_splits_and_dev_split_name",
+                    "avoid_hardcoded_dev_split",
+                    "fallback_validation_val_or_train_derived_dev",
+                ]
+            )
         elif "no such file or directory" in merged or "filenotfounderror" in merged:
             error_class = "io"
             severity = "medium"
@@ -114,6 +126,11 @@ class DiagnosisService:
             error_codes.append("scoring_column_list_misuse")
             root_cause = "scoring_column_list_not_indexed"
             repair_hints.append("read_manifest_and_use_scoring_column_index0")
+        elif "submission_preflight_failed:missing_columns" in merged or "missing required columns" in merged or "missing_columns" in merged:
+            error_class = "format"
+            error_codes.append("submission_format_invalid")
+            root_cause = "submission_schema_mismatch"
+            repair_hints.append("align_submission_columns_with_manifest")
         elif "evaluate.py failed" in merged or ("submission" in merged and "format" in merged):
             error_class = "format"
             error_codes.append("submission_format_invalid")
@@ -194,6 +211,20 @@ class DiagnosisService:
                     )
                     rules_hit.append("io_train_csv_to_load_from_disk")
 
+            if "dev_split_name_or_presence_misuse" in error_codes:
+                replaced = updated
+                replaced = replaced.replace(
+                    "load_data_robust(args.data_dir, 'dev')",
+                    "load_data_robust(args.data_dir, manifest.get('dev_split_name') or 'validation')",
+                )
+                replaced = replaced.replace(
+                    'load_data_robust(args.data_dir, \"dev\")',
+                    "load_data_robust(args.data_dir, manifest.get('dev_split_name') or 'validation')",
+                )
+                if replaced != updated:
+                    updated = replaced
+                    rules_hit.append("io_dev_split_use_manifest_name")
+
             if "scoring_column_list_misuse" in error_codes:
                 if "scoring_column" in updated and "[0]" not in updated:
                     updated = updated.replace(
@@ -221,6 +252,39 @@ class DiagnosisService:
                         "submission_path = os.path.join('./outputs', 'submission.csv')\n"
                     )
                     rules_hit.append("format_force_submission_path")
+                if "submission_format_invalid" in error_codes:
+                    updated += (
+                        "\n\n# template fix: enforce submission schema from manifest\n"
+                        "try:\n"
+                        "    import json as _json_fix\n"
+                        "    import pandas as _pd_fix\n"
+                        "    _manifest_path = './.task_manifest.json'\n"
+                        "    _required_cols = ['prediction']\n"
+                        "    if os.path.exists(_manifest_path):\n"
+                        "        with open(_manifest_path, 'r', encoding='utf-8') as _mf:\n"
+                        "            _manifest = _json_fix.load(_mf)\n"
+                        "        _sc = _manifest.get('scoring_column')\n"
+                        "        if isinstance(_sc, list) and _sc:\n"
+                        "            _required_cols = [str(x).strip() for x in _sc if str(x).strip()] or ['prediction']\n"
+                        "        elif isinstance(_sc, str) and _sc.strip():\n"
+                        "            _required_cols = [_sc.strip()]\n"
+                        "    _sub_path = os.path.join('./outputs', 'submission.csv')\n"
+                        "    if os.path.exists(_sub_path):\n"
+                        "        _df = _pd_fix.read_csv(_sub_path)\n"
+                        "        if len(_required_cols) == 1:\n"
+                        "            _target_col = _required_cols[0]\n"
+                        "            if _target_col in _df.columns:\n"
+                        "                _out = _df[[_target_col]]\n"
+                        "            else:\n"
+                        "                _src_col = 'prediction' if 'prediction' in _df.columns else (\n"
+                        "                    _df.columns[1] if ('row_id' in _df.columns and len(_df.columns) > 1) else _df.columns[0]\n"
+                        "                )\n"
+                        "                _out = _df[[_src_col]].rename(columns={_src_col: _target_col})\n"
+                        "            _out.to_csv(_sub_path, index=False)\n"
+                        "except Exception:\n"
+                        "    pass\n"
+                    )
+                    rules_hit.append("format_enforce_manifest_columns")
 
             if updated != content:
                 file_obj["content"] = updated[: self.plugin._code_max_file_chars]

@@ -21,23 +21,38 @@ class ReviewOperator:
         submission: Optional[Dict[str, Any]] = None,
     ) -> ActionResult:
         if self.plugin._strict_review_mode and not paper_id and not run_id:
-            ar = ActionResult.success(
-                method_name="review",
-                message="Review deferred: no paper_id or run_id available in strict mode.",
-                data={
-                    "ok": False,
-                    "review_deferred": True,
-                    "reason": "no_artifact_to_review",
-                    "reward": 0.0,
-                    "effective_action": "review",
-                    "reward_components": {
-                        "review_reward": 0.0,
-                        "learning_reward": 0.0,
+            local_runs = await self.plugin._get_state(agent_id, "observations") or []
+            inferred_run_id = ""
+            for run in reversed(local_runs):
+                if not isinstance(run, dict):
+                    continue
+                candidate_run_id = str(run.get("run_id") or "").strip()
+                if not candidate_run_id:
+                    continue
+                scientific_ok = bool(run.get("scientific_ok", run.get("evidence_ok", run.get("ok", False))))
+                if scientific_ok:
+                    inferred_run_id = candidate_run_id
+                    break
+            if inferred_run_id:
+                run_id = inferred_run_id
+            else:
+                ar = ActionResult.success(
+                    method_name="review",
+                    message="Review deferred: no paper_id or scientific run_id available in strict mode.",
+                    data={
+                        "ok": False,
+                        "review_deferred": True,
+                        "reason": "no_artifact_to_review",
+                        "reward": 0.0,
+                        "effective_action": "review",
+                        "reward_components": {
+                            "review_reward": 0.0,
+                            "learning_reward": 0.0,
+                        },
                     },
-                },
-            )
-            await self.plugin._append_trace(agent_id, "review", 0.0, ar.data or {})
-            return ar
+                )
+                await self.plugin._append_trace(agent_id, "review", 0.0, ar.data or {})
+                return ar
 
         review_world_spec: Dict[str, Any] = {}
         review_local_runs: List[Dict[str, Any]] = []
@@ -250,14 +265,15 @@ class ReviewOperator:
             if latest is None:
                 latest = {}
 
-            if not bool(latest.get("evidence_ok", latest.get("ok", False))):
+            latest_scientific_ok = bool(latest.get("scientific_ok", latest.get("evidence_ok", latest.get("ok", False))))
+            if not latest_scientific_ok:
                 ar = ActionResult.success(
                     method_name="review",
-                    message="Review deferred: run lacks scientific evidence (dev proxy/preflight).",
+                    message="Review deferred: run lacks scientific evidence (missing dev proxy).",
                     data={
                         "ok": False,
                         "review_deferred": True,
-                        "reason": "run_evidence_not_ready",
+                        "reason": "run_scientific_not_ready",
                         "run_id": latest.get("run_id") or run_id,
                         "reward": 0.0,
                         "effective_action": "review",

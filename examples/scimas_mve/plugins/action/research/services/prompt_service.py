@@ -644,11 +644,13 @@ class PromptService:
         failure_context: Optional[str] = None,
         failure_diagnosis: Optional[Dict[str, Any]] = None,
         template_fix: Optional[Dict[str, Any]] = None,
-        best_dev_score_norm: Optional[float] = None,
+        best_metric_text: Optional[str] = None,
         rag_context: str = "",
         rag_refs: Optional[List[str]] = None,
         rag_status: str = "",
         data_columns: Optional[Dict[str, List[str]]] = None,
+        repeated_failures: Optional[List[Dict[str, Any]]] = None,
+        recent_failure_codes: Optional[List[str]] = None,
     ) -> str:
         notes_short = []
         for n in notes[-4:]:
@@ -683,6 +685,20 @@ class PromptService:
         observed_columns = data_columns if isinstance(data_columns, dict) else {}
         train_columns = [str(x) for x in (observed_columns.get("train") or []) if str(x).strip()][:128]
         test_columns = [str(x) for x in (observed_columns.get("test") or []) if str(x).strip()][:128]
+        split_stats = (data_card_short or {}).get("split_stats") if isinstance(data_card_short, dict) else {}
+        split_hint = {
+            "train_rows": int(split_stats.get("train_rows", 0) or 0) if isinstance(split_stats, dict) else 0,
+            "dev_rows": int(split_stats.get("dev_rows", 0) or 0) if isinstance(split_stats, dict) else 0,
+            "test_rows": int(split_stats.get("test_rows", 0) or 0) if isinstance(split_stats, dict) else 0,
+        }
+        raw_scoring = world_spec.get("scoring_column")
+        required_submission_columns: List[str] = []
+        if isinstance(raw_scoring, list):
+            required_submission_columns = [str(x).strip() for x in raw_scoring if str(x).strip()]
+        elif isinstance(raw_scoring, str) and raw_scoring.strip():
+            required_submission_columns = [raw_scoring.strip()]
+        if not required_submission_columns:
+            required_submission_columns = ["prediction"]
         enforce_columns = bool(getattr(self.plugin, "_experiment_prompt_enforce_columns", True))
         column_constraints = ""
         if enforce_columns:
@@ -690,22 +706,49 @@ class PromptService:
                 """
                 11) Use only columns observed in 'Observed train/test columns' unless guarded fallback checks prove existence at runtime.
                 12) Never hardcode imaginary column names; validate columns before selecting features/targets.
+                13) `outputs/submission.csv` MUST contain exactly the required columns from task manifest (no extras, no row_id).
+                14) For this task, required submission columns are shown below; align header strictly.
                 """
             ).strip()
+        if round_idx <= 1:
+            complexity = "minimal"
+        elif round_idx <= 3:
+            complexity = "moderate"
+        else:
+            complexity = "advanced"
+
         phase_guidance = {
-            "generate": "Write first executable baseline code for this task.",
-            "repair": "Fix execution/runtime errors and keep scientific validity.",
-            "optimize": "Improve dev score while preserving reproducibility and format validity.",
+            "generate": f"Write a {complexity} executable baseline. Start simple; correctness before cleverness.",
+            "repair": f"Fix the execution/runtime error. Apply a targeted, {complexity}-complexity fix—do not rewrite working code.",
+            "optimize": f"Improve dev score with one {complexity}-level change (feature, architecture, or schedule). Preserve all passing logic.",
         }.get(phase, "Write executable research code.")
+
+        scoped_memory_note = ""
+        if phase in ("generate", "optimize"):
+            scoped_memory_note = (
+                "MEMORY SCOPE: Use only sibling-run summaries (same parent hypothesis). "
+                "Promote diversity—do NOT copy previous approaches verbatim."
+            )
+        elif phase == "repair":
+            scoped_memory_note = (
+                "MEMORY SCOPE: Use the full ancestor chain of this run for debugging context. "
+                "Review all prior fix attempts to avoid undo-redo oscillations."
+            )
 
         return textwrap.dedent(
             f"""
             You are an autonomous ML researcher working in a controlled AIRS code sandbox.
             Objective: produce runnable code, iterate from errors, and improve dev metrics.
 
+            IMPORTANT: Before writing code, think step-by-step about your approach.
+            Reason about what has worked, what has failed, and what single change will have
+            the highest expected improvement. Structure your reasoning before producing code.
+
             Phase: {phase}
             Round: {round_idx}/{max_rounds}
+            Complexity level: {complexity}
             Guidance: {phase_guidance}
+            {scoped_memory_note}
 
             Task context:
             - task_name: {world_spec.get('task_name')}
@@ -713,8 +756,9 @@ class PromptService:
             - category: {world_spec.get('category')}
             - research_problem: {world_spec.get('research_problem')}
             - budget_used: {exp_count}/{budget}
-            - best_dev_score_norm_so_far: {best_dev_score_norm if best_dev_score_norm is not None else "N/A"}
+            - best_metric_so_far: {best_metric_text if best_metric_text is not None else "N/A"}
             - current_strategy: {plan_spec.get('strategy')}
+            - required_submission_columns: {json.dumps(required_submission_columns, ensure_ascii=False)}
 
             Scientific hypotheses:
             {json.dumps(hypothesis[:8], ensure_ascii=False)}
@@ -743,6 +787,12 @@ class PromptService:
             Failure context (if any):
             {failure_context or "N/A"}
 
+            Repeated failure blacklist:
+            {json.dumps(list(repeated_failures or [])[:8], ensure_ascii=False)}
+
+            Recent failure codes to avoid:
+            {json.dumps(list(recent_failure_codes or [])[:12], ensure_ascii=False)}
+
             Diagnosis JSON (for repair/optimize):
             {json.dumps(failure_diagnosis or {}, ensure_ascii=False)}
 
@@ -763,6 +813,7 @@ class PromptService:
             2) Code must run via one command.
             3) Must output `outputs/submission.csv` for test-format predictions.
             4) Should output `outputs/dev_predictions.csv` for dev evaluation.
+            4.1) If you compute dev metric in code, also save `outputs/dev_metrics.json` with numeric `raw_score`.
             5) No network calls, no package installs, no external downloads.
             6) Keep code deterministic (set seeds if applicable).
             7) IMPORTANT: Do NOT assume `./data/train.csv` or `./data/test.csv` always exist.
@@ -771,9 +822,27 @@ class PromptService:
                Prefer robust loading:
                - first try `datasets.load_from_disk('./data/train')`
                - fallback to `pd.read_csv('./data/train.csv')` only if CSV exists.
-            8) Read `.task_manifest.json` to get metric/category/scoring_column and format submission accordingly.
-            9) Do NOT repeat previously failed error_codes if provided in Diagnosis JSON.
+            8) Read `.task_manifest.json` before loading any split. Use:
+               - `available_splits = manifest.get('available_splits', [])`
+               - `dev_split_name = manifest.get('dev_split_name')`
+            8.1) Never hardcode the validation split name as `'dev'`.
+                 Use `dev_split_name` first; only try `validation` / `val` / `dev`
+                 if that candidate is explicitly present in `available_splits`.
+            8.2) Split hint from profile: {json.dumps(split_hint, ensure_ascii=False)}.
+                 If `dev_rows > 0`, assume a dev-like split exists but may be named `validation` or `val`, not `dev`.
+            8.3) If no dev-like split exists, do NOT raise `FileNotFoundError`.
+                 Fall back gracefully: derive a local validation split from train or skip local dev loading while still writing submission.
+            9) Do NOT repeat previously failed error_codes if provided in Diagnosis JSON or Repeated failure blacklist.
+            9.1) If the repeated blacklist shows split/path IO mistakes, patch the data-loading logic first before changing model logic.
             10) Keep valid existing logic unless a rule in TemplateFix explicitly changes it.
+            11) If scoring_column is a list, use the first item as primary output column unless task requires multi-column output.
+            12) Save one row per sample and one JSON-serialized list string per cell for sequence outputs.
+            13) CRITICAL: submission.csv MUST contain predictions for ALL test rows. Never
+                sample, truncate, or skip test rows. The row count must match exactly.
+                You MAY sample/truncate train data for faster training, but test predictions
+                must be exhaustive. Row count mismatch causes automatic rejection.
+            13.1) Do not call `head()`, `sample()`, slicing, or any row filter on test before
+                  writing submission.csv. `len(submission.csv)` must equal `len(test split)`.
             {column_constraints}
 
             Return ONLY JSON:

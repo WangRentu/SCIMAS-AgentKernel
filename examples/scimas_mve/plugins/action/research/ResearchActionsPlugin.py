@@ -1603,11 +1603,13 @@ class ResearchActionsPlugin(OtherActionsPlugin):
         failure_context: Optional[str] = None,
         failure_diagnosis: Optional[Dict[str, Any]] = None,
         template_fix: Optional[Dict[str, Any]] = None,
-        best_dev_score_norm: Optional[float] = None,
+        best_metric_text: Optional[str] = None,
         rag_context: str = "",
         rag_refs: Optional[List[str]] = None,
         rag_status: str = "",
         data_columns: Optional[Dict[str, List[str]]] = None,
+        repeated_failures: Optional[List[Dict[str, Any]]] = None,
+        recent_failure_codes: Optional[List[str]] = None,
     ) -> str:
         payload = dict(locals())
         payload.pop("self", None)

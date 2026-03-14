@@ -88,11 +88,11 @@ class ExperimentOperator:
         return merged
 
     @staticmethod
-    def _derive_evidence_ok(result: Dict[str, Any]) -> bool:
+    def _derive_scientific_ok(result: Dict[str, Any]) -> bool:
         if not isinstance(result, dict):
             return False
-        if "evidence_ok" in result:
-            return bool(result.get("evidence_ok", False))
+        if "scientific_ok" in result:
+            return bool(result.get("scientific_ok", False))
         exec_ok = bool(result.get("exec_ok", result.get("ok", False)))
         has_dev_proxy = bool(
             isinstance(result.get("dev_score"), (int, float))
@@ -106,9 +106,132 @@ class ExperimentOperator:
                 )
             )
         )
+        return bool(exec_ok and has_dev_proxy)
+
+    @staticmethod
+    def _derive_publish_ready(result: Dict[str, Any]) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if "publish_ready" in result:
+            return bool(result.get("publish_ready", False))
+        if "evidence_ok" in result:
+            return bool(result.get("evidence_ok", False))
+        scientific_ok = ExperimentOperator._derive_scientific_ok(result)
         preflight = result.get("submission_preflight")
         preflight_ok = bool(preflight.get("ok", False)) if isinstance(preflight, dict) else True
-        return bool(exec_ok and has_dev_proxy and preflight_ok)
+        return bool(scientific_ok and preflight_ok)
+
+    @staticmethod
+    def _derive_evidence_ok(result: Dict[str, Any]) -> bool:
+        # Backward-compatible alias: evidence_ok means publish-level readiness.
+        return ExperimentOperator._derive_publish_ready(result)
+
+    @staticmethod
+    def _as_optional_float(value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _recent_failure_blacklist(attempts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        code_counts: Dict[str, int] = {}
+        code_examples: Dict[str, str] = {}
+        for attempt in attempts[-8:]:
+            if not isinstance(attempt, dict):
+                continue
+            diagnosis = attempt.get("diagnosis") or {}
+            result = attempt.get("result") or {}
+            if not isinstance(diagnosis, dict):
+                diagnosis = {}
+            if not isinstance(result, dict):
+                result = {}
+            snippet = str(
+                result.get("error")
+                or result.get("stderr_tail")
+                or diagnosis.get("root_cause")
+                or ""
+            ).strip()
+            for raw_code in list(diagnosis.get("error_codes") or [])[:8]:
+                code = str(raw_code or "").strip()
+                if not code:
+                    continue
+                code_counts[code] = int(code_counts.get(code, 0)) + 1
+                if code not in code_examples and snippet:
+                    code_examples[code] = snippet[:220]
+        ranked = sorted(code_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        rows: List[Dict[str, Any]] = []
+        for code, count in ranked:
+            if count < 2 and len(rows) >= 3:
+                continue
+            rows.append(
+                {
+                    "error_code": code,
+                    "count": int(count),
+                    "example": code_examples.get(code, ""),
+                }
+            )
+            if len(rows) >= 6:
+                break
+        return rows
+
+    def _metric_lower_is_better(self, world_spec: Dict[str, Any], result: Optional[Dict[str, Any]]) -> bool:
+        payload = result if isinstance(result, dict) else {}
+        if payload.get("metric_lower_is_better") is not None:
+            return bool(payload.get("metric_lower_is_better"))
+        dev_eval = payload.get("dev_eval")
+        if isinstance(dev_eval, dict) and dev_eval.get("lower_is_better") is not None:
+            return bool(dev_eval.get("lower_is_better"))
+        return bool((world_spec or {}).get("metric_lower_is_better", False))
+
+    def _metric_value(self, result: Optional[Dict[str, Any]]) -> Optional[float]:
+        payload = result if isinstance(result, dict) else {}
+        dev_score = self._as_optional_float(payload.get("dev_score"))
+        if dev_score is not None:
+            return dev_score
+        dev_eval = payload.get("dev_eval")
+        if isinstance(dev_eval, dict):
+            dev_eval_score = self._as_optional_float(dev_eval.get("raw_score"))
+            if dev_eval_score is not None:
+                return dev_eval_score
+        raw_score = self._as_optional_float(payload.get("raw_score"))
+        if raw_score is not None:
+            return raw_score
+        return None
+
+    def _selection_summary(self, world_spec: Dict[str, Any], result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        payload = result if isinstance(result, dict) else {}
+        lower_is_better = self._metric_lower_is_better(world_spec, payload)
+        metric_name = str(payload.get("metric_name") or (world_spec or {}).get("metric") or "score")
+        metric_value = self._metric_value(payload)
+        if metric_value is not None:
+            direction = "lower better" if lower_is_better else "higher better"
+            return {
+                "selection_score": -metric_value if lower_is_better else metric_value,
+                "metric_value": metric_value,
+                "metric_name": metric_name,
+                "metric_lower_is_better": lower_is_better,
+                "display": f"{metric_name}={metric_value:.6f} ({direction})",
+            }
+        norm_value = self._as_optional_float(payload.get("dev_score_norm"))
+        if norm_value is None:
+            norm_value = self._as_optional_float(payload.get("score_norm"))
+        if norm_value is not None:
+            return {
+                "selection_score": norm_value,
+                "metric_value": None,
+                "metric_name": metric_name,
+                "metric_lower_is_better": lower_is_better,
+                "display": f"score_norm={norm_value:.6f}",
+            }
+        return {
+            "selection_score": None,
+            "metric_value": None,
+            "metric_name": metric_name,
+            "metric_lower_is_better": lower_is_better,
+            "display": None,
+        }
 
     async def _run_code_research_loop(
         self,
@@ -132,7 +255,8 @@ class ExperimentOperator:
 
         attempts: List[Dict[str, Any]] = []
         best_result: Optional[Dict[str, Any]] = None
-        best_score = -1.0
+        best_selection_score: Optional[float] = None
+        best_metric_text: Optional[str] = None
         best_plan: Dict[str, Any] = {}
         previous_plan: Dict[str, Any] = {}
         failure_context = ""
@@ -142,7 +266,8 @@ class ExperimentOperator:
         had_code_agent_success = False
         require_code_agent_success = bool(getattr(self.plugin, "_experiment_require_code_agent_success", True))
         treat_fallback_as_repair = bool(getattr(self.plugin, "_experiment_treat_fallback_as_repair", True))
-        require_evidence_ok = bool(getattr(self.plugin, "_experiment_require_evidence_ok", True))
+        require_scientific_ok = bool(getattr(self.plugin, "_experiment_require_evidence_ok", True))
+        require_publish_ready = bool(getattr(self.plugin, "_experiment_require_publish_ready", False))
         observed_data_columns = self._columns_from_data_card(data_card if isinstance(data_card, dict) else None)
 
         max_rounds = min(self.plugin._code_debug_rounds, max(1, int(budget or self.plugin._code_debug_rounds)))
@@ -208,11 +333,13 @@ class ExperimentOperator:
                 failure_context=failure_context,
                 failure_diagnosis=last_diagnosis,
                 template_fix=last_template_fix,
-                best_dev_score_norm=best_score if best_score >= 0.0 else None,
+                best_metric_text=best_metric_text,
                 rag_context=rag_block.get("context", ""),
                 rag_refs=rag_block.get("refs", []),
                 rag_status=rag_block.get("status", ""),
                 data_columns=observed_data_columns,
+                repeated_failures=self._recent_failure_blacklist(attempts),
+                recent_failure_codes=list((last_diagnosis or {}).get("error_codes") or []),
             )
             llm_result = await self.plugin._call_llm_json(agent_id=agent_id, action_name="experiment", prompt=prompt)
             if not llm_result.get("ok") or not isinstance(llm_result.get("data"), dict):
@@ -294,7 +421,8 @@ class ExperimentOperator:
 
             result_payload = result or {}
             round_exec_ok = bool(result_payload.get("exec_ok", result_payload.get("ok", False)))
-            round_evidence_ok = self._derive_evidence_ok(result_payload)
+            round_scientific_ok = self._derive_scientific_ok(result_payload)
+            round_publish_ready = self._derive_publish_ready(result_payload)
             run_columns = self._normalize_columns_map(result_payload.get("data_columns"))
             if run_columns.get("train") or run_columns.get("test"):
                 observed_data_columns = self._merge_columns_map(observed_data_columns, run_columns)
@@ -306,7 +434,9 @@ class ExperimentOperator:
             round_success = bool(round_exec_ok)
             if code_agent_failed and (require_code_agent_success or treat_fallback_as_repair):
                 round_success = False
-            if require_evidence_ok and not round_evidence_ok:
+            if require_scientific_ok and not round_scientific_ok:
+                round_success = False
+            if require_publish_ready and not round_publish_ready:
                 round_success = False
 
             if not round_success:
@@ -319,20 +449,45 @@ class ExperimentOperator:
                     diagnosis_result["stderr_tail"] = str(result_payload.get("code_agent_stderr_tail") or "")
                 if not str(diagnosis_result.get("stdout_tail") or "").strip() and str(result_payload.get("code_agent_stdout_tail") or "").strip():
                     diagnosis_result["stdout_tail"] = str(result_payload.get("code_agent_stdout_tail") or "")
-                if round_exec_ok and require_evidence_ok and not round_evidence_ok:
-                    diag_reason = str(result_payload.get("evidence_reason") or "")
+                preflight: Dict[str, Any] = {}
+                preflight_code = ""
+                preflight_detail = ""
+                if round_exec_ok and require_scientific_ok and not round_scientific_ok:
+                    diag_reason = str(result_payload.get("scientific_reason") or "")
+                    if not diag_reason:
+                        diag_reason = "missing_dev_proxy"
+                    diagnosis_result["ok"] = False
+                    diagnosis_result["error"] = f"scientific_not_ready:{diag_reason}"
+                    if not str(diagnosis_result.get("stderr_tail") or "").strip():
+                        diagnosis_result["stderr_tail"] = (
+                            f"has_dev_proxy={bool(result_payload.get('has_dev_proxy', False))}; "
+                            f"publish_ready={bool(result_payload.get('publish_ready', result_payload.get('evidence_ok', False)))}"
+                        )
+                elif round_exec_ok and require_publish_ready and not round_publish_ready:
+                    diag_reason = str(result_payload.get("publish_reason") or result_payload.get("evidence_reason") or "")
                     preflight = result_payload.get("submission_preflight") or {}
                     if not isinstance(preflight, dict):
                         preflight = {}
                     preflight_code = str(preflight.get("error_code") or "")
+                    preflight_message = str(preflight.get("message") or "")
                     if not diag_reason:
-                        diag_reason = "missing_dev_proxy_or_submission_preflight"
+                        diag_reason = "submission_preflight_failed"
                     diagnosis_result["ok"] = False
-                    diagnosis_result["error"] = f"evidence_not_ready:{diag_reason}"
-                    if not str(diagnosis_result.get("stderr_tail") or "").strip():
-                        diagnosis_result["stderr_tail"] = (
-                            f"submission_preflight_error={preflight_code}; has_dev_proxy={bool(result_payload.get('has_dev_proxy', False))}"
+                    diagnosis_result["error"] = f"publish_not_ready:{diag_reason}"
+                    preflight_detail = f"submission_preflight_error={preflight_code}"
+                    diagnosis_result["submission_preflight_code"] = preflight_code
+                    if preflight_code == "row_count_mismatch":
+                        preflight_detail += (
+                            f"; got={preflight.get('row_count')} expected={preflight.get('expected_rows')}. "
+                            "submission.csv MUST contain one row per test sample — never truncate or sample test data."
                         )
+                        diagnosis_result["submission_row_count"] = preflight.get("row_count")
+                        diagnosis_result["submission_expected_rows"] = preflight.get("expected_rows")
+                    elif preflight_message:
+                        preflight_detail += f"; {preflight_message}"
+                    diagnosis_result["submission_preflight_detail"] = preflight_detail
+                    if not str(diagnosis_result.get("stderr_tail") or "").strip():
+                        diagnosis_result["stderr_tail"] = preflight_detail
                 diagnosis = self.plugin._classify_experiment_failure(
                     result=diagnosis_result,
                     code_plan=code_plan,
@@ -353,13 +508,29 @@ class ExperimentOperator:
                     diagnosis["error_codes"] = error_codes
                     diagnosis["root_cause"] = "code_agent_failed_solver_fallback_masked"
                     diagnosis["retryable"] = True
-                if round_exec_ok and require_evidence_ok and not round_evidence_ok:
+                if round_exec_ok and require_scientific_ok and not round_scientific_ok:
                     diagnosis = dict(diagnosis or {})
                     error_codes = list(diagnosis.get("error_codes") or [])
                     if "scientific_evidence_not_ready" not in error_codes:
                         error_codes.append("scientific_evidence_not_ready")
                     diagnosis["error_codes"] = error_codes
-                    diagnosis["root_cause"] = "missing_dev_proxy_or_submission_preflight"
+                    diagnosis["root_cause"] = "missing_dev_proxy"
+                    diagnosis["retryable"] = True
+                elif round_exec_ok and require_publish_ready and not round_publish_ready:
+                    diagnosis = dict(diagnosis or {})
+                    error_codes = list(diagnosis.get("error_codes") or [])
+                    if "publish_readiness_not_ready" not in error_codes:
+                        error_codes.append("publish_readiness_not_ready")
+                    if preflight_code == "row_count_mismatch" and "row_count_mismatch" not in error_codes:
+                        error_codes.append("row_count_mismatch")
+                    diagnosis["error_codes"] = error_codes
+                    diagnosis["root_cause"] = "row_count_mismatch" if preflight_code == "row_count_mismatch" else "submission_preflight_failed"
+                    diagnosis["preflight"] = {
+                        "error_code": preflight_code,
+                        "row_count": preflight.get("row_count"),
+                        "expected_rows": preflight.get("expected_rows"),
+                        "detail": preflight_detail,
+                    }
                     diagnosis["retryable"] = True
                 failure_context = self.plugin._build_repair_context(
                     diagnosis=diagnosis,
@@ -400,13 +571,19 @@ class ExperimentOperator:
                 continue
 
             had_code_agent_success = had_code_agent_success or bool(code_agent_ok)
-            score = (result or {}).get("dev_score_norm")
-            if not isinstance(score, (int, float)):
-                score = (result or {}).get("score_norm")
-            score_f = self.plugin._clamp01(score or 0.0)
-            if best_result is None or score_f > best_score + 1e-6:
+            selection = self._selection_summary(world_spec, result)
+            selection_score = selection.get("selection_score")
+            has_better_selection = (
+                isinstance(selection_score, (int, float))
+                and (
+                    best_selection_score is None
+                    or float(selection_score) > float(best_selection_score) + 1e-6
+                )
+            )
+            if best_result is None or has_better_selection:
                 best_result = result
-                best_score = score_f
+                best_selection_score = float(selection_score) if isinstance(selection_score, (int, float)) else best_selection_score
+                best_metric_text = selection.get("display") or best_metric_text
                 best_plan = code_plan
                 no_improve_rounds = 0
             else:
@@ -444,7 +621,11 @@ class ExperimentOperator:
         await self.plugin._log_code_loop(
             agent_id=agent_id,
             attempts=attempts,
-            best_dev_score_norm=(best_score if best_score >= 0.0 else None),
+            best_dev_score_norm=(
+                float((best_result or {}).get("dev_score_norm"))
+                if isinstance((best_result or {}).get("dev_score_norm"), (int, float))
+                else None
+            ),
         )
 
         final_result = best_result
@@ -482,7 +663,13 @@ class ExperimentOperator:
             "llm_experiment_plan": {
                 "mode": "code_agent_loop",
                 "attempts": attempts,
-                "best_dev_score_norm": best_score if best_score >= 0.0 else None,
+                "best_dev_score_norm": (
+                    float((best_result or {}).get("dev_score_norm"))
+                    if isinstance((best_result or {}).get("dev_score_norm"), (int, float))
+                    else None
+                ),
+                "best_selection_score": best_selection_score,
+                "best_metric_text": best_metric_text,
             },
             "code_attempts": attempts,
         }
@@ -700,6 +887,10 @@ class ExperimentOperator:
             )
 
         observations = await self.plugin._get_state(agent_id, "observations") or []
+        scientific_ok = self._derive_scientific_ok(result or {})
+        publish_ready = self._derive_publish_ready(result or {})
+        scientific_reason = str((result or {}).get("scientific_reason") or "")
+        publish_reason = str((result or {}).get("publish_reason") or (result or {}).get("evidence_reason") or "")
         observation = {
             "run_id": (result or {}).get("run_id"),
             "task_name": (result or {}).get("task_name"),
@@ -732,11 +923,15 @@ class ExperimentOperator:
             "execution_path": (result or {}).get("execution_path"),
             "data_columns": (result or {}).get("data_columns"),
             "exec_ok": bool((result or {}).get("exec_ok", (result or {}).get("ok", False))),
-            "evidence_ok": self._derive_evidence_ok(result or {}),
-            "evidence_reason": (result or {}).get("evidence_reason"),
+            "scientific_ok": bool(scientific_ok),
+            "scientific_reason": scientific_reason,
+            "publish_ready": bool(publish_ready),
+            "publish_reason": publish_reason,
+            "evidence_ok": bool(publish_ready),
+            "evidence_reason": publish_reason,
             "has_dev_proxy": bool((result or {}).get("has_dev_proxy", False)),
             "submission_preflight": (result or {}).get("submission_preflight"),
-            "ok": self._derive_evidence_ok(result or {}),
+            "ok": bool(scientific_ok),
             "error": (result or {}).get("error"),
             "elapsed_s": (result or {}).get("elapsed_s"),
             "strategy": run_config.get("strategy"),
@@ -766,13 +961,23 @@ class ExperimentOperator:
         score_norm = float((result or {}).get("score_norm", 0.0) or 0.0)
         dev_score_norm = (result or {}).get("dev_score_norm")
         dev_score_norm = float(dev_score_norm) if isinstance(dev_score_norm, (int, float)) else score_norm
+        selection_summary = self._selection_summary(world_spec, observation)
+        selection_score = selection_summary.get("selection_score")
+        selection_score = float(selection_score) if isinstance(selection_score, (int, float)) else dev_score_norm
+        metric_value = selection_summary.get("metric_value")
         exec_ok = bool(observation.get("exec_ok", False))
-        evidence_ok = bool(observation.get("evidence_ok", False))
+        scientific_ok = bool(observation.get("scientific_ok", observation.get("ok", False)))
+        publish_ready = bool(observation.get("publish_ready", observation.get("evidence_ok", False)))
         cost = float((result or {}).get("cost", 0.0) or 0.0)
-        prev_best_dev = max(
-            [float(o.get("dev_score_norm", 0.0) or 0.0) for o in prior_observations if bool(o.get("ok"))] or [0.0]
-        )
-        improvement = dev_score_norm - prev_best_dev
+        prior_selection_scores = []
+        for prev_obs in prior_observations:
+            if not bool((prev_obs or {}).get("ok")):
+                continue
+            prev_selection = self._selection_summary(world_spec, prev_obs).get("selection_score")
+            if isinstance(prev_selection, (int, float)):
+                prior_selection_scores.append(float(prev_selection))
+        prev_best_selection = max(prior_selection_scores) if prior_selection_scores else 0.0
+        improvement = float(selection_score) - float(prev_best_selection)
         reward = max(-0.06, min(0.12, 0.05 * dev_score_norm + 0.08 * improvement - 0.03 * cost))
         flags = self.plugin._experiment_error_flags(result or {})
         first_pass = self.plugin._is_first_pass_success(
@@ -780,7 +985,7 @@ class ExperimentOperator:
             ok=bool((result or {}).get("ok", False)),
         )
         vram_eff = self.plugin._estimate_vram_efficiency(result=result or {}, world_spec=world_spec)
-        if evidence_ok:
+        if scientific_ok:
             reward += self.plugin._experiment_success_reward
             if first_pass:
                 reward += self.plugin._experiment_first_pass_bonus
@@ -792,12 +997,12 @@ class ExperimentOperator:
             reward -= self.plugin._experiment_oom_penalty
         if flags.get("typeerror", False):
             reward -= self.plugin._experiment_typeerror_penalty
-        if not evidence_ok:
+        if not scientific_ok:
             reward = min(reward, -0.02)
         reward = max(-1.0, min(2.0, float(reward)))
 
         post_experiment_recovery = None
-        if evidence_ok:
+        if scientific_ok:
             try:
                 await self.plugin.controller.run_environment(
                     "science",
@@ -811,7 +1016,9 @@ class ExperimentOperator:
                 )
             except Exception as e:
                 logger.warning(f"Failed to enqueue post-experiment review task: {e}")
-        elif exec_ok:
+        elif exec_ok and not bool(observation.get("has_dev_proxy", False)):
+            # Only spawn recovery experiment when there is genuinely no dev
+            # score at all (not merely a preflight format issue).
             recovery_service = getattr(self.plugin, "_recovery_service", None)
             if recovery_service is not None and hasattr(recovery_service, "ensure_experiment_spawned"):
                 try:
@@ -840,9 +1047,13 @@ class ExperimentOperator:
             method_name="experiment",
             message="AIRS experiment executed.",
             data={
-                "ok": bool(evidence_ok),
+                "ok": bool(scientific_ok),
                 "exec_ok": bool(exec_ok),
-                "evidence_ok": bool(evidence_ok),
+                "scientific_ok": bool(scientific_ok),
+                "scientific_reason": str(observation.get("scientific_reason") or ""),
+                "publish_ready": bool(publish_ready),
+                "publish_reason": str(observation.get("publish_reason") or ""),
+                "evidence_ok": bool(publish_ready),
                 "evidence_reason": str(observation.get("evidence_reason") or ""),
                 "observation": observation,
                 "exp_count": exp_count,
@@ -851,9 +1062,13 @@ class ExperimentOperator:
                 "reward_components": {
                     "learning_reward": float(reward),
                     "experiment_reward": float(reward),
+                    "dev_score_norm": float(dev_score_norm),
                     "experiment_score_norm": float(score_norm),
                     "experiment_dev_score_norm": float(dev_score_norm),
                     "experiment_improvement": float(improvement),
+                    "experiment_selection_score": float(selection_score),
+                    "experiment_metric_value": float(metric_value) if isinstance(metric_value, (int, float)) else None,
+                    "experiment_metric_lower_is_better": bool(selection_summary.get("metric_lower_is_better", False)),
                     "experiment_first_pass_bonus": float(self.plugin._experiment_first_pass_bonus if first_pass else 0.0),
                     "experiment_vram_efficiency": float(vram_eff) if isinstance(vram_eff, (int, float)) else 0.0,
                     "experiment_oom_penalty": float(-self.plugin._experiment_oom_penalty if flags.get("oom", False) else 0.0),
@@ -869,8 +1084,11 @@ class ExperimentOperator:
                     "typeerror_flag": bool(flags.get("typeerror", False)),
                     "vram_efficiency": float(vram_eff) if isinstance(vram_eff, (int, float)) else None,
                     "exec_ok": bool(exec_ok),
-                    "evidence_ok": bool(evidence_ok),
+                    "scientific_ok": bool(scientific_ok),
+                    "publish_ready": bool(publish_ready),
+                    "evidence_ok": bool(publish_ready),
                     "evidence_reason": str(observation.get("evidence_reason") or ""),
+                    "scientific_reason": str(observation.get("scientific_reason") or ""),
                     "code_agent_attempted": bool((result or {}).get("code_agent_attempted", False)),
                     "code_agent_ok": bool((result or {}).get("code_agent_ok", False)),
                     "fallback_solver_used": bool((result or {}).get("fallback_solver_used", False)),

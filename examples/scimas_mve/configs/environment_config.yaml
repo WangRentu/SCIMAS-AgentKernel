@@ -48,8 +48,11 @@ components:
         code_forbid_network: true
         code_executor_backend: "docker"
         code_executor_fallback_soft: true
-        code_docker_image: "scimas-airs-runtime:py311-v1"
+        code_docker_image: "scimas-airs-runtime:py311-cu124-v2"
         code_docker_bin: "docker"
         code_docker_cpus: 2.0
         code_docker_gpus: "all"
         code_docker_keepalive: false
+        code_docker_gpu_preflight: true
+        code_docker_gpu_preflight_timeout_s: 20
+        code_docker_require_cuda_torch: true

@@ -48,17 +48,23 @@ To simplify the process, we have provided basic implementations for five core pl
 Build the dedicated AIRS runtime image once:
 
 ```bash
-docker build -t scimas-airs-runtime:py311-v1 -f examples/scimas_mve/docker/Dockerfile.airs-runtime .
+docker build --no-cache \
+  -t scimas-airs-runtime:py311-cu124-v2 \
+  -f examples/scimas_mve/docker/Dockerfile.airs-runtime \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124 \
+  --build-arg TORCH_VERSION=2.5.1 \
+  .
 ```
 
-Quick verify:
+Quick verify (must print `True` for CUDA availability):
 
 ```bash
-docker run --rm scimas-airs-runtime:py311-v1 python -c "import datasets,numpy,pandas,sklearn,scipy,sktime,torch,torchmetrics,rouge_score; print('ok')"
+docker run --rm --gpus all scimas-airs-runtime:py311-cu124-v2 \
+  python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
 `environment_config.yaml` is configured to use this image:
-`code_docker_image: "scimas-airs-runtime:py311-v1"`.
+`code_docker_image: "scimas-airs-runtime:py311-cu124-v2"`.
 
         
             

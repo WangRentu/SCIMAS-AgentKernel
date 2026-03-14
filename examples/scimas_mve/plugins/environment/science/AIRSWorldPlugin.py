@@ -89,6 +89,9 @@ class AIRSWorldPlugin(SciencePluginBase):
         code_docker_cpus: float = 2.0,
         code_docker_gpus: str = "",
         code_docker_keepalive: bool = False,
+        code_docker_gpu_preflight: bool = True,
+        code_docker_gpu_preflight_timeout_s: int = 20,
+        code_docker_require_cuda_torch: bool = True,
     ):
         super().__init__()
         self.seed = seed
@@ -139,6 +142,9 @@ class AIRSWorldPlugin(SciencePluginBase):
         self._code_docker_cpus = max(0.1, float(code_docker_cpus))
         self._code_docker_gpus = str(code_docker_gpus or "").strip()
         self._code_docker_keepalive = bool(code_docker_keepalive)
+        self._code_docker_gpu_preflight = bool(code_docker_gpu_preflight)
+        self._code_docker_gpu_preflight_timeout_s = int(max(5, int(code_docker_gpu_preflight_timeout_s)))
+        self._code_docker_require_cuda_torch = bool(code_docker_require_cuda_torch)
         self._log_mode = (os.getenv("SCIMAS_LOG_MODE", "compact") or "compact").strip().lower()
         self._taskboard_log_events = self._resolve_taskboard_log_events()
         self._runtime_monitor = os.getenv(
@@ -294,6 +300,7 @@ class AIRSWorldPlugin(SciencePluginBase):
         if self._prepared_cache_persist_enable:
             os.makedirs(self._prepared_cache_persist_root, exist_ok=True)
         self._load_eval_cache_sync()
+        self._validate_docker_gpu_runtime_sync()
         logger.info(
             f"AIRSWorldPlugin initialized: tasks_root={self.tasks_root}, shared_data_dir={self.shared_data_dir}, "
             f"catalog_size={len(self._tasks_catalog)}"
@@ -323,6 +330,71 @@ class AIRSWorldPlugin(SciencePluginBase):
             logger.error(f"[MONITOR] {message}")
         else:
             logger.info(f"[MONITOR] {message}")
+
+    def _validate_docker_gpu_runtime_sync(self) -> None:
+        """Fail fast if docker GPU runtime is required but unavailable."""
+        if self._code_executor_backend != "docker":
+            return
+        if not self._code_docker_gpus:
+            return
+        if not self._code_docker_gpu_preflight:
+            return
+        if shutil.which(self._code_docker_bin) is None:
+            raise RuntimeError(f"docker_bin_not_found:{self._code_docker_bin}")
+
+        require_cuda = bool(self._code_docker_require_cuda_torch)
+        probe_cmd = (
+            "import json,sys\n"
+            "out={}\n"
+            "try:\n"
+            " import torch\n"
+            " out['torch_import']=True\n"
+            " out['torch_version']=str(torch.__version__)\n"
+            " out['torch_cuda_version']=str(getattr(torch.version,'cuda',None))\n"
+            " out['cuda_available']=bool(torch.cuda.is_available())\n"
+            " out['cuda_count']=int(torch.cuda.device_count()) if torch.cuda.is_available() else 0\n"
+            " out['cuda_name']=torch.cuda.get_device_name(0) if torch.cuda.is_available() else None\n"
+            "except Exception as e:\n"
+            " out['torch_import']=False\n"
+            " out['error']=str(e)\n"
+            "print(json.dumps(out, ensure_ascii=False))\n"
+            f"sys.exit(0 if (out.get('torch_import') and out.get('cuda_available')) else {13 if require_cuda else 0})\n"
+        )
+        docker_cmd = [
+            self._code_docker_bin,
+            "run",
+            "--rm",
+            "--gpus",
+            self._code_docker_gpus,
+            self._code_docker_image,
+            "python",
+            "-c",
+            probe_cmd,
+        ]
+        try:
+            proc = subprocess.run(
+                docker_cmd,
+                capture_output=True,
+                text=True,
+                timeout=self._code_docker_gpu_preflight_timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                "docker_gpu_preflight_timeout:"
+                f"image={self._code_docker_image}, timeout_s={self._code_docker_gpu_preflight_timeout_s}"
+            )
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "docker_gpu_preflight_failed:"
+                f"image={self._code_docker_image}, gpus={self._code_docker_gpus}, "
+                f"rc={proc.returncode}, stdout={proc.stdout.strip()}, stderr={proc.stderr.strip()}"
+            )
+
+        logger.info(
+            "Docker GPU runtime preflight passed: "
+            f"image={self._code_docker_image}, gpus={self._code_docker_gpus}, probe={proc.stdout.strip()}"
+        )
 
     def _append_jsonl_sync(self, path: str, record: Dict[str, Any]) -> None:
         try:
@@ -925,39 +997,7 @@ class AIRSWorldPlugin(SciencePluginBase):
         return expired
 
     def _bootstrap_taskboard(self) -> None:
-        n_agents = self._estimate_agent_count()
-        n_workers = len(self._active_workers) if self._active_workers else min(n_agents, self._active_worker_count)
-        n_workers = max(1, n_workers)
-        read_count = max(2, min(6, n_workers // 2 + 1))
-        prepare_count = 1
-        profile_count = max(1, min(3, n_workers // 3 + 1))
-        method_count = max(1, min(3, n_workers // 3 + 1))
-        experiment_count = max(2, min(self.budget, n_workers))
-        hypothesize_count = max(2, min(5, n_workers // 2 + 1))
-        write_count = max(1, min(3, n_workers // 3 + 1))
-
-        for _ in range(read_count):
-            self._create_task_internal("read", payload={"topic": "task_requirements"})
-        for _ in range(prepare_count):
-            self._create_task_internal("prepare_data", payload={})
-        for _ in range(profile_count):
-            self._create_task_internal("profile_data", payload={})
-        for _ in range(method_count):
-            self._create_task_internal("retrieve_literature", payload={"topic": "task_baselines"})
-        for _ in range(experiment_count):
-            self._create_task_internal("experiment", payload={})
-        for _ in range(hypothesize_count):
-            self._create_task_internal("hypothesize", payload={})
-        for _ in range(write_count):
-            self._create_task_internal("write", payload={})
-
-        if not self._strict_task_dependencies:
-            review_count = max(1, min(3, n_workers // 3 + 1))
-            replicate_count = max(1, min(3, n_workers // 3 + 1))
-            for _ in range(review_count):
-                self._create_task_internal("review", payload={})
-            for _ in range(replicate_count):
-                self._create_task_internal("replicate", payload={})
+        pass
 
     def _completed_task_counts(self) -> Dict[str, int]:
         counts: Dict[str, int] = {}
@@ -1311,6 +1351,7 @@ class AIRSWorldPlugin(SciencePluginBase):
             "task_path": (self._current_task or {}).get("task_path"),
             "taskboard": summary,
             "metric": info.get("metric"),
+            "scoring_column": info.get("scoring_column"),
             "dataset": info.get("dataset"),
             "category": info.get("category"),
             "research_problem": info.get("research_problem"),
@@ -1335,6 +1376,9 @@ class AIRSWorldPlugin(SciencePluginBase):
             "code_docker_cpus": self._code_docker_cpus,
             "code_docker_gpus": self._code_docker_gpus,
             "code_docker_keepalive": self._code_docker_keepalive,
+            "code_docker_gpu_preflight": self._code_docker_gpu_preflight,
+            "code_docker_gpu_preflight_timeout_s": self._code_docker_gpu_preflight_timeout_s,
+            "code_docker_require_cuda_torch": self._code_docker_require_cuda_torch,
             "task_sampling": self.task_sampling,
             "solver_supported_task_count": int(sum(1 for t in self._tasks_catalog if bool(t.get("solver_supported", False)))),
             "taskboard_event_counts": dict(self._taskboard_event_counts),
@@ -4318,6 +4362,10 @@ class AIRSWorldPlugin(SciencePluginBase):
                 "fallback_solver_used": False,
                 "fallback_solver_ok": False,
                 "exec_ok": False,
+                "scientific_ok": False,
+                "scientific_reason": f"hard_stop:{stop_reason}",
+                "publish_ready": False,
+                "publish_reason": f"hard_stop:{stop_reason}",
                 "evidence_ok": False,
                 "evidence_reason": f"hard_stop:{stop_reason}",
                 "has_dev_proxy": False,
@@ -4548,17 +4596,26 @@ class AIRSWorldPlugin(SciencePluginBase):
             )
         )
         preflight_ok = bool((submission_preflight or {}).get("ok", False))
-        evidence_ok = bool(exec_ok and has_dev_proxy and preflight_ok)
-        evidence_reasons: List[str] = []
+        scientific_ok = bool(exec_ok and has_dev_proxy)
+        scientific_reasons: List[str] = []
         if not exec_ok:
-            evidence_reasons.append("exec_failed")
+            scientific_reasons.append("exec_failed")
         if exec_ok and not has_dev_proxy:
-            evidence_reasons.append("missing_dev_proxy")
-        if exec_ok and not preflight_ok:
-            evidence_reasons.append(
+            scientific_reasons.append("missing_dev_proxy")
+        scientific_reason = "ok" if scientific_ok else "|".join(scientific_reasons or ["missing_scientific_evidence"])
+
+        publish_ready = bool(scientific_ok and preflight_ok)
+        publish_reasons: List[str] = list(scientific_reasons)
+        if scientific_ok and not preflight_ok:
+            publish_reasons.append(
                 f"submission_preflight_failed:{str((submission_preflight or {}).get('error_code') or 'unknown')}"
             )
-        evidence_reason = "ok" if evidence_ok else "|".join(evidence_reasons or ["missing_evidence"])
+        publish_reason = "ok" if publish_ready else "|".join(publish_reasons or ["missing_publish_evidence"])
+
+        # Backward-compatible aliases:
+        # - evidence_ok/evidence_reason continue to represent publish-level readiness.
+        evidence_ok = bool(publish_ready)
+        evidence_reason = str(publish_reason)
         ok = exec_ok
 
         if code_agent_attempted and code_agent_ok:
@@ -4608,6 +4665,10 @@ class AIRSWorldPlugin(SciencePluginBase):
             "fallback_solver_used": bool(fallback_solver_used),
             "fallback_solver_ok": bool(fallback_solver_ok),
             "exec_ok": bool(exec_ok),
+            "scientific_ok": bool(scientific_ok),
+            "scientific_reason": str(scientific_reason or ""),
+            "publish_ready": bool(publish_ready),
+            "publish_reason": str(publish_reason or ""),
             "evidence_ok": bool(evidence_ok),
             "evidence_reason": str(evidence_reason or ""),
             "has_dev_proxy": bool(has_dev_proxy),

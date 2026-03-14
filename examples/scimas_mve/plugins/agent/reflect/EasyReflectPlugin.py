@@ -1,5 +1,4 @@
 from typing import Dict, Any
-import math
 import os
 
 from agentkernel_standalone.mas.agent.base.plugin_base import ReflectPlugin
@@ -7,6 +6,12 @@ from agentkernel_standalone.toolkit.logger import get_logger
 
 
 logger = get_logger(__name__)
+
+PIPELINE_PHASES = {
+    "read", "prepare_data", "profile_data", "retrieve_literature",
+    "hypothesize", "experiment", "review", "write", "replicate",
+}
+
 
 class EasyReflectPlugin(ReflectPlugin):
     def __init__(self):
@@ -18,54 +23,70 @@ class EasyReflectPlugin(ReflectPlugin):
             "SCIMAS_VERBOSE_REFLECT_LOGS",
             "1" if log_mode == "verbose" else "0",
         ).lower() in {"1", "true", "yes"}
-        
+
     async def init(self):
-        self.agent_id = self._component.agent.agent_id 
+        self.agent_id = self._component.agent.agent_id
         state_comp = self._component.agent.get_component("state")
         self.state_plug = state_comp._plugin
-        
+
     async def execute(self, current_tick: int) -> Dict[str, Any]:
-        policy = await self.state_plug.get_state("policy") or {}
-        action_space = await self.state_plug.get_state("action_space") or list(policy.keys())
         last_action = await self.state_plug.get_state("last_action")
         last_effective_action = await self.state_plug.get_state("last_effective_action") or last_action
         last_reward = await self.state_plug.get_state("last_reward") or 0.0
-        last_learning_reward = await self.state_plug.get_state("last_learning_reward")
-        if last_learning_reward is None:
-            last_learning_reward = last_reward
-        alpha = await self.state_plug.get_state("alpha") or 0.3
-        beta = await self.state_plug.get_state("beta") or 2.0
+        last_reward_components = await self.state_plug.get_state("last_reward_components") or {}
+        last_action_seq = int((await self.state_plug.get_state("last_action_seq")) or 0)
+        last_reflected_seq = int((await self.state_plug.get_state("last_reflected_seq")) or 0)
+        phase_status: Dict[str, Dict[str, Any]] = await self.state_plug.get_state("phase_status") or {}
 
-        if not policy or not last_action:
+        if not last_action or last_action_seq <= last_reflected_seq:
             if self._verbose_reflect_logs:
-                logger.info(f"Agent {self.agent_id} has no policy update this tick.")
-            return {}
-        if last_effective_action not in action_space:
+                logger.info(f"Agent {self.agent_id} has no action to reflect on.")
+            return phase_status
+
+        if last_effective_action in PIPELINE_PHASES:
+            entry = phase_status.setdefault(last_effective_action, {
+                "runs": 0, "successes": 0, "last_result": None, "best_score": None,
+            })
+            # Patch entries that were created before best_score was added to the schema
+            entry.setdefault("best_score", None)
+            entry["runs"] += 1
+
+            last_action_ok = await self.state_plug.get_state("last_action_ok")
+            if last_action_ok is not None:
+                success = bool(last_action_ok)
+            else:
+                success = last_reward > 0
+
+            if success:
+                entry["successes"] += 1
+            entry["last_result"] = "success" if success else "failed"
+
+            if last_effective_action == "experiment":
+                score = last_reward_components.get("experiment_selection_score")
+                if score is None:
+                    score = last_reward_components.get("dev_score_norm")
+                if score is None:
+                    score = last_reward if last_reward > 0 else None
+                current_best = entry.get("best_score")
+                if score is not None and (current_best is None or score > current_best):
+                    entry["best_score"] = score
+
+            await self.state_plug.set_state("phase_status", phase_status)
+
             if self._verbose_reflect_logs:
-                logger.info(f"Agent {self.agent_id} effective action {last_effective_action} not in action_space.")
-            return {}
+                logger.info(
+                    f"Agent {self.agent_id} phase_status[{last_effective_action}]: "
+                    f"runs={entry['runs']} successes={entry['successes']} last={entry['last_result']}"
+                )
 
-        rewards = {action: (last_learning_reward if action == last_effective_action else 0.0) for action in action_space}
-        exp_vals = {action: math.exp(beta * reward) for action, reward in rewards.items()}
-        denom = sum(exp_vals.values()) or 1.0
-        softmax = {action: (value / denom) for action, value in exp_vals.items()}
+        reward_ledger: Dict[str, float] = await self.state_plug.get_state("episode_reward_ledger") or {}
+        action_counts: Dict[str, int] = await self.state_plug.get_state("episode_action_counts") or {}
 
-        updated = {}
-        for action in action_space:
-            old_p = policy.get(action, 0.0)
-            updated[action] = (1 - alpha) * old_p + alpha * softmax.get(action, 0.0)
+        if last_effective_action:
+            reward_ledger[last_effective_action] = reward_ledger.get(last_effective_action, 0.0) + last_reward
+            action_counts[last_effective_action] = action_counts.get(last_effective_action, 0) + 1
+            await self.state_plug.set_state("episode_reward_ledger", reward_ledger)
+            await self.state_plug.set_state("episode_action_counts", action_counts)
+        await self.state_plug.set_state("last_reflected_seq", last_action_seq)
 
-        total = sum(updated.values())
-        if total > 0:
-            updated = {action: value / total for action, value in updated.items()}
-
-        await self.state_plug.set_state("policy", updated)
-        if self._verbose_reflect_logs:
-            logger.info(f"Agent {self.agent_id} updated policy: {updated}")
-        return {
-            "policy": updated,
-            "last_action": last_action,
-            "last_effective_action": last_effective_action,
-            "last_reward": last_reward,
-            "last_learning_reward": last_learning_reward,
-        }
+        return phase_status

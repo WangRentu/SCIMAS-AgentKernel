@@ -83,6 +83,43 @@ class WriteOperator:
                 "message": f"failed to parse submission.csv: {e}",
             }
 
+    @staticmethod
+    def _as_optional_float(value: Any):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    def _metric_lower_is_better(self, world_spec: Dict[str, Any], run: Dict[str, Any]) -> bool:
+        if isinstance(run, dict) and run.get("metric_lower_is_better") is not None:
+            return bool(run.get("metric_lower_is_better"))
+        return bool((world_spec or {}).get("metric_lower_is_better", False))
+
+    def _metric_value(self, run: Dict[str, Any]):
+        if not isinstance(run, dict):
+            return None
+        dev_score = self._as_optional_float(run.get("dev_score"))
+        if dev_score is not None:
+            return dev_score
+        dev_eval = run.get("dev_eval")
+        if isinstance(dev_eval, dict):
+            dev_eval_score = self._as_optional_float(dev_eval.get("raw_score"))
+            if dev_eval_score is not None:
+                return dev_eval_score
+        return self._as_optional_float(run.get("raw_score"))
+
+    def _best_run_sort_key(self, world_spec: Dict[str, Any], run: Dict[str, Any]):
+        metric_value = self._metric_value(run)
+        if metric_value is not None:
+            lower_is_better = self._metric_lower_is_better(world_spec, run)
+            primary = metric_value if lower_is_better else -metric_value
+            return (0, primary)
+        norm_value = self._as_optional_float(run.get("dev_score_norm"))
+        if norm_value is None:
+            norm_value = self._as_optional_float(run.get("score_norm")) or 0.0
+        return (1, -float(norm_value))
+
     async def execute(self, agent_id: str) -> ActionResult:
         ctx = await self.plugin._load_research_context(agent_id=agent_id, include_shared=True)
         if isinstance(ctx, dict):
@@ -138,7 +175,7 @@ class WriteOperator:
             obs
             for obs in observations
             if (
-                bool(obs.get("evidence_ok", obs.get("ok", False)))
+                bool(obs.get("scientific_ok", obs.get("evidence_ok", obs.get("ok", False))))
                 and obs.get("run_id")
             )
         ]
@@ -147,16 +184,12 @@ class WriteOperator:
                 "write",
                 "No scientifically successful experiment run available for submission.",
                 effective_action="write",
-                detail={"precondition_failed": True, "reason": "no_evidence_backed_run"},
+                detail={"precondition_failed": True, "reason": "no_scientific_run"},
             )
             await self.plugin._append_trace(agent_id, "write", 0.0, ar.data or {})
             return ar
 
-        best_run = sorted(
-            valid_runs,
-            key=lambda r: float(r.get("dev_score_norm", r.get("score_norm", 0.0)) or 0.0),
-            reverse=True,
-        )[0]
+        best_run = min(valid_runs, key=lambda r: self._best_run_sort_key(world_spec, r))
         best_run_for_write = dict(best_run)
         local_preflight = self._local_submission_format_check(str(best_run_for_write.get("submission_path") or ""))
         if not bool(local_preflight.get("ok")):

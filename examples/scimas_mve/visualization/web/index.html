@@ -3,144 +3,257 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SCIMAS ResearchOps Console</title>
+  <title>SCIMAS Research Console</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <div class="app">
+
+    <!-- ── Top Header ─────────────────────────────────────── -->
     <header class="header">
       <div class="header-left">
-        <div class="title">SCIMAS ResearchOps Console</div>
-        <span class="badge"><span id="health-dot" class="health-dot"></span><span id="health-text">health: -</span></span>
-        <span class="badge" id="alert-chip">alerts: 0</span>
-        <span class="badge" id="top-release-chip">top release: -</span>
-        <span class="badge" id="sim-clock-chip">clock: -</span>
-        <span class="badge" id="token-chip">token cost: -</span>
-        <span class="badge" id="gpu-chip">gpu: -</span>
+        <span class="logo-mark">◈</span>
+        <span class="header-title">SCIMAS Research Console</span>
+        <div class="header-sep"></div>
+        <span class="status-pill" id="health-pill">
+          <span id="health-dot" class="dot"></span>
+          <span id="health-text">—</span>
+        </span>
+        <span class="header-chip" id="alert-chip">alerts: 0</span>
+        <span class="header-chip" id="episode-chip">episode: —</span>
+        <span class="header-chip" id="token-chip">tokens: —</span>
+        <span class="header-chip" id="cost-chip">cost: —</span>
+        <span class="header-chip" id="gpu-chip" style="display:none">gpu: —</span>
+        <span class="header-chip dim" id="clock-chip">clock: —</span>
       </div>
       <div class="header-right">
-        <input id="run-search" type="text" class="mini-input" placeholder="Run/Episode Search" />
-        <select id="episode-select" class="mini-select"></select>
-        <select id="mode-select" class="mini-select">
-          <option value="live">Live</option>
-          <option value="replay">Replay</option>
-        </select>
-        <input id="replay-slider" type="range" min="0" max="100" value="100" class="hidden" />
-        <button id="snapshot-btn" class="mini-btn">Snapshot</button>
-        <button id="export-btn" class="mini-btn">Export</button>
-        <button id="inspector-toggle" class="mini-btn">Hide Inspector</button>
+        <select id="episode-select" class="h-select" title="Episode"></select>
+        <label class="h-toggle" id="live-toggle" title="Auto-refresh">
+          <span class="h-toggle-dot" id="live-dot"></span> Live
+        </label>
+        <button id="refresh-btn" class="h-btn">↻ Refresh</button>
       </div>
     </header>
 
+    <!-- ── Tab Bar ────────────────────────────────────────── -->
+    <nav class="tab-bar">
+      <button class="tab-btn active" data-tab="overview">
+        <span class="tab-icon">⬡</span> Overview
+      </button>
+      <button class="tab-btn" data-tab="llm">
+        <span class="tab-icon">⚡</span> LLM Trace
+        <span class="tab-badge" id="llm-badge" style="display:none">0</span>
+      </button>
+      <button class="tab-btn" data-tab="rag">
+        <span class="tab-icon">⟳</span> RAG & Retrieve
+      </button>
+      <button class="tab-btn" data-tab="pipeline">
+        <span class="tab-icon">⊞</span> Pipeline
+      </button>
+      <button class="tab-btn" data-tab="runs">
+        <span class="tab-icon">▷</span> Runs & Code
+      </button>
+      <button class="tab-btn" data-tab="papers">
+        <span class="tab-icon">✦</span> Papers
+      </button>
+    </nav>
+
+    <!-- ── Main Layout ────────────────────────────────────── -->
     <div class="layout" id="layout-root">
-      <aside class="sidebar">
-        <section class="panel">
-          <div class="panel-head">
-            <div class="panel-title">Filters</div>
+
+      <!-- Left Sidebar -->
+      <aside class="sidebar" id="sidebar">
+
+        <!-- Search & Filters -->
+        <section class="s-panel">
+          <div class="s-head">
+            <span class="s-title">Filters</span>
           </div>
-          <div class="panel-body">
-            <input id="search-input" type="text" class="full-input" placeholder="task/agent/error keyword" />
-            <div class="group-title">Task Types</div>
-            <div class="chips" id="type-filters"></div>
-            <div class="group-title">Anomalies</div>
-            <div class="chips" id="error-filters"></div>
+          <div class="s-body">
+            <input id="search-input" type="text" class="s-input" placeholder="keyword search…" />
+            <div class="s-group-label">Task Types</div>
+            <div class="chips-wrap" id="type-filters"></div>
+            <div class="s-group-label" id="err-filters-label" style="display:none">Anomalies</div>
+            <div class="chips-wrap" id="error-filters"></div>
           </div>
         </section>
 
-        <section class="panel">
-          <div class="panel-head">
-            <div class="panel-title">Agents</div>
-            <div class="muted" id="agent-count"></div>
+        <!-- Agents -->
+        <section class="s-panel">
+          <div class="s-head">
+            <span class="s-title">Agents</span>
+            <span class="s-count muted" id="agent-count"></span>
           </div>
-          <div class="panel-body list" id="agent-list"></div>
+          <div class="s-body s-list" id="agent-list"></div>
         </section>
 
-        <section class="panel">
-          <div class="panel-head">
-            <div class="panel-title">Alert Center</div>
-            <div class="muted" id="alert-count-mini"></div>
+        <!-- Alert Center -->
+        <section class="s-panel" id="alert-section" style="display:none">
+          <div class="s-head">
+            <span class="s-title">Alerts</span>
+            <span class="s-count muted" id="alert-count-mini"></span>
           </div>
-          <div class="panel-body list" id="alert-list"></div>
+          <div class="s-body s-list" id="alert-list"></div>
         </section>
+
       </aside>
 
-      <div class="col-splitter" id="splitter-left" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0">
-        <span class="splitter-grip-vertical"></span>
-      </div>
+      <!-- Sidebar Resize Handle -->
+      <div class="col-handle" id="handle-left" title="Drag to resize"></div>
 
-      <main class="main">
-        <section class="panel timeline-panel">
-          <div class="panel-head">
-            <div class="panel-title">Process Timeline</div>
-            <div class="muted">read → hypothesize → experiment → review → write → replicate</div>
-          </div>
-          <div class="panel-body fill">
-            <div class="timeline-shell">
-              <canvas id="flow-canvas"></canvas>
-              <div class="timeline" id="timeline"></div>
+      <!-- Main Content -->
+      <main class="main" id="main-content">
+
+        <!-- ── OVERVIEW TAB ──────────────────────────────── -->
+        <div class="tab-panel active" id="tab-overview">
+
+          <div class="ov-grid">
+
+            <!-- System Health Card -->
+            <div class="ov-card span2">
+              <div class="ov-card-head">System Health</div>
+              <div class="ov-metrics" id="ov-health-metrics"></div>
             </div>
-          </div>
-        </section>
 
-        <div class="main-splitter" id="main-splitter" role="separator" aria-orientation="horizontal" aria-label="Resize timeline and taskboard" tabindex="0">
-          <span class="splitter-grip"></span>
+            <!-- Team Metrics Card -->
+            <div class="ov-card span2">
+              <div class="ov-card-head">Team Performance
+                <span class="ov-sub muted" id="ov-team-sub"></span>
+              </div>
+              <div class="ov-metrics" id="ov-team-metrics"></div>
+            </div>
+
+            <!-- Pipeline Flow -->
+            <div class="ov-card span4">
+              <div class="ov-card-head">DAG Pipeline Flow
+                <span class="ov-sub muted">read → hypothesize → experiment → review → write → replicate</span>
+              </div>
+              <div class="pipeline-flow" id="ov-pipeline-flow"></div>
+            </div>
+
+            <!-- Token Usage -->
+            <div class="ov-card span2">
+              <div class="ov-card-head">LLM Token Usage</div>
+              <div class="ov-metrics" id="ov-token-metrics"></div>
+            </div>
+
+            <!-- Action Trace Summary -->
+            <div class="ov-card span2">
+              <div class="ov-card-head">Recent Actions</div>
+              <div class="ov-action-list" id="ov-action-list"></div>
+            </div>
+
+          </div>
         </div>
 
-        <section class="panel taskboard-panel">
-          <div class="panel-head">
-            <div class="panel-title">Taskboard Live</div>
-            <div class="muted" id="task-summary"></div>
-          </div>
-          <div class="panel-body fill">
-            <div class="stats-row" id="task-pills"></div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Task ID</th>
-                    <th>Type</th>
-                    <th>State</th>
-                    <th>Owner</th>
-                    <th>Lease/HB</th>
-                    <th>Deps</th>
-                    <th>C→S</th>
-                    <th>S→C</th>
-                    <th>Confidence</th>
-                    <th>Last Update</th>
-                    <th>Release Reason</th>
-                    <th>Artifacts</th>
-                    <th>Bridge</th>
-                    <th>Run</th>
-                  </tr>
-                </thead>
-                <tbody id="task-tbody"></tbody>
-              </table>
+        <!-- ── LLM TRACE TAB ─────────────────────────────── -->
+        <div class="tab-panel" id="tab-llm">
+          <div class="llm-layout">
+
+            <!-- LLM Filter Toolbar -->
+            <div class="llm-toolbar">
+              <div class="llm-filters">
+                <select id="llm-ep-select" class="llm-select" title="Episode">
+                  <option value="current">Current Episode</option>
+                  <option value="all">All Episodes</option>
+                </select>
+                <select id="llm-agent-select" class="llm-select" title="Agent">
+                  <option value="">All Agents</option>
+                </select>
+                <select id="llm-action-select" class="llm-select" title="Action">
+                  <option value="">All Actions</option>
+                </select>
+                <input id="llm-search" type="text" class="llm-search-input" placeholder="Search prompts…" />
+                <button id="llm-load-btn" class="llm-action-btn primary">Load / Refresh</button>
+              </div>
+              <div class="llm-stats-bar" id="llm-stats-bar">
+                <span id="llm-count-label" class="muted">—</span>
+              </div>
             </div>
+
+            <!-- LLM Records List -->
+            <div class="llm-list" id="llm-list">
+              <div class="llm-empty" id="llm-empty">
+                <div class="llm-empty-icon">⚡</div>
+                <div>Click <strong>Load / Refresh</strong> to fetch LLM trace records</div>
+                <div class="muted" style="margin-top:6px;font-size:12px">Full prompts and responses with markdown rendering</div>
+              </div>
+            </div>
+
+            <!-- Load More -->
+            <div class="llm-footer" id="llm-footer" style="display:none">
+              <button id="llm-more-btn" class="llm-action-btn">Load More</button>
+              <span class="muted" id="llm-more-label"></span>
+            </div>
+
           </div>
-        </section>
+        </div>
+
+        <!-- ── RAG & RETRIEVE TAB ────────────────────────── -->
+        <div class="tab-panel" id="tab-rag">
+          <div class="sub-tabs">
+            <button class="sub-tab-btn active" data-subtab="rag_io">RAG I/O</button>
+            <button class="sub-tab-btn" data-subtab="retrieve_pipeline">Retrieve Pipeline</button>
+            <button class="sub-tab-btn" data-subtab="retrieve_guardrail">Guardrail</button>
+            <button class="sub-tab-btn" data-subtab="retrieve_evidence">Evidence</button>
+          </div>
+          <div class="sub-tab-content" id="rag-content">
+            <div class="io-loading">Select a sub-tab to load data…</div>
+          </div>
+        </div>
+
+        <!-- ── PIPELINE TAB ──────────────────────────────── -->
+        <div class="tab-panel" id="tab-pipeline">
+          <div class="sub-tabs">
+            <button class="sub-tab-btn active" data-subtab="action_trace">Action Trace</button>
+            <button class="sub-tab-btn" data-subtab="code_loops">Code Loops</button>
+            <button class="sub-tab-btn" data-subtab="precondition">Precondition Gates</button>
+            <button class="sub-tab-btn" data-subtab="eval_failures">Eval Failures</button>
+          </div>
+          <div class="sub-tab-content" id="pipeline-content"></div>
+        </div>
+
+        <!-- ── RUNS & CODE TAB ───────────────────────────── -->
+        <div class="tab-panel" id="tab-runs">
+          <div class="sub-tabs">
+            <button class="sub-tab-btn active" data-subtab="run_list">Run List</button>
+            <button class="sub-tab-btn" data-subtab="run_stats">Stats</button>
+          </div>
+          <div class="sub-tab-content" id="runs-content"></div>
+        </div>
+
+        <!-- ── PAPERS TAB ────────────────────────────────── -->
+        <div class="tab-panel" id="tab-papers">
+          <div class="sub-tabs">
+            <button class="sub-tab-btn active" data-subtab="papers_list">Papers</button>
+            <button class="sub-tab-btn" data-subtab="evidence_cards">Evidence Cards</button>
+          </div>
+          <div class="sub-tab-content" id="papers-content"></div>
+        </div>
+
       </main>
 
-      <div class="col-splitter" id="splitter-right" role="separator" aria-orientation="vertical" aria-label="Resize inspector" tabindex="0">
-        <span class="splitter-grip-vertical"></span>
-      </div>
+      <!-- Inspector Resize Handle -->
+      <div class="col-handle" id="handle-right" title="Drag to resize"></div>
 
+      <!-- Inspector Panel -->
       <aside class="inspector" id="inspector">
-        <section class="panel">
-          <div class="panel-head">
-            <div class="panel-title">Inspector</div>
-            <div class="muted" id="inspector-hint">select event/task/agent</div>
+        <div class="insp-head">
+          <span class="s-title">Inspector</span>
+          <span class="muted" id="insp-hint">select a record</span>
+          <button class="insp-close" id="insp-close-btn" title="Close">✕</button>
+        </div>
+        <div class="insp-tabs" id="insp-tabs"></div>
+        <div class="insp-body" id="insp-body">
+          <div class="insp-placeholder">
+            <div style="font-size:28px;opacity:.3">◈</div>
+            <div class="muted" style="margin-top:8px;font-size:12px">Select an item to inspect</div>
           </div>
-          <div class="panel-body">
-            <div class="kv" id="inspector-summary"></div>
-          </div>
-        </section>
-        <section class="tabs" id="inspector-tabs"></section>
-        <section class="panel fill">
-          <div class="panel-body fill inspector-content" id="inspector-content"></div>
-        </section>
+        </div>
       </aside>
-    </div>
-  </div>
+
+    </div><!-- /layout -->
+  </div><!-- /app -->
 
   <script src="/app.js"></script>
 </body>

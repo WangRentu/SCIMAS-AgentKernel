@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import re
+import csv
+import math
 from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -451,6 +453,50 @@ def _extract_dev_score(stdout_text: str, stderr_text: str) -> Optional[float]:
     return None
 
 
+def _to_optional_float(v: Any) -> Optional[float]:
+    try:
+        if v is None or isinstance(v, bool):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _to_optional_finite_float(v: Any) -> Optional[float]:
+    n = _to_optional_float(v)
+    if n is None:
+        return None
+    if not math.isfinite(n):
+        return None
+    return n
+
+
+def _infer_metric_lower_is_better(metric_name: str) -> Optional[bool]:
+    metric = str(metric_name or "").strip().lower()
+    if not metric:
+        return None
+    if re.search(r"(mase|mae|mse|rmse|mape|smape|loss|error|nll|cross.?entropy|perplexity|wer|cer|distance|latency)", metric):
+        return True
+    if re.search(r"(acc|accuracy|auc|f1|precision|recall|r2|ndcg|map|bleu|rouge|pass@|hit@)", metric):
+        return False
+    return None
+
+
+def _read_submission_preview(path: str) -> Dict[str, Any]:
+    preview = {"exists": False, "columns": [], "has_rows": False}
+    if not os.path.exists(path):
+        return preview
+    preview["exists"] = True
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            preview["columns"] = [str(x).strip() for x in (next(reader, []) or []) if str(x).strip()]
+            preview["has_rows"] = next(reader, None) is not None
+    except Exception:
+        return preview
+    return preview
+
+
 def _stage_for_task_type(task_type: str) -> str:
     t = str(task_type or "").strip().lower()
     if t in {"prepare_data"}:
@@ -746,12 +792,20 @@ def _collect_workspace_runs(base_dir: str, max_runs: int = 200) -> Dict[str, Any
         run_dirs = sorted([x for x in os.listdir(ep_path) if x.startswith("RUN")])
         for run_name in run_dirs:
             agent_log = os.path.join(ep_path, run_name, "agent_log")
+            workspace_dir = os.path.join(ep_path, run_name, "workspace")
             code_run_path = os.path.join(agent_log, "code_run.json")
             solver_run_path = os.path.join(agent_log, "solver_run.json")
             submission_path = os.path.join(agent_log, "submission.csv")
+            if not os.path.exists(submission_path):
+                submission_path = os.path.join(workspace_dir, "outputs", "submission.csv")
+            dev_metrics_path = os.path.join(workspace_dir, "outputs", "dev_metrics.json")
+            dev_predictions_path = os.path.join(workspace_dir, "outputs", "dev_predictions.csv")
+            manifest_path = os.path.join(workspace_dir, ".task_manifest.json")
 
             code_log = _read_json(code_run_path)
             solver_log = _read_json(solver_run_path)
+            dev_metrics = _read_json(dev_metrics_path)
+            task_manifest = _read_json(manifest_path)
             if not code_log and not solver_log and not os.path.exists(submission_path):
                 continue
 
@@ -770,7 +824,45 @@ def _collect_workspace_runs(base_dir: str, max_runs: int = 200) -> Dict[str, Any
             run_result = (code_log or {}).get("run_result") or {}
             stdout_text = str(run_result.get("stdout") or "")
             stderr_text = str(run_result.get("stderr") or "")
-            dev_score = _extract_dev_score(stdout_text, stderr_text)
+            raw_score = _to_optional_finite_float((dev_metrics or {}).get("raw_score"))
+            parsed_dev_score = _extract_dev_score(stdout_text, stderr_text)
+            dev_score = raw_score if raw_score is not None else _to_optional_finite_float(parsed_dev_score)
+            metric_name = str(
+                (dev_metrics or {}).get("metric_name")
+                or (task_manifest or {}).get("metric")
+                or (method_card or {}).get("metric")
+                or ""
+            )
+            metric_lower_is_better = _infer_metric_lower_is_better(metric_name)
+            selection_score = None
+            if dev_score is not None and metric_lower_is_better is not None:
+                selection_score = -float(dev_score) if metric_lower_is_better else float(dev_score)
+            submission_preview = _read_submission_preview(submission_path)
+            scoring_column = (task_manifest or {}).get("scoring_column")
+            if isinstance(scoring_column, list):
+                required_submission_columns = [str(x).strip() for x in scoring_column if str(x).strip()]
+            elif isinstance(scoring_column, str) and scoring_column.strip():
+                required_submission_columns = [scoring_column.strip()]
+            else:
+                required_submission_columns = []
+            preflight_ok = bool(submission_preview.get("exists") and submission_preview.get("has_rows"))
+            if required_submission_columns:
+                preflight_ok = preflight_ok and submission_preview.get("columns") == required_submission_columns
+            exit_code = run_result.get("exit_code")
+            exec_ok = bool(exit_code in (None, 0) and os.path.exists(submission_path))
+            has_dev_proxy = bool(raw_score is not None or os.path.exists(dev_predictions_path) or dev_score is not None)
+            scientific_ok = bool(exec_ok and has_dev_proxy)
+            scientific_reason_parts: List[str] = []
+            if not exec_ok:
+                scientific_reason_parts.append("exec_failed")
+            if not has_dev_proxy:
+                scientific_reason_parts.append("missing_dev_proxy")
+            scientific_reason = "ok" if scientific_ok else "|".join(scientific_reason_parts)
+            publish_ready = bool(scientific_ok and preflight_ok)
+            publish_reason_parts: List[str] = list(scientific_reason_parts)
+            if scientific_ok and not preflight_ok:
+                publish_reason_parts.append("submission_preflight_failed")
+            publish_reason = "ok" if publish_ready else "|".join(publish_reason_parts)
             error_signature = _extract_error_signature(stderr_text)
             rows.append(
                 {
@@ -788,6 +880,22 @@ def _collect_workspace_runs(base_dir: str, max_runs: int = 200) -> Dict[str, Any
                     "stdout": stdout_text[-12000:],
                     "error_signature": error_signature,
                     "dev_score": dev_score,
+                    "raw_score": dev_score,
+                    "metric_name": metric_name,
+                    "metric_lower_is_better": metric_lower_is_better,
+                    "selection_score": selection_score,
+                    "exec_ok": exec_ok,
+                    "has_dev_proxy": has_dev_proxy,
+                    "preflight_ok": preflight_ok,
+                    "scientific_ok": scientific_ok,
+                    "scientific_reason": scientific_reason,
+                    "publish_ready": publish_ready,
+                    "publish_reason": publish_reason,
+                    # Backward-compatible aliases for older frontend code paths.
+                    "evidence_ok": publish_ready,
+                    "evidence_reason": publish_reason,
+                    "required_submission_columns": required_submission_columns,
+                    "submission_columns": list(submission_preview.get("columns") or []),
                     "command": str(run_result.get("command") or ""),
                     "artifacts": list(run_result.get("artifacts") or []),
                     "code_plan": {
@@ -801,8 +909,11 @@ def _collect_workspace_runs(base_dir: str, max_runs: int = 200) -> Dict[str, Any
                     "method_card": method_card,
                     "code_log_path": code_run_path if code_log else "",
                     "solver_log_path": solver_run_path if solver_log else "",
-                    "workspace_dir": str((code_log or {}).get("workspace_dir") or ""),
+                    "workspace_dir": str((code_log or {}).get("workspace_dir") or workspace_dir),
                     "snapshot_before_run": str((code_log or {}).get("snapshot_before_run") or ""),
+                    "dev_metrics_path": dev_metrics_path if dev_metrics else "",
+                    "dev_predictions_path": dev_predictions_path if os.path.exists(dev_predictions_path) else "",
+                    "task_manifest_path": manifest_path if task_manifest else "",
                 }
             )
 
